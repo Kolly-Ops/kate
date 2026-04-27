@@ -52,9 +52,30 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class InstrumentMeta:
-    """Per-instrument calibration. Sourced from config/instruments.json."""
+    """Per-instrument calibration. Sourced from config/instruments.json.
+
+    The three name fields capture distinct identifiers we encounter in the
+    real Sierra+DTC stack — they often differ:
+
+      symbol         — logical/display name. Used for strategy ctx,
+                       TradeIntent, StateStore, log lines. Stable, short.
+                       Example: "MESM26".
+      scid_filename  — name of the .scid file Sierra writes ticks to,
+                       WITHOUT the .scid extension. Used by CandleManager
+                       to find the file. Example: "MESM26_FUT_CME".
+      dtc_symbol     — what Sierra accepts on the DTC wire as Symbol[64]
+                       in SUBMIT_NEW_SINGLE_ORDER and what it returns in
+                       POSITION_UPDATE. Example: "MESM26-CME".
+
+    Phase A integration tests passed because the test fixtures used the
+    same string for all three. In production they MUST be set
+    independently — the engine maps logical → scid for CandleManager
+    calls and logical → dtc for DTCClient calls.
+    """
     symbol: str
     exchange: str
+    scid_filename: str
+    dtc_symbol: str
     tick_size: float
     tick_value: float
     per_contract_margin: float
@@ -106,7 +127,14 @@ class ManagedFuturesEngine:
         self._history: dict[str, deque[Candle]] = {
             s: deque(maxlen=self._history_size) for s in symbols
         }
-        # Latest broker-side position snapshot per (symbol, exchange)
+        # Reverse lookup: dtc_symbol → logical symbol. Sierra reports
+        # POSITION_UPDATE in dtc_symbol form; we key broker_positions
+        # by logical symbol for clean reconciler compare against the
+        # local StateStore (which uses logical symbols).
+        self._dtc_to_logical: dict[str, str] = {
+            meta.dtc_symbol: logical for logical, meta in instruments.items()
+        }
+        # Latest broker-side position snapshot per (LOGICAL symbol, exchange).
         self._broker_positions: dict[tuple[str, str], RemotePosition] = {}
         # Latest broker-side order status per client_order_id
         self._broker_orders: dict[str, RemoteOrder] = {}
@@ -125,13 +153,14 @@ class ManagedFuturesEngine:
         )
 
         for symbol in self.symbols:
+            meta = self.instruments[symbol]
             backfill = self.candle_manager.backfill(
-                symbol, max_candles=self._history_size
+                meta.scid_filename, max_candles=self._history_size
             )
             self._history[symbol].extend(backfill)
             # Initialize tail baseline (first poll returns [] but baselines
             # the file position so subsequent polls see only new ticks).
-            self.candle_manager.poll(symbol)
+            self.candle_manager.poll(meta.scid_filename)
 
         await self._seed_broker_state()
 
@@ -266,12 +295,21 @@ class ManagedFuturesEngine:
         if msg.no_positions:
             self._broker_positions.clear()
             return
-        key = (msg.symbol, msg.exchange)
+        # Sierra reports POSITION_UPDATE.symbol in dtc_symbol form
+        # (e.g. "MESM26-CME"). Map to logical for reconciler key consistency.
+        logical = self._dtc_to_logical.get(msg.symbol)
+        if logical is None:
+            logger.debug(
+                "engine: POSITION_UPDATE for unmanaged dtc_symbol %r — ignored",
+                msg.symbol,
+            )
+            return
+        key = (logical, msg.exchange)
         if msg.quantity == 0:
             self._broker_positions.pop(key, None)
         else:
             self._broker_positions[key] = RemotePosition(
-                symbol=msg.symbol, exchange=msg.exchange, quantity=msg.quantity,
+                symbol=logical, exchange=msg.exchange, quantity=msg.quantity,
             )
 
     def _handle_account_balance_update(
@@ -292,7 +330,8 @@ class ManagedFuturesEngine:
 
     # ── Per-tick processing ───────────────────────────────────────────────
     async def _process_symbol(self, symbol: str) -> None:
-        closed = self.candle_manager.poll(symbol)
+        meta = self.instruments[symbol]
+        closed = self.candle_manager.poll(meta.scid_filename)
         for candle in closed:
             self._history[symbol].append(candle)
             await self._on_candle_close(symbol, candle)
@@ -344,15 +383,16 @@ class ManagedFuturesEngine:
         # mid-flight the reconciler can detect the orphan record.
         self.state.record_order(
             client_order_id=intent.intent_id,
-            symbol=intent.symbol,
+            symbol=intent.symbol,           # logical — for state
             exchange=intent.exchange,
             side=intent.side,
             quantity=intent.quantity,
             order_type=intent.order_type,
         )
+        meta = self.instruments[intent.symbol]
         try:
             await self.dtc.submit_order(
-                symbol=intent.symbol,
+                symbol=meta.dtc_symbol,     # dtc_symbol on the wire
                 exchange=intent.exchange,
                 trade_account=self.trade_account,
                 client_order_id=intent.intent_id,
@@ -362,7 +402,10 @@ class ManagedFuturesEngine:
                 price1=intent.price,
                 free_form_text=intent.strategy_name[:48],
             )
-            logger.info("submitted order %s for %s", intent.intent_id, intent.symbol)
+            logger.info(
+                "submitted order %s for %s (dtc_symbol=%s)",
+                intent.intent_id, intent.symbol, meta.dtc_symbol,
+            )
         except Exception:
             # Mark the order REJECTED locally so the active-orders set is
             # accurate. The reconciler will further validate on next pass.

@@ -89,6 +89,12 @@ async def _make_engine(
         instruments={
             symbol: InstrumentMeta(
                 symbol=symbol, exchange="CME",
+                # In integration tests we use the same string for all
+                # three identifiers — the synthetic .scid file is
+                # named {symbol}.scid and the mock accepts any
+                # symbol the engine sends.
+                scid_filename=symbol,
+                dtc_symbol=symbol,
                 tick_size=0.25, tick_value=1.25, per_contract_margin=100.0,
             ),
         },
