@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.env
+.env.*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Trade data — local only, never commit
+data/*.csv
+data/*.scid
+data/*.depth
+!data/.gitkeep
+
+# Legacy KATE audit dumps — operational data + account info, do not commit
+# (kept locally for reference; copy into data/ for any artifact you actually need)
+KATE_DATA_AUDIT/
+KATE_DATA_AUDIT.zip
+data_audit/
+KATE Report.txt
+
+# Secrets — never commit
+secrets.json
+*.pem
+*.key
+
+# Build / dist
+build/
+dist/
+
+# Logs
+*.log
+logs/
+
+# Sierra Chart artifacts (if ever generated locally)
+*.cht
+*.dly

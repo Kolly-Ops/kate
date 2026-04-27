@@ -1,0 +1,373 @@
+import socket
+import json
+import struct
+import os
+import time
+import threading
+import csv
+from datetime import datetime, time as dtime
+from shared_state import update_pnl, read_state, get_kill_switch_status
+import sys
+import pandas as pd
+import numpy as np
+
+def check_futures_singleton():
+    lock_path = "kate_futures.lock"
+    if os.path.exists(lock_path):
+        try: os.remove(lock_path)
+        except:
+            print("[CRITICAL] KATE Futures is already running. Duplicate blocked.")
+            sys.exit(0)
+    open(lock_path, 'w').close()
+
+def cleanup_futures_lock():
+    lock_path = "kate_futures.lock"
+    if os.path.exists(lock_path):
+        try: os.remove(lock_path)
+        except: pass
+
+# --- CONFIG ---
+CONFIG_FILE = "config_futures.json"
+SIERRA_HOST = '127.0.0.1'
+SIERRA_PORT = 11099
+
+# DTC Constants
+LOGON_REQUEST = 1
+LOGON_RESPONSE = 2
+HEARTBEAT = 3
+MARKET_DATA_REQUEST = 101
+MARKET_DATA_SNAPSHOT = 104
+MARKET_DATA_UPDATE_TRADE = 107
+SUBMIT_NEW_SINGLE_ORDER = 208
+ACCOUNT_BALANCE_REQUEST = 400
+ACCOUNT_BALANCE_UPDATE = 401
+
+def debug_log(msg):
+    ts = datetime.now().strftime('%H:%M:%S')
+    full_msg = f"[{ts}] {msg}"
+    print(full_msg)
+    try:
+        with open("simulation_debug.log", "a") as f:
+            f.write(full_msg + "\n")
+    except: pass
+
+def tprint(msg):
+    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f"[{ts}] {msg}", flush=True)
+
+def check_time_rules():
+    now = datetime.now() 
+    if now.weekday() >= 5: return "MARKET_CLOSED"
+    if now.hour >= 22: return "MARKET_CLOSED"
+    if now.hour == 21 and now.minute >= 45: return "FORCE_CLOSE"
+    if now.hour >= 20: return "STOP_NEW"
+    return "SAFE"
+
+def get_current_contract(base_symbol):
+    now = datetime.now()
+    year_digit = now.year % 10
+    month = now.month
+    day = now.day
+    roll_day = 12
+    if (month < 3) or (month == 3 and day < roll_day): letter = 'H'; yr = year_digit
+    elif (month < 6) or (month == 6 and day < roll_day): letter = 'M'; yr = year_digit
+    elif (month < 9) or (month == 9 and day < roll_day): letter = 'U'; yr = year_digit
+    elif (month < 12) or (month == 12 and day < roll_day): letter = 'Z'; yr = year_digit
+    else: letter = 'H'; yr = (year_digit + 1) % 10
+    return f"{base_symbol}{letter}{yr}"
+
+class CandleManager:
+    def __init__(self, symbol, timeframe_min=15):
+        self.symbol = symbol
+        self.timeframe_min = timeframe_min
+        self.current_candle = None
+        self.candles = []
+        self.history_file = f"candles_{self.symbol}.json"
+        self.load_history()
+
+    def save_history(self):
+        try:
+            # Save enough for EMA 200 calc
+            data_to_save = self.candles[-500:]
+            serializable = []
+            for c in data_to_save:
+                c_copy = c.copy()
+                if isinstance(c_copy['timestamp'], datetime):
+                    c_copy['timestamp'] = c_copy['timestamp'].strftime("%Y-%m-%d %H:%M:%S")
+                serializable.append(c_copy)
+            with open(self.history_file, 'w') as f:
+                json.dump(serializable, f, indent=4)
+        except: pass
+
+    def load_history(self):
+        if not os.path.exists(self.history_file): return
+        try:
+            with open(self.history_file, 'r') as f:
+                data = json.load(f)
+                loaded = []
+                for c in data:
+                    c['timestamp'] = datetime.strptime(c['timestamp'], "%Y-%m-%d %H:%M:%S")
+                    loaded.append(c)
+                self.candles = loaded
+        except: pass
+
+    def backfill_from_scid(self, scid_path):
+        if len(self.candles) >= 300: return
+        try:
+            record_size = 40
+            f_size = os.path.getsize(scid_path)
+            num_req = 100000 
+            start_off = max(56, f_size - (num_req * record_size))
+            backfill_candles = {}
+            with open(scid_path, 'rb') as f:
+                f.seek(start_off)
+                while True:
+                    data = f.read(record_size)
+                    if len(data) < record_size: break
+                    unpacked = struct.unpack('qffffIIII', data)
+                    sc_ts = unpacked[0]
+                    price = unpacked[4] / 100.0
+                    days = sc_ts / 86400000000
+                    from datetime import timedelta
+                    tk_time = datetime(1899, 12, 30) + timedelta(days=days)
+                    minute = (tk_time.minute // self.timeframe_min) * self.timeframe_min
+                    bar_start = tk_time.replace(minute=minute, second=0, microsecond=0)
+                    key = bar_start.strftime("%Y-%m-%d %H:%M:%S")
+                    if key not in backfill_candles:
+                        backfill_candles[key] = {'timestamp': bar_start, 'open': price, 'high': price, 'low': price, 'close': price}
+                    else:
+                        c = backfill_candles[key]
+                        c['high'] = max(c['high'], price); c['low'] = min(c['low'], price); c['close'] = price
+            if backfill_candles:
+                sorted_c = [backfill_candles[k] for k in sorted(backfill_candles.keys())]
+                self.candles = sorted_c[-301:-1]
+                self.save_history()
+                print(f"[BACKFILL] {self.symbol} ARMED with {len(self.candles)} candles.")
+        except Exception as e: print(f"Backfill Error: {e}")
+
+    def add_tick(self, price, timestamp=None):
+        if not timestamp: timestamp = datetime.now()
+        minute = (timestamp.minute // self.timeframe_min) * self.timeframe_min
+        bar_start = timestamp.replace(minute=minute, second=0, microsecond=0)
+        if self.current_candle is None or bar_start > self.current_candle['timestamp']:
+            if self.current_candle:
+                self.candles.append(self.current_candle)
+                if len(self.candles) > 500: self.candles.pop(0)
+                self.save_history()
+            self.current_candle = {'timestamp': bar_start, 'open': price, 'high': price, 'low': price, 'close': price}
+            return True
+        else:
+            self.current_candle['high'] = max(self.current_candle['high'], price); self.current_candle['low'] = min(self.current_candle['low'], price); self.current_candle['close'] = price
+            return False
+
+class InstrumentState:
+    def __init__(self, config):
+        raw_sym = config['symbol']
+        self.base_symbol = raw_sym
+        self.symbol = get_current_contract(raw_sym) + "_FUT_CME" if len(raw_sym) <= 4 else raw_sym
+        self.symbol_id = config['symbol_id']
+        self.tick_size = config['tick_size']
+        self.tick_value = config['tick_value']
+        self.current_price = 0.0
+        self.in_position = False
+        self.entry_price = 0.0
+        self.side = None
+        self.stop_price = 0.0
+        self.target_price = 0.0
+        self.cm = CandleManager(symbol=self.symbol, timeframe_min=15)
+        self.trades_today = 0
+        self.last_trade_date = None
+
+    def save_position_state(self):
+        try:
+            state = {
+                "active": self.in_position,
+                "symbol": self.symbol,
+                "side": self.side,
+                "entry_price": self.entry_price,
+                "stop_price": self.stop_price,
+                "target_price": self.target_price,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            with open("futures_position_state.json", "w") as f:
+                json.dump(state, f, indent=4)
+        except: pass
+
+    def on_tick(self, price, strategy_callback):
+        if price <= 0: return
+        self.current_price = price
+        new_candle = self.cm.add_tick(price)
+        strategy_callback(self, is_new_candle=new_candle)
+
+class DTCClient:
+    def __init__(self):
+        self.sock = None
+        self.connected = False
+        self.instruments = {}
+        self.cum_pnl = 0.0
+        self.starting_balance = 5000.0
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                config = json.load(f)
+                for inst_cfg in config['instruments']:
+                    if inst_cfg.get('enabled', True):
+                        self.instruments[inst_cfg['symbol_id']] = InstrumentState(inst_cfg)
+                gs = config.get('global_settings', {})
+                self.sim_mode = gs.get('SIM_MODE', True)
+        except: exit(1)
+        self.cum_pnl = read_state().get('futures_pnl', 0.0)
+
+    def log_trade(self, symbol, side, price, qty, pnl=0, note=""):
+        log_file = "futures_trade_history.csv"
+        exists = os.path.exists(log_file)
+        with open(log_file, "a", newline="") as f:
+            writer = csv.writer(f)
+            if not exists: writer.writerow(["timestamp", "symbol", "side", "price", "qty", "pnl", "note"])
+            writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), symbol, side, price, qty, f"{pnl:.4f}", note])
+
+    def connect(self):
+        while not self.connected:
+            if get_kill_switch_status(): break
+            try:
+                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM); self.sock.settimeout(15)
+                self.sock.connect((SIERRA_HOST, SIERRA_PORT)); self.connected = True
+                self.send_json({"Type": LOGON_REQUEST, "ProtocolVersion": 8, "ClientName": "KATE_V6_PRECISION"})
+                for s_id, inst in self.instruments.items():
+                    self.send_json({"Type": MARKET_DATA_REQUEST, "RequestAction": 1, "SymbolID": s_id, "Symbol": inst.symbol})
+                threading.Thread(target=self.read_loop, daemon=True).start()
+                # Link SCIDs for data scavenge (not implemented in this minimal block)
+            except: time.sleep(5)
+
+    def send_json(self, msg):
+        try: self.sock.sendall(json.dumps(msg).encode('utf-8') + b'\x00')
+        except: self.connected = False
+
+    def read_loop(self):
+        while self.connected:
+            try:
+                data = self.sock.recv(8192)
+                if not data: break
+                for m_str in data.decode('utf-8', errors='ignore').split('\x00'):
+                    if m_str.strip(): self.handle_message(json.loads(m_str))
+            except: break
+
+    def handle_message(self, msg):
+        if msg.get('Type') == MARKET_DATA_UPDATE_TRADE:
+            s_id = msg.get('SymbolID', 0) % 100
+            if s_id in self.instruments: self.instruments[s_id].on_tick(msg.get('Price'), self.check_strategy)
+
+    def check_strategy(self, inst, is_new_candle=False):
+        # 1. Position Management
+        if inst.in_position:
+            hit_exit = False; reason = ""
+            if inst.side == "BUY":
+                if inst.current_price <= inst.stop_price: hit_exit = True; reason = "STOP LOSS"
+                elif inst.current_price >= inst.target_price: hit_exit = True; reason = "TAKE PROFIT"
+            else:
+                if inst.current_price >= inst.stop_price: hit_exit = True; reason = "STOP LOSS"
+                elif inst.current_price <= inst.target_price: hit_exit = True; reason = "TAKE PROFIT"
+            
+            if hit_exit:
+                pnl = ((inst.current_price - inst.entry_price) / inst.tick_size * inst.tick_value) if inst.side == "BUY" else ((inst.entry_price - inst.current_price) / inst.tick_size * inst.tick_value)
+                pnl -= 4.00 # Commission
+                self.log_trade(inst.symbol, "EXIT", inst.current_price, 1, pnl, reason)
+                self.cum_pnl += pnl; update_pnl('futures_pnl', self.cum_pnl)
+                inst.in_position = False; inst.trades_today += 1
+                inst.save_position_state()
+            return
+
+        # 2. Entry Logic (Precision Scalper v6.0)
+        if not is_new_candle: return
+        now_date = datetime.now().date()
+        if inst.last_trade_date != now_date:
+            inst.trades_today = 0; inst.last_trade_date = now_date
+        
+        if inst.trades_today > 0: return # One-and-Done enforcement
+        
+        comp = inst.cm.candles
+        if len(comp) < 200: return
+        
+        df = pd.DataFrame(comp)
+        df['sma20'] = df['close'].rolling(20).mean(); df['std20'] = df['close'].rolling(20).std()
+        df['upper_bb'] = df['sma20'] + (2 * df['std20']); df['lower_bb'] = df['sma20'] - (2 * df['std20'])
+        df['ema20'] = df['close'].ewm(span=20, adjust=False).mean(); df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
+        
+        delta = df['close'].diff(); gain = (delta.where(delta > 0, 0)).rolling(14).mean(); loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        df['rsi'] = 100 - (100 / (1 + (gain / loss)))
+        df['atr'] = (df['high'] - df['low']).rolling(14).mean() # Simplified ATR
+        
+        row = df.iloc[-1]; prev = df.iloc[-2]; setup = False; side = 0; note = ""
+        
+        # Volatility Gate
+        if row['atr'] > 6.0: return
+        
+        # Session Filter (9:30 - 15:30 Eastern)
+        now_time = datetime.now().time()
+        if not (dtime(9, 30) <= now_time <= dtime(15, 30)): return
+
+        # Setup A: Mean Reversion
+        if row['close'] <= row['lower_bb'] and row['rsi'] <= 30: setup = True; side = 1; note = "PRECISION_MR"
+        elif row['close'] >= row['upper_bb'] and row['rsi'] >= 70: setup = True; side = -1; note = "PRECISION_MR"
+        
+        # Setup B: Trend Pullback
+        if not setup:
+            if row['close'] > row['ema200'] and prev['low'] <= prev['ema20'] and row['close'] > row['ema20']: setup = True; side = 1; note = "PRECISION_PB"
+            elif row['close'] < row['ema200'] and prev['high'] >= prev['ema20'] and row['close'] < row['ema20']: setup = True; side = -1; note = "PRECISION_PB"
+
+        if setup:
+            inst.in_position = True; inst.side = "BUY" if side == 1 else "SELL"; inst.entry_price = row['close']
+            inst.stop_price = inst.entry_price - (3.0 if side == 1 else -3.0)
+            inst.target_price = inst.entry_price + (5.0 if side == 1 else -5.0)
+            inst.save_position_state()
+            self.log_trade(inst.symbol, inst.side, inst.entry_price, 1, 0, note)
+            tprint(f"[ENTRY] {inst.symbol}: {note} at {inst.entry_price} (SL: {inst.stop_price} TP: {inst.target_price})")
+
+def run_futures_strategy():
+    client = DTCClient()
+    tprint("--- KATE V6.0 PRECISION SCALPER (One-and-Done) ---")
+    last_print = 0
+    while True:
+        try:
+            if not client.connected: client.connect()
+            client.send_json({"Type": HEARTBEAT})
+            
+            if time.time() - last_print > 15:
+                # v6.0 Institutional Dashboard
+                curr_bal = client.starting_balance + client.cum_pnl
+                dashboard = "\n" + "="*65 + "\n"
+                dashboard += f" KATE PRECISION SCALPER v6.0 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                dashboard += f" [!] STATUS: 100% SIMULATION MODE - LIVE TRADING DISABLED\n"
+                dashboard += "-" * 65 + "\n"
+                dashboard += f"{'SYMBOL':<15} | {'PRICE':<10} | {'RSI':<6} | {'ATR':<6} | {'TREND'}\n"
+                dashboard += "-" * 65 + "\n"
+                
+                for inst in client.instruments.values():
+                    rsi_val = 0.0; atr_val = 0.0; trend = "???"
+                    if len(inst.cm.candles) >= 200:
+                        df = pd.DataFrame(inst.cm.candles[-200:])
+                        # Fast RSI/ATR for dashboard
+                        delta = df['close'].diff()
+                        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+                        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+                        rsi_val = (100 - (100 / (1 + (gain / loss)))).iloc[-1]
+                        atr_val = (df['high'] - df['low']).rolling(14).mean().iloc[-1]
+                        ema200 = df['close'].ewm(span=200, adjust=False).mean().iloc[-1]
+                        trend = "BULL" if inst.current_price > ema200 else "BEAR"
+                    
+                    dashboard += f"{inst.base_symbol:<15} | {inst.current_price:<10.2f} | {rsi_val:<6.1f} | {atr_val:<6.2f} | {trend}\n"
+                
+                dashboard += "-" * 65 + "\n"
+                dashboard += f"BALANCE: ${curr_bal:,.2f} | PNL: ${client.cum_pnl:+.2f} | TRADES TODAY: {sum([i.trades_today for i in client.instruments.values()])}\n"
+                dashboard += "="*65 + "\n"
+                print(dashboard, flush=True)
+                last_print = time.time()
+
+            time.sleep(10)
+        except Exception as e: 
+            print(f"Loop Err: {e}")
+            time.sleep(5)
+
+if __name__ == "__main__":
+    check_futures_singleton()
+    try: run_futures_strategy()
+    finally: cleanup_futures_lock()

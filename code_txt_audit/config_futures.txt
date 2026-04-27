@@ -1,0 +1,66 @@
+{
+    "instruments": [
+        {
+            "symbol": "ES",
+            "name": "Standard S&P 500 (E-mini)",
+            "symbol_id": 1,
+            "tick_size": 0.25,
+            "tick_value": 12.50,
+            "enabled": true,
+            "activation_threshold": 400
+        },
+        {
+            "symbol": "MES",
+            "name": "Micro S&P 500",
+            "symbol_id": 0,
+            "tick_size": 0.25,
+            "tick_value": 1.25,
+            "enabled": false,
+            "activation_threshold": 400
+        },
+        {
+            "symbol": "MGC",
+            "name": "Micro Gold",
+            "symbol_id": 2,
+            "tick_size": 0.1,
+            "tick_value": 1.0,
+            "enabled": false,
+            "activation_threshold": 400
+        },
+        {
+            "symbol": "MNQ",
+            "name": "Micro Nasdaq 100",
+            "enabled": false
+        },
+        {
+            "symbol": "M6E",
+            "name": "Micro Euro FX",
+            "enabled": false
+        },
+        {
+            "symbol": "MCL",
+            "name": "Micro Crude Oil",
+            "enabled": false
+        }
+    ],
+    "global_settings": {
+        "SIM_MODE": true,
+        "max_daily_loss": 500.0,
+        "daily_goal": 1500.0,
+        "min_balance": 2000,
+        "live_starting_balance": 1080.0,
+        "sim_starting_balance": 5000.0,
+        "LIVE_TRADING_ENABLED": false,
+        "heartbeat_interval_sec": 10,
+        "slippage_buffer_ticks": 2,
+        "commission_per_round_trip": 4.00
+    },
+    "edgeclear_compliance": {
+        "trade_service_id": "47771955",
+        "broker_account_id": "E8933",
+        "stop_new_trades_hour": 21,
+        "stop_new_trades_min": 30,
+        "force_close_hour": 21,
+        "force_close_min": 45
+    }
+}

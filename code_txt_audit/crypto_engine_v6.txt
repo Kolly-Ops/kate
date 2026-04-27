@@ -1,0 +1,588 @@
+import ccxt
+import time
+import json
+import os
+import threading
+import websocket
+import csv
+from collections import deque
+from datetime import datetime
+import sys
+from shared_state import update_pnl, read_state, get_kill_switch_status
+from email_notifier import send_alert
+
+def ts_print(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+def check_singleton():
+    lock_path = "kate_crypto.lock"
+    if os.path.exists(lock_path):
+        try: os.remove(lock_path)
+        except:
+            ts_print("[CRITICAL] KATE is already running. Duplicate process blocked.")
+            sys.exit(0)
+    open(lock_path, 'w').close()
+
+def cleanup_lock():
+    lock_path = "kate_crypto.lock"
+    if os.path.exists(lock_path):
+        try: os.remove(lock_path)
+        except: pass
+
+def calculate_rsi(prices, period=14):
+    """Calculate RSI from a list of prices."""
+    if len(prices) < period + 1:
+        return 50  # Not enough data, return neutral
+    
+    deltas = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+    gains = [d if d > 0 else 0 for d in deltas[-period:]]
+    losses = [-d if d < 0 else 0 for d in deltas[-period:]]
+    
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    
+    if avg_loss == 0:
+        return 100
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+# --- CONFIGURATION ---
+PAPER_MODE = True
+EXCHANGE_ID = "binance" # Primary exchange for spot orders
+WATCH_SYMBOLS = ["BTC", "ETH", "SOL", "XRP", "ADA", "BNB", "LINK", "DOGE", "PEPE"]
+TIERED_LIQS = {
+    "BTC": 100000, "ETH": 80000,
+    "SOL": 100000, "XRP": 50000, "ADA": 50000, "BNB": 50000, "LINK": 50000,
+    "DOGE": 60000, "PEPE": 30000
+}
+OI_DROP_PCT = 0.0015        # 0.15% Drop in OI (Tripled for quality)
+TOTAL_CAPITAL_USD = 86.35   # Actual Binance Spot Balance
+DCA_BULLETS = [0.45, 0.55]        # ACCELERATED RECOVERY: 45% Initial, 55% final stand (2 bullets total)
+
+# --- RISK SETTINGS ---
+DCA_DROP_TRIGGER = 0.015       # 1.5% Drop to fire next bullet
+STOP_LOSS_PCT = 0.03
+MAX_DRAWDOWN_USD = 10.0      # Slightly wider to avoid "Vulnerable Stop"
+STAGNATION_HOURS = 24.0      # Extended to 24h to give DCA room to breathe
+TAKE_PROFIT_PCT = 0.015      # 1.5% Target (Lowered for high-velocity recovery)
+TRAILING_DROP_PCT = 0.004    # 0.4% Trailing (Tighter for quick gains)
+CIRCUIT_BREAKER_TIME = 10800  # 3 hours (Extended to give DCA room to breathe)
+CIRCUIT_BREAKER_TARGET = 0.001
+
+# --- GLOBAL STATE ---
+symbols_state = {sym: {"price": 0.0, "oi": 0.0, "last_oi": 0.0, "liqs_deque": deque(), "price_history": deque(maxlen=50)} for sym in WATCH_SYMBOLS}
+lock = threading.Lock()
+is_in_position = False # SERIAL LOCK
+engine_meta = {'last_update_ts': 0}
+
+class Position:
+    def __init__(self):
+        self.active = False
+        self.symbol = ""
+        self.bullets_fired = 0
+        self.total_qty = 0.0
+        self.avg_price = 0.0
+        self.entry_time = 0
+        self.last_dca_price = 0.0
+        self.trade_capital = 0.0
+        self.trailing_peak = 0.0
+        self.is_trailing = False
+
+    def to_dict(self):
+        return self.__dict__
+
+    def from_dict(self, d):
+        for k, v in d.items():
+            setattr(self, k, v)
+
+    def save(self):
+        with open("position_state.json", "w") as f:
+            json.dump(self.to_dict(), f)
+
+    def load(self):
+        if os.path.exists("position_state.json"):
+            try:
+                with open("position_state.json", "r") as f:
+                    d = json.load(f)
+                    self.from_dict(d)
+                return self.active
+            except: pass
+        return False
+
+    def add_execution(self, price, qty):
+        if self.total_qty + qty > 0:
+            current_value = self.total_qty * self.avg_price
+            new_value = qty * price
+            self.avg_price = (current_value + new_value) / (self.total_qty + qty)
+        else:
+            self.avg_price = price
+            
+        self.total_qty += qty
+        self.last_dca_price = price
+        self.bullets_fired += 1
+        
+        if not self.active:
+            self.active = True
+            self.entry_time = time.time()
+            self.trailing_peak = price
+        self.save()
+
+    def close(self):
+        self.active = False
+        self.symbol = ""
+        self.bullets_fired = 0
+        self.total_qty = 0.0
+        self.avg_price = 0.0
+        self.entry_time = 0
+        self.trade_capital = 0.0
+        self.trailing_peak = 0.0
+        self.is_trailing = False
+        if os.path.exists("position_state.json"):
+            os.remove("position_state.json")
+
+current_pos = Position()
+
+# --- WEBSOCKET LISTENERS ---
+def on_liq_message(ws, message):
+    data = json.loads(message)
+    try:
+        payload = data.get('o', {})
+        symbol = payload.get('s', '').replace('USDT', '')
+        if symbol in WATCH_SYMBOLS and payload.get('S') == "SELL":
+            q, p = float(payload.get('q', 0)), float(payload.get('p', 0))
+            with lock:
+                symbols_state[symbol]['liqs_deque'].append((time.time(), q * p))
+    except: pass
+
+def on_ticker_message(ws, message):
+    data = json.loads(message)
+    try:
+        # Handles both single and multiple stream formats
+        results = data if isinstance(data, list) else [data]
+        for item in results:
+            s_data = item.get('data', item)
+            raw_sym = s_data.get('s', '')
+            symbol = raw_sym.replace('USDT', '')
+            symbol = symbol.replace('USDT', '')
+            if symbol in WATCH_SYMBOLS:
+                price = float(s_data.get('c', 0))
+                with lock:
+                    symbols_state[symbol]['price'] = price
+                    symbols_state[symbol]['price_history'].append(price)
+                    engine_meta['last_update_ts'] = time.time()
+    except: pass
+
+def start_websocket_streams():
+    # 1. Liquidation Stream (Futures)
+    liq_url = "wss://fstream.binance.com/ws/!forceOrder@arr"
+    def run_liq():
+        while True:
+            try:
+                ws = websocket.WebSocketApp(liq_url, on_message=on_liq_message)
+                ws.run_forever()
+            except: pass
+            time.sleep(5) # Auto-retry
+    threading.Thread(target=run_liq, daemon=True).start()
+
+    # 2. Ticker Stream (Spot)
+    streams = "/".join([f"{s.lower()}usdt@ticker" for s in WATCH_SYMBOLS])
+    ticker_url = f"wss://stream.binance.com:9443/stream?streams={streams}"
+    def run_ticker():
+        while True:
+            try:
+                ws = websocket.WebSocketApp(ticker_url, on_message=on_ticker_message)
+                ws.run_forever()
+            except: pass
+            time.sleep(5) # Auto-retry
+    threading.Thread(target=run_ticker, daemon=True).start()
+
+def get_symbol_liqs(symbol, seconds=60):
+    now = time.time()
+    with lock:
+        dq = symbols_state[symbol]['liqs_deque']
+        while dq and dq[0][0] < now - seconds:
+            dq.popleft()
+        return sum(v for _, v in dq)
+
+def log_trade(side, price, qty, pnl=0, note=""):
+    log_file = "trade_history.csv"
+    exists = os.path.exists(log_file)
+    try:
+        with open(log_file, "a", newline="") as f:
+            writer = csv.writer(f)
+            if not exists:
+                writer.writerow(["timestamp", "side", "price", "qty", "pnl_usd", "note"])
+            # Estimate Fees (0.1% per trade)
+            est_fee_usd = (price * qty) * 0.001
+            # For BUY: Record 0 profit, but we effectively 'paid' the fee from our cash
+            # For SELL: Record Gross PnL - Sell Fee - estimated Buy Fee
+            net_pnl = pnl - est_fee_usd if side == "SELL" else -est_fee_usd
+            writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), side, price, qty, f"{net_pnl:.4f}", note])
+    except Exception as e:
+        ts_print(f"Logging Error: {e}")
+
+def check_and_send_alert(pnl_usd, symbol):
+    if abs(pnl_usd) >= 5.0:
+        subject = f"🚨 KATE MAJOR ACTIVITY: {symbol} ${pnl_usd:+.2f}"
+        body = f"""
+        <h3>Major Trade Activity Detected</h3>
+        <p><b>Symbol:</b> {symbol}</p>
+        <p><b>PnL:</b> <span style="color: {'green' if pnl_usd >= 0 else 'red'}">${pnl_usd:.2f}</span></p>
+        <p>Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+        """
+        send_alert(subject, body)
+
+# --- EXECUTION HANDLER (100% SIMULATION LOCK) ---
+def execute_trade(exchange, side, usd_amount, spot_price, is_paper, symbol_pair, exit_reason=""):
+    global current_pos
+    qty = usd_amount / spot_price
+    
+    # HARD SAFETY LOCK: Ensure no real orders can EVER be sent
+    if not is_paper:
+        ts_print(f"[SAFETY BLOCK] BLOCKED {side} order for {symbol_pair}. LIVE TRADING IS GLOBALLY DISABLED.")
+        return 0
+
+    if side == "BUY":
+        ts_print(f"[SIMULATION] BUYING ${usd_amount:.2f} {symbol_pair} @ {spot_price}")
+        current_pos.add_execution(spot_price, qty)
+        log_trade("BUY", spot_price, qty, 0, f"[SIM] Bullet fired on {symbol_pair}")
+    elif side == "SELL":
+        pnl_usd = (spot_price - current_pos.avg_price) * current_pos.total_qty
+        ts_print(f"[SIMULATION] SELLING ALL {symbol_pair} @ {spot_price}. PnL: ${pnl_usd:.2f}")
+        log_trade("SELL", spot_price, current_pos.total_qty, pnl_usd, f"[SIM] Exit on {symbol_pair} ({exit_reason})")
+        current_pos.close()
+        return pnl_usd
+    return 0
+
+
+# --- MAIN ENGINE ---
+def run_crypto_strategy():
+    global is_in_position
+    ts_print(f"--- KATE FAST SNIPER ENGINE ---")
+    ts_print(f"Mode: {'REAL' if not PAPER_MODE else 'PAPER'} | Symbols: {WATCH_SYMBOLS}")
+    
+    # Setup Clients
+    clients = []
+    spot_exchange = None
+    
+    # Always attempt to load secrets for balance reporting, even in PAPER mode
+    try:
+        if os.path.exists("secrets.json"):
+            with open("secrets.json") as f: s = json.load(f)
+            
+            # 1. Setup Binance (Attempt)
+            if s.get('BINANCE_SPOT_API_KEY'):
+                try:
+                    bin_cli = ccxt.binance({
+                        'apiKey': s.get('BINANCE_SPOT_API_KEY'),
+                        'secret': s.get('BINANCE_SPOT_SECRET'),
+                        'options': {'defaultType': 'spot'}
+                    })
+                    clients.append(bin_cli)
+                    if EXCHANGE_ID == 'binance': spot_exchange = bin_cli
+                    ts_print(f">> Connected: Binance (Balance reporting enabled)")
+                except: pass
+    except Exception as e: 
+        ts_print(f">> FAILED to load secrets: {e}.")
+
+    active_paper_mode = PAPER_MODE or (spot_exchange is None)
+
+    
+    # Setup Streams
+    futures_client = ccxt.binanceusdm()
+    start_websocket_streams()
+
+    # --- TERMINAL DISPLAY THREAD ---
+    def balance_display_thread(active_exchange, all_exchanges):
+        while True:
+            try:
+                total_equity_spot = 0.0
+                exchange_data = [] # List of (Name, Equity)
+
+                # Sum up all connected exchanges
+                for ex in all_exchanges:
+                    if not ex: continue
+                    try:
+                        name = ex.id.upper()
+                        b = ex.fetch_balance()
+                        
+                        # Sum USDT/USD cash only (User request: No coins)
+                        base_cash = b['total'].get('USDT', 0.0) 
+                        if base_cash == 0: base_cash = b['total'].get('USD', 0.0)
+                        if base_cash == 0: base_cash = b['total'].get('ZUSD', 0.0)
+
+                        ex_equity = base_cash
+                        total_equity_spot += ex_equity
+                        exchange_data.append((name, ex_equity))
+                    except Exception as e:
+                        ts_print(f"[WARN] {ex.id} Check: {e}")
+
+                # Calculate Grand Total (SOURCE OF TRUTH: LIVE DATA)
+                state_data = read_state()
+                futures_pnl = state_data.get('futures_pnl', 0.0)
+                
+                # Use Live-reported balance if available, otherwise fallback to config/initial
+                live_sim_bal = state_data.get('futures_balance_live')
+                sim_equity = live_sim_bal if live_sim_bal is not None else (5000.0 + futures_pnl)
+                
+                # LIVE FUTURES DISPLAY
+                live_f_balance = 0.0
+                f_status_tag = "[OFFLINE/EST]"
+                dtc_live_bal = state_data.get('futures_balance_live')
+
+                if dtc_live_bal is not None:
+                    live_f_balance = dtc_live_bal
+                    f_status_tag = "[LIVE DTC]"
+                else:
+                    # Fallback to config
+                    try:
+                        if os.path.exists("config_futures.json"):
+                            with open("config_futures.json", "r") as f:
+                                f_cfg = json.load(f)
+                                live_f_balance = f_cfg['global_settings'].get('live_starting_balance', 1080.0)
+                                f_status_tag = "[EST/CFG]"
+                    except: pass
+                
+                # Calculate Separate Totals
+                active_pos_val = 0.0
+                if current_pos.active:
+                    with lock:
+                        p_price = symbols_state.get(current_pos.symbol, {}).get('price', 0)
+                        active_pos_val = current_pos.total_qty * p_price
+                
+                real_grand_total = total_equity_spot + live_f_balance + active_pos_val
+                sim_baseline = 5000.0
+                
+                # v6.0 Institutional Dashboard
+                dashboard = "\n" + "="*65 + "\n"
+                dashboard += f" KATE PRECISION SCALPER v6.0 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                dashboard += f" [!] STATUS: 100% SIMULATION MODE - LIVE TRADING DISABLED\n"
+                dashboard += "-" * 65 + "\n"
+                
+                # Check for active position status
+                status = "HUNTING" if not current_pos.active else f"IN POSITION ({current_pos.symbol})"
+                ts_print(f"[KATE STATUS] {status} | Mode: {EXCHANGE_ID.upper()}")
+                
+                # BIFURCATED WEALTH BREAKDOWN
+                ts_print(f"=== REAL CAPITAL (LIVE) ===")
+                j = 1
+                for name, eq in exchange_data:
+                    ts_print(f" {j}. SPOT ({name})  : ${eq:,.2f}")
+                    j += 1
+                
+                # Show Active Position Value
+                if current_pos.active:
+                    with lock:
+                        p_price = symbols_state.get(current_pos.symbol, {}).get('price', 0)
+                        pos_value = current_pos.total_qty * p_price
+                    ts_print(f" {j}. POSITION ({current_pos.symbol}): ${pos_value:,.2f} [ACTIVE]")
+                    j += 1
+                
+                ts_print(f" {j}. FUTURES (LIVE) : ${live_f_balance:,.2f} {f_status_tag}")
+                ts_print(f" >> TOTAL REAL     : ${real_grand_total:,.2f}")
+                
+                ts_print(f"\n=== SIMULATION TEST (ES Scaling) ===")
+                ts_print(f" 1. Baseline       : ${sim_baseline:,.2f}")
+                ts_print(f" 2. Current PnL    : ${futures_pnl:,.2f}")
+                ts_print(f" >> SIM EQUITY     : ${sim_equity:,.2f}")
+                ts_print(f" {'='*60}\n")
+                
+            except Exception as e:
+                ts_print(f"[DEBUG] Balance Thread Error: {e}")
+            time.sleep(60)
+
+    # Always start display
+    threading.Thread(target=balance_display_thread, args=(spot_exchange, clients), daemon=True).start()
+    
+    # Load initial PnL
+    state = read_state()
+    cumulative_pnl = state.get('crypto_pnl', 0)
+    
+    # --- POSITION PERSISTENCE RECOVERY ---
+    global is_in_position
+    if current_pos.load():
+        is_in_position = True
+        ts_print(f">>> RECOVERY: Restored active position on {current_pos.symbol} <<<")
+    
+    ts_print(f"Engine Started. Current PnL: ${cumulative_pnl:.2f}")
+    time.sleep(3) # Wait for WS warm up
+    
+    while True:
+        # Halt logic is now handled inside signal checks to permit graceful exit of existing trades
+        try:
+            # 1. Update Global OI (Every 5s is fine via API)
+            if time.time() % 5 < 1:
+                # --- HEARTBEAT CHECK ---
+                lu_ts = engine_meta['last_update_ts']
+                if lu_ts > 0 and (time.time() - lu_ts > 120):
+                    ts_print(f"[CRITICAL] Data stream is STALE! No updates for {time.time()-lu_ts:.0f}s. RESTARTING STREAMS...")
+                    start_websocket_streams() # Force reconnect
+                    engine_meta['last_update_ts'] = time.time() # Reset timer to give it time to connect
+                
+                for sym in WATCH_SYMBOLS:
+                    try:
+                        fut_sym = f"{sym}/USDT:USDT"
+                        oi_data = futures_client.fetch_open_interest(fut_sym)
+                        oi = float(oi_data['openInterestAmount'])
+                        with lock:
+                            symbols_state[sym]['last_oi'] = symbols_state[sym]['oi']
+                            symbols_state[sym]['oi'] = oi
+                    except: pass
+
+            # 2. CORE LOGIC
+            if current_pos.active:
+                # --- MANAGE ACTIVE POSITION ---
+                sym = current_pos.symbol
+                with lock: spot_price = symbols_state[sym]['price']
+                if spot_price == 0: continue
+
+                pnl_pct = (spot_price - current_pos.avg_price) / current_pos.avg_price
+                trade_pnl_usd = (spot_price - current_pos.avg_price) * current_pos.total_qty
+                elapsed = time.time() - current_pos.entry_time
+
+                # A. TRAILING TAKE PROFIT
+                if pnl_pct >= TAKE_PROFIT_PCT:
+                    if not current_pos.is_trailing:
+                        current_pos.is_trailing = True
+                        ts_print(f"!!! {sym} TRAILING ACTIVATED at +{pnl_pct*100:.2f}% !!!")
+                    
+                    if spot_price > current_pos.trailing_peak:
+                        current_pos.trailing_peak = spot_price
+                    
+                    # Exit if price drops TRALING_DROP_PCT from peak
+                    drop_from_peak = (current_pos.trailing_peak - spot_price) / current_pos.trailing_peak
+                    if drop_from_peak >= TRAILING_DROP_PCT:
+                        ts_print(f"!!! {sym} TRAILING EXIT: Caught ${trade_pnl_usd:.2f} !!!")
+                        pnl_usd = execute_trade(spot_exchange, "SELL", 0, spot_price, active_paper_mode, f"{sym}/USDT", exit_reason="Trailing TP")
+                        cumulative_pnl += pnl_usd
+                        update_pnl('crypto_pnl', cumulative_pnl)
+                        check_and_send_alert(pnl_usd, sym)
+                        current_pos.close()
+                        is_in_position = False
+                        continue
+
+                # Apply 12h stagnation rule to everything EXCEPT the current DOGE session
+                is_stagnant = (elapsed > STAGNATION_HOURS * 3600) and (trade_pnl_usd < 0) and (sym != "DOGE")
+                
+                # FINAL DEADLINE: Cut any open trade at 19:45 (7:45 PM) Local Time to ensure EOD flatness
+                now_time = datetime.now().time()
+                is_deadline = (now_time.hour == 19 and now_time.minute >= 45) or (now_time.hour >= 20)
+                
+                if pnl_pct < -STOP_LOSS_PCT or trade_pnl_usd <= -MAX_DRAWDOWN_USD or is_stagnant or is_deadline:
+                    if is_deadline:
+                        note = "EOD EXIT (Flat for tomorrow)"
+                    elif is_stagnant:
+                        note = "STAGNATION EXIT (12h+)"
+                    elif trade_pnl_usd <= -MAX_DRAWDOWN_USD:
+                        note = "MAX DRAWDOWN ($%s)" % MAX_DRAWDOWN_USD
+                    else:
+                        note = "STOP LOSS %"
+                        
+                    ts_print(f"!!! {sym} {note} HIT (${trade_pnl_usd:.2f}) !!!")
+                    pnl_usd = execute_trade(spot_exchange, "SELL", 0, spot_price, active_paper_mode, f"{sym}/USDT", exit_reason=note)
+                    cumulative_pnl += pnl_usd
+                    update_pnl('crypto_pnl', cumulative_pnl)
+                    check_and_send_alert(pnl_usd, sym)
+                    current_pos.close()
+                    is_in_position = False
+                    continue
+
+                # C. DCA BULLETS
+                if current_pos.bullets_fired < len(DCA_BULLETS) and not current_pos.is_trailing:
+                    drop_from_last = (spot_price - current_pos.last_dca_price) / current_pos.last_dca_price
+                    if drop_from_last < -DCA_DROP_TRIGGER:
+                        ts_print(f"!!! {sym} DCA Triggered (-{drop_from_last*100:.2f}%) !!!")
+                        amount = current_pos.trade_capital * DCA_BULLETS[current_pos.bullets_fired]
+                        execute_trade(spot_exchange, "BUY", amount, spot_price, active_paper_mode, f"{sym}/USDT")
+                
+                # D. CIRCUIT BREAKER
+                if elapsed > CIRCUIT_BREAKER_TIME and pnl_pct < CIRCUIT_BREAKER_TARGET:
+                        ts_print(f"!!! {sym} CIRCUIT BREAKER EXIT !!!")
+                        pnl_usd = execute_trade(spot_exchange, "SELL", 0, spot_price, active_paper_mode, f"{sym}/USDT", exit_reason="Circuit Breaker")
+                        cumulative_pnl += pnl_usd
+                        update_pnl('crypto_pnl', cumulative_pnl)
+                        check_and_send_alert(pnl_usd, sym)
+                        current_pos.close()
+                        is_in_position = False
+
+            else:
+                # --- LOOK FOR SERIAL ENTRY ---
+                for sym in WATCH_SYMBOLS:
+                    liqs = get_symbol_liqs(sym)
+                    with lock:
+                        price = symbols_state[sym]['price']
+                        oi = symbols_state[sym]['oi']
+                        last_oi = symbols_state[sym]['last_oi']
+                    
+                    if price == 0 or last_oi == 0: continue
+                    oi_chg = (oi - last_oi) / last_oi
+
+                    # DYNAMIC TIERED THRESHOLD
+                    current_threshold = TIERED_LIQS.get(sym, 8000)
+                    if liqs > current_threshold and oi_chg < -OI_DROP_PCT:
+                        # --- RSI FILTER (Catch Only Elastic Snaps) ---
+                        price_list = list(symbols_state[sym]['price_history'])
+                        rsi = calculate_rsi(price_list)
+                        if rsi >= 28:
+                            if time.time() % 60 < 1:  # Log once per minute
+                                ts_print(f"[FILTER] {sym} signal rejected: RSI={rsi:.1f} (need <32)")
+                            continue
+
+                        # --- KILL SWITCH CHECK (Graceful) ---
+                        if get_kill_switch_status():
+                            if time.time() % 300 < 1: # Log every 5 mins
+                                ts_print("[SAFE MODE] KILL SWITCH ACTIVE. Skipping new entry signal.")
+                            continue
+
+                        # SET FLAG IMMEDIATELY to prevent double firing in current loop
+                        is_in_position = True
+                        
+                        ts_print(f">>> SIGNAL: {sym} | Liq ${liqs:,.0f} | OI Drop {oi_chg*100:.2f}% <<<")
+                        
+                        # FLUSH LIQS for this symbol to avoid "Machine Gun" firing on next tick
+                        with lock:
+                            symbols_state[sym]['liqs_deque'].clear()
+
+                        # Dynamic Compounding Capital Fetch
+                        cap = 0
+                        if spot_exchange:
+                            try:
+                                # Fetch fresh balance to compound profits
+                                bal = spot_exchange.fetch_balance()
+                                cap = bal['free'].get('USDT', 0.0)
+                                if cap < 10.0: # Filter for minimum trade size
+                                    ts_print(f"[WARN] Balance too low to trade: ${cap:.2f}")
+                                    continue
+                            except Exception as e:
+                                ts_print(f"[ERROR] Could not fetch balance for compounding: {e}")
+                                continue
+                        else:
+                            cap = TOTAL_CAPITAL_USD # Fallback for PAPER mode
+                        
+                        current_pos.symbol = sym
+                        current_pos.trade_capital = cap
+                        amount = cap * DCA_BULLETS[0]
+                        ts_print(f">>> COMPOUNDING: Firing 20% of Current Balance (${amount:.2f}) <<<")
+                        execute_trade(spot_exchange, "BUY", amount, price, active_paper_mode, f"{sym}/USDT")
+                        
+                        time.sleep(5) # Cooldown to let balance/orders settle
+                        break # Only one trade at a time
+                
+                if not is_in_position and time.time() % 60 < 1:
+                    status_msg = "[PULSE] KATE is alive and monitoring..."
+                    if get_kill_switch_status():
+                        status_msg = "[SAFE MODE] KILL SWITCH ACTIVE. Halting new entries."
+                    ts_print(status_msg)
+
+        except Exception as e:
+            ts_print(f"Engine Error: {e}")
+            time.sleep(1)
+        
+        time.sleep(0.5) # Fast loop for WebSocket processing
+
+if __name__ == "__main__":
+    check_singleton()
+    try:
+        run_crypto_strategy()
+    finally:
+        cleanup_lock()

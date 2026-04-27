@@ -1,0 +1,204 @@
+import os
+import pandas as pd
+import numpy as np
+from scid_parser import parse_scid, parse_scid_aggregated
+from datetime import time
+
+class BacktestEngine:
+    def __init__(self, initial_balance=1000, risk_per_trade=25):
+        self.initial_balance = initial_balance
+        self.risk_per_trade = risk_per_trade
+        self.balance = initial_balance
+        self.peak_balance = initial_balance
+        self.max_drawdown = 0
+        self.equity_curve = []
+        self.trades = []
+        
+    def aggregate_candles(self, records, timeframe='15min'):
+        """Aggregates raw SCID records into candles of the specified timeframe."""
+        if isinstance(records, list) and len(records) > 0 and 'timestamp' in records[0]:
+             df = pd.DataFrame(records)
+             df.set_index('timestamp', inplace=True)
+        elif isinstance(records, pd.DataFrame):
+             df = records
+        else:
+             return pd.DataFrame()
+        
+        # Resample logic
+        agg_logic = {
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum'
+        }
+        
+        resampled = df.resample(timeframe).apply(agg_logic).dropna()
+        return resampled
+
+    def run_strategy(self, data, symbol, tick_size, tick_value, quantity=1.0, commission=4.00):
+        """
+        v6.0 Precision Scalper Engine
+        - Target: Low Drawdown (<10%) on small accounts ($5k).
+        - Logic: BB Mean Reversion + EMA Trend Pullbacks.
+        - Risk: Hard 3.0pt SL / 5.0pt TP ($150 risk).
+        """
+        if data.empty: return 0
+        df = data.copy()
+        
+        # 1. Timezone Alignment
+        if df.index.tz is None:
+            df.index = df.index.tz_localize('UTC')
+        df.index = df.index.tz_convert('US/Eastern')
+        
+        # 2. Indicator Suite
+        df['sma20'] = df['close'].rolling(20).mean()
+        df['std20'] = df['close'].rolling(20).std()
+        df['upper_bb'] = df['sma20'] + (2 * df['std20'])
+        df['lower_bb'] = df['sma20'] - (2 * df['std20'])
+        df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
+        df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
+        
+        # RSI calculation
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['rsi'] = 100 - (100 / (1 + rs))
+        
+        # Volatility Filter
+        df['tr'] = np.maximum(df['high'] - df['low'], 
+                    np.maximum(abs(df['high'] - df['close'].shift(1)), 
+                               abs(df['low'] - df['close'].shift(1))))
+        df['atr'] = df['tr'].rolling(14).mean()
+        
+        position = 0
+        entry_price = 0
+        stop_loss = 0
+        target_price = 0
+        trade_count = 0
+        
+        daily_pnl = 0
+        trades_today = 0
+        
+        for i in range(200, len(df)): 
+            row = df.iloc[i]
+            prev_row = df.iloc[i-1]
+            curr_time = row.name.time()
+            curr_date = row.name.date()
+            prev_date = prev_row.name.date() if i > 0 else curr_date
+            
+            # Reset daily counters (One-and-Done enforcement)
+            if curr_date != prev_date:
+                daily_pnl = 0
+                trades_today = 0
+
+            # Update Drawdown stats
+            if self.balance > self.peak_balance:
+                self.peak_balance = self.balance
+            current_dd = (self.peak_balance - self.balance) / self.peak_balance if self.peak_balance > 0 else 0
+            self.max_drawdown = max(self.max_drawdown, current_dd)
+
+            # 1. Exit Logic (3pt SL / 5pt TP / EOD)
+            if position != 0:
+                exit_signal = False
+                reason = "NA"
+                
+                if position == 1:
+                    if row['high'] >= target_price:
+                        exit_price = target_price; exit_signal = True; reason = "TAKE_PROFIT"
+                    elif row['low'] <= stop_loss:
+                        exit_price = stop_loss; exit_signal = True; reason = "STOP_LOSS"
+                elif position == -1:
+                    if row['low'] <= target_price:
+                        exit_price = target_price; exit_signal = True; reason = "TAKE_PROFIT"
+                    elif row['high'] >= stop_loss:
+                        exit_price = stop_loss; exit_signal = True; reason = "STOP_LOSS"
+                
+                if not exit_signal and curr_time >= time(15, 45):
+                    exit_price = row['close']
+                    exit_signal = True; reason = "EOD_EXIT"
+                    
+                if exit_signal:
+                    raw_pnl = (exit_price - entry_price) * (tick_value / tick_size) * quantity if position > 0 else (entry_price - exit_price) * (tick_value / tick_size) * quantity
+                    net_pnl = raw_pnl - commission * quantity
+                    self.balance += net_pnl
+                    daily_pnl += net_pnl
+                    self.trades.append({"symbol": symbol, "pnl": net_pnl, "type": reason, "time": row.name, "side": "Long" if position > 0 else "Short"})
+                    position = 0
+                    continue
+
+            # 2. Entry Logic (Only if NO trades today)
+            if position == 0 and trades_today == 0:
+                # Volatility Check (ES Noise Gating)
+                if row['atr'] > 6.0: continue
+                
+                # Market Hours (Primary Session Only for precision)
+                if not (time(9, 30) <= curr_time <= time(15, 30)): continue
+
+                setup_triggered = False
+                
+                # SETUP A: BB Mean Reversion (RSI 30/70)
+                if row['low'] <= row['lower_bb'] and row['rsi'] <= 30:
+                    setup_triggered = True; side = 1; note = "BB_MR_LONG"
+                elif row['high'] >= row['upper_bb'] and row['rsi'] >= 70:
+                    setup_triggered = True; side = -1; note = "BB_MR_SHORT"
+                
+                # SETUP B: Trend Pullback (EMA 20 rejection)
+                if not setup_triggered:
+                    if row['close'] > row['ema200'] and prev_row['low'] <= prev_row['ema20'] and row['close'] > row['ema20']:
+                        setup_triggered = True; side = 1; note = "EMA_PB_LONG"
+                    elif row['close'] < row['ema200'] and prev_row['high'] >= prev_row['ema20'] and row['close'] < row['ema20']:
+                        setup_triggered = True; side = -1; note = "EMA_PB_SHORT"
+
+                if setup_triggered:
+                    position = side
+                    entry_price = row['close']
+                    # Fixed 3.0pt SL / 5.0pt TP for Drawdown Cap
+                    stop_loss = entry_price - (3.0 if side == 1 else -3.0)
+                    target_price = entry_price + (5.0 if side == 1 else -5.0)
+                    trade_count += 1
+                    trades_today += 1
+
+        return trade_count
+
+        return trade_count
+
+if __name__ == "__main__":
+    engine = BacktestEngine(initial_balance=5000)
+    symbols = [
+        {"file": "MESH26_FUT_CME.scid", "name": "ES (Standard S&P)", "tick_size": 0.25, "tick_value": 12.50, "qty": 1.0},
+    ]
+    
+    for s in symbols:
+        path = os.path.join(r"C:\SierraChart\Data", s['file'])
+        if not os.path.exists(path): continue
+        print(f"\nProcessing {s['name']} (Qty: {s['qty']})...")
+        # We use 15m candles to capture ORB and Mean Reversion precision
+        candle_list = parse_scid_aggregated(path, timeframe_min=15, max_gb=2.0)
+        if not candle_list: continue
+        
+        candles = pd.DataFrame(candle_list).set_index('timestamp')
+        num_trades = engine.run_strategy(candles, s['name'], s['tick_size'], s['tick_value'], quantity=s['qty'])
+        print(f"--- {s['name']} Results ---")
+        print(f"Trades: {num_trades}")
+        
+        symbol_trades = [t for t in engine.trades if t['symbol'] == s['name']]
+        if symbol_trades:
+            print(f"Net Symbol PnL: ${sum([t['pnl'] for t in symbol_trades]):.2f}")
+    
+    print("\n" + "="*40)
+    print("FINAL PORTFOLIO PERFORMANCE (v4.3 - 15m)")
+    print("="*40)
+    print(f"Starting Balance: ${engine.initial_balance:.2f}")
+    print(f"Ending Balance:   ${engine.balance:.2f}")
+    print(f"Total PnL:        ${engine.balance - engine.initial_balance:.2f}")
+    print(f"Max Drawdown:     {engine.max_drawdown:.2%}")
+    
+    pnl_only = [t['pnl'] for t in engine.trades]
+    if pnl_only:
+        wins = [p for p in pnl_only if p > 0]
+        losses = [p for p in pnl_only if p <= 0]
+        print(f"Win Rate:         {len(wins)/len(pnl_only):.2%}")
+        print(f"Profit Factor:    {sum(wins)/abs(sum(losses)) if sum(losses) != 0 else 0:.2f}")
+        print(f"Total Trades:     {len(pnl_only)}")

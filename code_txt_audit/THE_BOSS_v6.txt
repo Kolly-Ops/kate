@@ -1,0 +1,172 @@
+# THE_BOSS.py
+import subprocess
+import time
+import os
+import sys
+import json
+import traceback
+
+# Constants
+# MOCK_SERVER_SCRIPT = "mock_dtc_server.py" # Basic static mock
+MOCK_SERVER_SCRIPT = "mock_sierra_server.py" # Advanced dynamic mock with scenarios
+CRYPTO_SCRIPT = "crypto_engine.py"
+FUTURES_SCRIPT = "futures_engine.py"
+
+import threading
+from email_notifier import send_performance_report, send_daily_report
+
+def check_boss_singleton():
+    lock_path = "kate_boss.lock"
+    if os.path.exists(lock_path):
+        try: os.remove(lock_path)
+        except:
+            print("[CRITICAL] KATE Supervisor is already running. Duplicate blocked.")
+            sys.exit(0)
+    open(lock_path, 'w').close()
+
+def cleanup_boss_lock():
+    lock_path = "kate_boss.lock"
+    if os.path.exists(lock_path):
+        try: os.remove(lock_path)
+        except: pass
+
+def start_process(script_name):
+    if not os.path.exists(script_name):
+        print(f"Script {script_name} not found, skipping...")
+        return None
+    print(f"Starting {script_name} in new terminal...")
+    # Use the same python interpreter as the current process
+    # creationflags=subprocess.CREATE_NEW_CONSOLE opens a visible terminal window on Windows
+    return subprocess.Popen([sys.executable, "-u", script_name], creationflags=subprocess.CREATE_NEW_CONSOLE)
+
+def email_scheduler():
+    """5-Hourly performance report scheduler with timestamp safety."""
+    while True:
+        try:
+            current_time = time.time()
+            # Use a state file to ensure we don't double-fire if supervisor restarts
+            state_file = "scheduler_state.json"
+            last_run = 0
+            if os.path.exists(state_file) and os.path.getsize(state_file) > 0:
+                try:
+                    with open(state_file, 'r') as f:
+                        last_run = json.load(f).get('last_5h_report', 0)
+                except:
+                    pass
+            
+            # If 5 hours (18000s) have passed since last run
+            if current_time - last_run >= 18000:
+                print("[SUPERVISOR] Triggering 5-hourly performance report...")
+                send_performance_report()
+                
+                # Update last run time
+                data = {}
+                if os.path.exists(state_file):
+                    with open(state_file, 'r') as f: data = json.load(f)
+                data['last_5h_report'] = current_time
+                with open(state_file, 'w') as f: json.dump(data, f)
+            else:
+                wait_remaining = 18000 - (current_time - last_run)
+                print(f"[SUPERVISOR] Email scheduler: Next 5h report in {wait_remaining/60:.1f} mins.")
+
+        except Exception as e:
+            print(f"[SUPERVISOR] Email scheduler error: {e}")
+        
+        # Check every 10 mins (600s) instead of just sleeping 5h
+        # This makes it more resilient to restarts
+        time.sleep(600)
+
+def daily_report_scheduler():
+    """Daily scheduler for post-market review (16:15 EST)."""
+    while True:
+        try:
+            now = datetime.now()
+            # 16:15 EST is 20:15 UTC (Summer) or 21:15 UTC (Winter)
+            # Since we are in the US/Eastern context for futures, let's use local hour check if possible
+            # Or just check for the 16:15 mark in Eastern Time
+            import pytz
+            est = pytz.timezone('US/Eastern')
+            now_est = datetime.now(est)
+            
+            state_file = "scheduler_state.json"
+            last_date = ""
+            if os.path.exists(state_file):
+                try:
+                    with open(state_file, 'r') as f:
+                        last_date = json.load(f).get('last_daily_date', "")
+                except: pass
+            
+            curr_date = now_est.strftime('%Y-%m-%d')
+            
+            # Fire if it's past 16:15 EST and we haven't sent today's report
+            if now_est.hour == 16 and now_est.minute >= 15 and last_date != curr_date:
+                print(f"[SUPERVISOR] Market Settled ({now_est.strftime('%H:%M')}). Triggering Daily Report...")
+                from email_notifier import send_daily_report
+                send_daily_report()
+                
+                data = {}
+                if os.path.exists(state_file):
+                    with open(state_file, 'r') as f: data = json.load(f)
+                data['last_daily_date'] = curr_date
+                with open(state_file, 'w') as f: json.dump(data, f)
+                
+        except Exception as e:
+            print(f"[SUPERVISOR] Daily report scheduler error: {e}")
+        
+        time.sleep(60) # Check every minute
+
+def weekly_backup_scheduler():
+    """Weekly scheduler for core code backup (Every 7 days)."""
+    while True:
+        try:
+            print("[SUPERVISOR] Triggering 7-day Weekly Code Backup...")
+            import backup_system
+            p = backup_system.create_backup()
+            if p:
+                backup_system.send_backup_email(p)
+        except Exception as e:
+            print(f"[SUPERVISOR] Backup scheduler error: {e}")
+        
+        # Wait 7 days (604,800 seconds)
+        time.sleep(604800)
+
+def main():
+    print("--- KATE TRADING SUPERVISOR STARTED ---")
+    
+    # Start Email Scheduler Threads
+    threading.Thread(target=email_scheduler, daemon=True).start()
+    threading.Thread(target=daily_report_scheduler, daemon=True).start()
+    threading.Thread(target=weekly_backup_scheduler, daemon=True).start()
+
+    # mock_server = start_process(MOCK_SERVER_SCRIPT)
+    mock_server = None
+    crypto_bot = start_process(CRYPTO_SCRIPT)
+    futures_bot = start_process(FUTURES_SCRIPT) 
+    
+    try:
+        while True:
+            # if mock_server and mock_server.poll() is not None:
+            #     print("CRITICAL: Mock Server Stopped! Restarting...")
+            #     mock_server = start_process(MOCK_SERVER_SCRIPT)
+
+            if crypto_bot and crypto_bot.poll() is not None:
+                print("CRITICAL: Crypto Bot Crashed! Restarting...")
+                crypto_bot = start_process(CRYPTO_SCRIPT)
+                
+            if futures_bot and futures_bot.poll() is not None:
+                print("CRITICAL: Futures Bot Crashed! Restarting...")
+                futures_bot = start_process(FUTURES_SCRIPT)
+                
+            time.sleep(5)
+    except KeyboardInterrupt:
+        print("Shutting down supervisor and bots...")
+        if mock_server: mock_server.terminate()
+        if crypto_bot: crypto_bot.terminate()
+        if futures_bot: futures_bot.terminate()
+
+if __name__ == "__main__":
+    check_boss_singleton()
+    try:
+        main()
+    finally:
+        cleanup_boss_lock()
