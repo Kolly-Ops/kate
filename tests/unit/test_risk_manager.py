@@ -53,6 +53,7 @@ def make_intent(
     stop_loss: float | None = 4998.0,   # 2pt = 8 ticks = $10 = 0.93% of $1080
     side: int = proto.BUY,
     per_contract_margin: float = 100.0,
+    round_trip_commission: float = 0.0,
 ) -> TradeIntent:
     return TradeIntent(
         intent_id="T-001",
@@ -67,6 +68,7 @@ def make_intent(
         price=price,
         stop_loss=stop_loss,
         per_contract_margin=per_contract_margin,
+        round_trip_commission=round_trip_commission,
     )
 
 
@@ -240,6 +242,69 @@ def test_with_policy_returns_new_manager_with_overrides(
     assert relaxed.evaluate(intent, healthy_account).approved
     # Original manager unchanged
     assert manager.policy.max_risk_per_trade_pct_nlv == 0.015
+
+
+# ── Commission integration into per-trade-risk ────────────────────────────
+# Per CEO+Gemini decision (2026-04-27): for sim mode commission stays at 0
+# (matching Sierra Trade Sim's zero-commission fills); for live mode set to
+# the broker's real rate (EdgeClear MES = $1.38/RT). The risk math must add
+# commission to gross slippage so the per-trade cap evaluates TOTAL cost.
+
+def test_default_commission_zero_preserves_phase_a_behavior(
+    manager: RiskManager, healthy_account: AccountState
+) -> None:
+    """Default round_trip_commission = 0.0 (sim mode). Risk amount equals
+    pure price-move risk — same as Phase A pre-commission integration."""
+    intent = make_intent(stop_loss=4998.0)   # 2pt = $10 gross risk
+    verdict = manager.evaluate(intent, healthy_account)
+    assert verdict.approved
+    assert verdict.risk_amount == pytest.approx(10.0)
+
+
+def test_non_zero_commission_adds_to_risk_amount(
+    manager: RiskManager, healthy_account: AccountState
+) -> None:
+    """Live mode: round_trip_commission > 0 lifts risk_amount accordingly."""
+    intent = make_intent(stop_loss=4998.0, round_trip_commission=1.38)  # EdgeClear MES live rate
+    verdict = manager.evaluate(intent, healthy_account)
+    assert verdict.approved
+    # gross $10 + $1.38 commission = $11.38
+    assert verdict.risk_amount == pytest.approx(11.38)
+
+
+def test_commission_scales_with_quantity(
+    manager: RiskManager, healthy_account: AccountState
+) -> None:
+    """Round-trip commission is per-contract — 2 contracts pays 2× fees."""
+    intent = make_intent(
+        quantity=2.0,
+        stop_loss=4999.0,                  # 1pt × 2 contracts = $10 gross
+        round_trip_commission=1.38,        # × 2 contracts = $2.76 fees
+        per_contract_margin=50.0,          # × 2 = $100, fits margin cap
+    )
+    verdict = manager.evaluate(intent, healthy_account)
+    assert verdict.approved, verdict.reasons
+    # $10 gross + $2.76 commission = $12.76 (1.18% of $1080, under 1.5% cap)
+    assert verdict.risk_amount == pytest.approx(12.76)
+
+
+def test_commission_can_push_borderline_trade_from_approve_to_reject(
+    manager: RiskManager, healthy_account: AccountState
+) -> None:
+    """A trade whose pure slippage risk fits under the 1.5% cap can be
+    rejected once commissions are added — exactly the systematic-over-
+    approval bug the integration prevents."""
+    # $1080 × 1.5% = $16.20 cap. Pick a stop where gross risk is $15.50
+    # (under cap) and commission pushes it to $16.88 (over cap).
+    # Stop 12.4 ticks = 3.1 pts: $15.50 gross at $1.25/tick.
+    # 3.1 pts → entry-stop = 5000 - 3.1 = 4996.9
+    intent = make_intent(stop_loss=4996.9, round_trip_commission=1.38)
+    # Without commission this would approve; with it, it should reject.
+    base = manager.evaluate(make_intent(stop_loss=4996.9), healthy_account)
+    assert base.approved, base.reasons       # baseline: pure slippage fits
+    fees = manager.evaluate(intent, healthy_account)
+    assert not fees.approved, "commission should have pushed over the 1.5% cap"
+    assert any("per_trade_risk" in r for r in fees.reasons)
 
 
 # ── AccountState helpers ───────────────────────────────────────────────────

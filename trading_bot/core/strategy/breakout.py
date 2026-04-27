@@ -125,6 +125,7 @@ class AtrBreakoutStrategy(Strategy):
                 stop_loss=stop,
                 take_profit=target,
                 per_contract_margin=ctx.per_contract_margin,
+                round_trip_commission=ctx.round_trip_commission,
                 reason=(
                     f"breakout: close {c.close:.2f} > prior-{self.breakout_lookback}-high "
                     f"{breakout_high:.2f} AND > SMA{self.ma_period} {ma_value:.2f}; "

@@ -44,6 +44,14 @@ class TradeIntent:
     # supplies it because broker margin tables are external to this module.
     per_contract_margin: float = 0.0
 
+    # Per-contract round-trip commission. RiskManager adds this to gross
+    # price-move risk so the per-trade-risk gate evaluates TOTAL cost, not
+    # just slippage. Strategies populate from StrategyContext (which gets
+    # it from InstrumentMeta). Defaults to 0.0 to match Sierra Trade Sim's
+    # zero-commission fills; for live mode set to the broker's actual rate
+    # (EdgeClear MES = $1.38/RT verified April 2026).
+    round_trip_commission: float = 0.0
+
     reason: str = ""             # free-text strategy rationale
     metadata: dict[str, str] = field(default_factory=dict)
 

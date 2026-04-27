@@ -112,6 +112,7 @@ def _build_instruments(symbols: list[str]) -> dict[str, InstrumentMeta]:
             tick_size=rt.tick_size,
             tick_value=rt.tick_value,
             per_contract_margin=rt.per_contract_margin,
+            round_trip_commission=rt.round_trip_commission,
         )
     return out
 

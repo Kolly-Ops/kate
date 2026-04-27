@@ -36,6 +36,7 @@ class StrategyContext:
     tick_value: float
     per_contract_margin: float
     has_open_position: bool
+    round_trip_commission: float = 0.0   # per-contract round-trip; baked into risk math (default 0 = Sierra Sim)
 
 
 class Strategy(ABC):

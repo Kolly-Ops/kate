@@ -145,9 +145,18 @@ class RiskManager:
             )
 
         # ── Gate 5: Per-trade risk (requires stop loss) ──────────────────
+        # Total per-trade risk = gross price-move risk + round-trip commission.
+        # The gate evaluates TOTAL cost vs the policy cap, not just slippage —
+        # otherwise the bot systematically over-approves on small-stop trades
+        # where commissions are a meaningful fraction of risk. Per CEO+Gemini
+        # decision (2026-04-27): commission stays at 0 for sim mode (matching
+        # Sierra Trade Sim's zero-commission fills) and switches to real
+        # EdgeClear rate ($1.38/RT for MES) at live transition, keeping local
+        # vs broker NLV reconciliation clean.
         risk_amount: Optional[float] = None
         risk_pct: Optional[float] = None
         entry_price = intent.price if intent.price > 0 else None
+        commission_total = intent.round_trip_commission * intent.quantity
 
         if intent.stop_loss is None:
             if self.policy.require_stop_loss:
@@ -162,12 +171,15 @@ class RiskManager:
             )
         else:
             ticks_to_stop = abs(entry_price - intent.stop_loss) / intent.tick_size
-            risk_amount = ticks_to_stop * intent.tick_value * intent.quantity
+            gross_risk = ticks_to_stop * intent.tick_value * intent.quantity
+            risk_amount = gross_risk + commission_total
             risk_pct = risk_amount / account.nlv if account.nlv > 0 else float("inf")
             if risk_pct > self.policy.max_risk_per_trade_pct_nlv:
                 reasons.append(
-                    f"per_trade_risk: ${risk_amount:.2f} ({risk_pct:.2%}) "
-                    f"> limit {self.policy.max_risk_per_trade_pct_nlv:.2%}"
+                    f"per_trade_risk: ${risk_amount:.2f} "
+                    f"(${gross_risk:.2f} slippage + ${commission_total:.2f} fees) "
+                    f"= {risk_pct:.2%} > limit "
+                    f"{self.policy.max_risk_per_trade_pct_nlv:.2%}"
                 )
 
         if reasons:

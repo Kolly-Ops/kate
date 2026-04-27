@@ -79,6 +79,14 @@ class InstrumentMeta:
     tick_size: float
     tick_value: float
     per_contract_margin: float
+    # Per-contract round-trip commission. For sim mode, set to 0.0 to match
+    # Sierra Trade Sim's default zero-commission fills (verified by COO
+    # Gemini 2026-04-27 — `findstr /s /i commission C:\SierraChart\*` empty
+    # across xml/cht/ini). For live mode, set to the broker's actual rate;
+    # EdgeClear MES is $1.38/RT ($0.69/side) verified April 2026. Setting
+    # this AND Sierra's matching commission config in lockstep keeps the
+    # local NLV vs broker NLV reconciliation clean.
+    round_trip_commission: float = 0.0
 
 
 class ManagedFuturesEngine:
@@ -354,6 +362,7 @@ class ManagedFuturesEngine:
             tick_size=meta.tick_size,
             tick_value=meta.tick_value,
             per_contract_margin=meta.per_contract_margin,
+            round_trip_commission=meta.round_trip_commission,
             has_open_position=self._has_open_position(symbol, meta.exchange),
         )
 
