@@ -144,6 +144,28 @@ def _on_intent_rejected(intent, verdict) -> None:  # type: ignore[no-untyped-def
     )
 
 
+async def _verify_dtc_reachable(host: str, port: int, *, timeout: float = 3.0) -> None:
+    """Quick TCP probe before the supervisor commits to a full DTC handshake.
+    Fails with a clear error message if the host:port isn't accepting
+    connections — saves debugging time when (e.g.) a firewall rule has
+    silently lapsed or Sierra is down. Does NOT validate that the listener
+    is actually a DTC server — just that something is accepting TCP."""
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout
+        )
+    except (asyncio.TimeoutError, OSError) as e:
+        raise SystemExit(
+            f"supervisor: cannot reach DTC server at {host}:{port} — {e}\n"
+            f"  is Sierra running? is the firewall open? is the IP correct?"
+        ) from e
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except Exception:
+        pass
+
+
 async def _run(args: argparse.Namespace) -> int:
     config_dir = Path(args.config_dir)
     db_path = Path(args.db_path)
@@ -196,6 +218,13 @@ async def _run(args: argparse.Namespace) -> int:
             LOGGER.info("supervisor: dry-run successful — exiting without connecting")
             return 0
 
+        # Pre-flight TCP probe before the full DTC handshake. Fails fast
+        # with a clear error if the host:port isn't reachable, instead of
+        # the asyncio traceback wall the engine produces on a bad connect.
+        LOGGER.info("supervisor: probing DTC reachability at %s:%d", args.dtc_host, args.dtc_port)
+        await _verify_dtc_reachable(args.dtc_host, args.dtc_port)
+        LOGGER.info("supervisor: DTC port reachable — proceeding with logon")
+
         stop_event = asyncio.Event()
 
         def _request_stop(sig_name: str) -> None:
@@ -215,7 +244,23 @@ async def _run(args: argparse.Namespace) -> int:
                 # outer asyncio.run level — handled in main().
                 pass
 
-        await engine.start()
+        try:
+            await engine.start()
+        except (asyncio.TimeoutError, OSError, ConnectionError) as e:
+            # The most common cause is Sierra-side: the DTC port is open
+            # but the server closes the connection before LOGON_RESPONSE
+            # (allow-list, encoding mismatch, stale client holding the slot,
+            # "Allow Trading from Network DTC Clients" disabled). Surface
+            # a clear actionable message instead of an asyncio traceback.
+            LOGGER.error(
+                "supervisor: DTC handshake failed — %s. Check Sierra's "
+                "Trade Service Log on the VPS for the reason. Common "
+                "causes: 'Allow Trading from Network DTC Clients' off; "
+                "stale DTC client holding the slot; encoding mismatch; "
+                "IP not in Sierra's allow-list.", e,
+            )
+            return 2
+
         run_task = asyncio.create_task(engine.run(), name="engine.run")
         stop_task = asyncio.create_task(stop_event.wait(), name="stop_signal")
 

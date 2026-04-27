@@ -259,6 +259,12 @@ class ManagedFuturesEngine:
             count += 1
 
     def _handle_dtc_message(self, msg: DTCMessage) -> None:
+        # Always log inbound traffic at INFO so paper-live logs are
+        # diagnosable without flipping log levels mid-session.
+        logger.info(
+            "DTC inbound: msg_type=%d size=%d",
+            msg.msg_type, len(msg.body),
+        )
         try:
             if msg.msg_type == proto.ORDER_UPDATE:
                 self._handle_order_update(proto.unpack_order_update(msg.body))
@@ -271,11 +277,23 @@ class ManagedFuturesEngine:
             elif msg.msg_type == proto.HEARTBEAT:
                 pass   # background heartbeat task handles outbound
             else:
-                logger.debug("engine: unhandled msg_type %d", msg.msg_type)
+                logger.warning("engine: unhandled msg_type %d", msg.msg_type)
         except Exception:
             logger.exception("engine: failed to handle msg_type %d", msg.msg_type)
 
     def _handle_order_update(self, msg: proto.OrderUpdate) -> None:
+        # Sierra sends a sentinel ORDER_UPDATE with NoOrders=1 when
+        # responding to OPEN_ORDERS_REQUEST on a flat account. This is
+        # NOT a real order update — skip it so the empty client_order_id
+        # doesn't poison broker_orders and create false reconciliation
+        # drift against the empty local state.
+        if msg.no_orders:
+            logger.info(
+                "engine: ORDER_UPDATE no-orders sentinel (broker reports "
+                "no open orders) — broker_orders cleared"
+            )
+            self._broker_orders.clear()
+            return
         store_status = proto.dtc_order_status_to_state_store(msg.order_status)
         # Always update our remote-orders snapshot
         self._broker_orders[msg.client_order_id] = RemoteOrder(

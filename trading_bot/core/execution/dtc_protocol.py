@@ -395,6 +395,12 @@ class OrderUpdate:
     Engine maps `order_status` → StateStore status string via
     `dtc_order_status_to_state_store()`. `info_text` becomes the
     `rejected_reason` when status indicates rejection.
+
+    `no_orders` is True when Sierra responds to OPEN_ORDERS_REQUEST on a
+    flat account — it's a sentinel "no orders to report" message, NOT a
+    real order update. Engine must skip these rather than register them
+    in broker_orders (otherwise they show up as false reconciliation drift
+    against the empty local state).
     """
     client_order_id: str
     server_order_id: str
@@ -410,6 +416,7 @@ class OrderUpdate:
     last_fill_quantity: float
     trade_account: str
     info_text: str
+    no_orders: bool
     raw_size: int
 
 
@@ -496,7 +503,7 @@ def unpack_order_update(data: bytes) -> OrderUpdate:
         _last_fill_exec_id_b,
         trade_account_b,
         info_text_b,
-        _no_orders,
+        no_orders,
         _parent_oid_b, _oco_oid_b,
         _open_close,
         _prev_client_oid_b,
@@ -519,6 +526,7 @@ def unpack_order_update(data: bytes) -> OrderUpdate:
         last_fill_quantity=last_fill_qty,
         trade_account=_decode_cstr(trade_account_b),
         info_text=_decode_cstr(info_text_b),
+        no_orders=bool(no_orders),
         raw_size=raw_size,
     )
 
