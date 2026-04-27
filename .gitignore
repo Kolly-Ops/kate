@@ -21,7 +21,14 @@ Thumbs.db
 data/*.csv
 data/*.scid
 data/*.depth
+data/*.db
+data/*.db-wal
+data/*.db-shm
 !data/.gitkeep
+
+# Logs — local only
+logs/
+*.log
 
 # Legacy KATE audit dumps — operational data + account info, do not commit
 # (kept locally for reference; copy into data/ for any artifact you actually need)
