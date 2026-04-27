@@ -103,8 +103,16 @@ class AtrBreakoutStrategy(Strategy):
         if c.close > breakout_high and c.close > ma_value:
             stop = c.close - self.atr_stop_mult * atr_value
             target = c.close + self.atr_target_mult * atr_value
+            # intent_id must fit in DTC's ClientOrderID[32] field on the
+            # wire. Use a compact deterministic format: strategy tag +
+            # symbol + bar timestamp. The full strategy name (with
+            # parameters) is preserved in `strategy_name` for audit.
+            intent_id = (
+                f"atrbo-{ctx.symbol[:10]}-"
+                f"{c.timestamp.strftime('%y%m%d%H%M%S')}"
+            )
             return TradeIntent(
-                intent_id=f"{self.name}|{ctx.symbol}|{c.timestamp.isoformat()}",
+                intent_id=intent_id,
                 strategy_name=self.name,
                 symbol=ctx.symbol,
                 exchange=ctx.exchange,

@@ -144,6 +144,45 @@ def pack_market_data_request(
     )
 
 
+def pack_open_orders_request(
+    *, request_id: int = 0, server_order_id: str = "", trade_account: str = ""
+) -> bytes:
+    """OPEN_ORDERS_REQUEST (msg 300). Empty `server_order_id` + `trade_account`
+    request all open orders across all accounts."""
+    fmt = "<HH i 32s 32s"
+    size = struct.calcsize(fmt)
+    return struct.pack(
+        fmt, size, OPEN_ORDERS_REQUEST, request_id,
+        server_order_id.encode("utf-8"), trade_account.encode("utf-8"),
+    )
+
+
+def pack_current_positions_request(
+    *, request_id: int = 0, trade_account: str = ""
+) -> bytes:
+    """CURRENT_POSITIONS_REQUEST (msg 310). Empty `trade_account` requests
+    all accounts."""
+    fmt = "<HH i 32s"
+    size = struct.calcsize(fmt)
+    return struct.pack(
+        fmt, size, CURRENT_POSITIONS_REQUEST, request_id,
+        trade_account.encode("utf-8"),
+    )
+
+
+def pack_account_balance_request(
+    *, request_id: int = 0, trade_account: str = ""
+) -> bytes:
+    """ACCOUNT_BALANCE_REQUEST (msg 400). Empty `trade_account` requests
+    all accounts."""
+    fmt = "<HH i 32s"
+    size = struct.calcsize(fmt)
+    return struct.pack(
+        fmt, size, ACCOUNT_BALANCE_REQUEST, request_id,
+        trade_account.encode("utf-8"),
+    )
+
+
 def pack_submit_order(
     *,
     symbol: str,

@@ -173,7 +173,11 @@ def test_breakout_long_intent_is_emitted() -> None:
     assert intent.take_profit == pytest.approx(127.0)
     assert intent.per_contract_margin == 100.0
     assert "breakout" in intent.reason
-    assert intent.strategy_name in intent.intent_id
+    # intent_id is short (≤32 chars to fit DTC ClientOrderID[32]) and
+    # includes the strategy tag + symbol + timestamp for uniqueness.
+    assert len(intent.intent_id) <= 32
+    assert intent.intent_id.startswith("atrbo-")
+    assert "MESM26" in intent.intent_id
 
 
 def test_no_signal_when_close_below_breakout_high() -> None:
