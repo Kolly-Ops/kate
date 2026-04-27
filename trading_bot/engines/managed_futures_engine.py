@@ -222,14 +222,20 @@ class ManagedFuturesEngine:
         Does NOT block forever — uses a bounded drain. If the broker
         doesn't reply within the timeout, we proceed with whatever we
         have (the reconciler will catch the gap on its next pass)."""
+        # Per COO Gemini's 2026-04-27 wire-capture diff: Sierra wants the
+        # TradeAccount field EMPTY in seed requests (it filters server-side
+        # based on the logon's account context). Sending "E8933" caused the
+        # initial connect to receive zero balance/positions responses — the
+        # account-name mismatch was a silent drop. Use empty here; the
+        # configured self.trade_account still flows through SUBMIT orders.
         self.dtc._writer.write(   # noqa: SLF001 — direct send is fine here
-            proto.pack_account_balance_request(trade_account=self.trade_account)
+            proto.pack_account_balance_request(request_id=1, trade_account="")
         )
         self.dtc._writer.write(   # noqa: SLF001
-            proto.pack_current_positions_request(trade_account=self.trade_account)
+            proto.pack_current_positions_request(request_id=2, trade_account="")
         )
         self.dtc._writer.write(   # noqa: SLF001
-            proto.pack_open_orders_request(trade_account=self.trade_account)
+            proto.pack_open_orders_request(request_id=3, trade_account="")
         )
         await self.dtc._writer.drain()   # noqa: SLF001
 

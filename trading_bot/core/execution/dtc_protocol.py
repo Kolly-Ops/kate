@@ -30,16 +30,19 @@ CANCEL_REPLACE_ORDER             = 204
 SUBMIT_NEW_SINGLE_ORDER          = 208
 OPEN_ORDERS_REQUEST              = 300
 ORDER_UPDATE                     = 301
-HISTORICAL_ORDER_FILLS_REQUEST   = 305
-# Sierra DTC v8 msg IDs corrected per COO Gemini's 2026-04-27 wire capture:
-# real Sierra emits POSITION_UPDATE as 306 and ACCOUNT_BALANCE_UPDATE as 600.
-# My earlier 311 / 402 were guesses from public docs that were wrong for v8.
+# Sierra DTC v8 msg IDs corrected per COO Gemini's 2026-04-27 wire captures:
+# - 16:55 UK capture: POSITION_UPDATE = 306 (was 311), ACCOUNT_BALANCE_UPDATE = 600 (was 402)
+# - 20:20 UK capture: ACCOUNT_BALANCE_REQUEST = 601 (was 400),
+#   CURRENT_POSITIONS_REQUEST = 305 (was 310). The first set fixed inbound
+#   parsing; the second set fixed outbound seed requests — without them
+#   Sierra silently dropped my balance + positions requests on the first
+#   real-Sierra connect (logs showed only ORDER_UPDATE coming back).
 # See tests/unit/test_dtc_protocol_wire.py — parses Gemini's actual Sierra
-# hex captures through these constants + the unpackers below.
+# hex through these constants + the unpackers below.
+CURRENT_POSITIONS_REQUEST        = 305
 POSITION_UPDATE                  = 306
-CURRENT_POSITIONS_REQUEST        = 310
 
-ACCOUNT_BALANCE_REQUEST          = 400
+ACCOUNT_BALANCE_REQUEST          = 601
 ACCOUNT_BALANCE_UPDATE           = 600
 
 # ── Trade mode (LogonRequest field) ───────────────────────────────────────
@@ -149,14 +152,22 @@ def pack_market_data_request(
 
 
 def pack_open_orders_request(
-    *, request_id: int = 0, server_order_id: str = "", trade_account: str = ""
+    *,
+    request_id: int = 0,
+    request_all_orders: int = 0,
+    server_order_id: str = "",
+    trade_account: str = "",
 ) -> bytes:
-    """OPEN_ORDERS_REQUEST (msg 300). Empty `server_order_id` + `trade_account`
-    request all open orders across all accounts."""
-    fmt = "<HH i 32s 32s"
+    """OPEN_ORDERS_REQUEST (msg 300). Sierra DTC v8 layout per COO Gemini's
+    2026-04-27 20:20 wire capture — 76 bytes total, with a `RequestAllOrders`
+    int32 between RequestID and ServerOrderID. Earlier 72-byte version
+    omitted RequestAllOrders; Sierra was tolerant enough to still respond,
+    which is how we initially missed the bug."""
+    fmt = "<HH i i 32s 32s"
     size = struct.calcsize(fmt)
     return struct.pack(
-        fmt, size, OPEN_ORDERS_REQUEST, request_id,
+        fmt, size, OPEN_ORDERS_REQUEST,
+        request_id, request_all_orders,
         server_order_id.encode("utf-8"), trade_account.encode("utf-8"),
     )
 

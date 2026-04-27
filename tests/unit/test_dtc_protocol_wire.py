@@ -130,6 +130,70 @@ def test_real_order_update_unpacks_open_orders_request_response(
     assert msg.raw_size == 720
 
 
+# ── Outbound request bytes match COO Gemini's known-working wire capture ──
+# Gemini's 2026-04-27 20:20 UK script triggered Sierra responses to all 3
+# seed requests. These hex strings are her EXACT working bytes — our
+# pack_*_request functions must produce byte-identical output, otherwise
+# Sierra silently drops the request (which is exactly what bit us during
+# the first real-Sierra connect at 20:08 UK).
+GEMINI_WORKING_ACCOUNT_BALANCE_REQUEST_HEX = (
+    "28005902"
+    "01000000"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+)
+
+GEMINI_WORKING_CURRENT_POSITIONS_REQUEST_HEX = (
+    "28003101"
+    "02000000"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+)
+
+GEMINI_WORKING_OPEN_ORDERS_REQUEST_HEX = (
+    "4c002c01"
+    "03000000"
+    "00000000"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+)
+
+
+def test_pack_account_balance_request_matches_gemini_working_hex() -> None:
+    expected = bytes.fromhex(GEMINI_WORKING_ACCOUNT_BALANCE_REQUEST_HEX)
+    actual = proto.pack_account_balance_request(request_id=1, trade_account="")
+    assert actual == expected, (
+        f"\nExpected (Gemini): {expected.hex()}"
+        f"\nActual (mine):     {actual.hex()}"
+    )
+    # Sanity: type ID at bytes 2-3 little-endian = 601
+    assert struct.unpack("<H", actual[2:4])[0] == 601
+    assert len(actual) == 40
+
+
+def test_pack_current_positions_request_matches_gemini_working_hex() -> None:
+    expected = bytes.fromhex(GEMINI_WORKING_CURRENT_POSITIONS_REQUEST_HEX)
+    actual = proto.pack_current_positions_request(request_id=2, trade_account="")
+    assert actual == expected, (
+        f"\nExpected (Gemini): {expected.hex()}"
+        f"\nActual (mine):     {actual.hex()}"
+    )
+    assert struct.unpack("<H", actual[2:4])[0] == 305
+    assert len(actual) == 40
+
+
+def test_pack_open_orders_request_matches_gemini_working_hex() -> None:
+    expected = bytes.fromhex(GEMINI_WORKING_OPEN_ORDERS_REQUEST_HEX)
+    actual = proto.pack_open_orders_request(
+        request_id=3, request_all_orders=0,
+        server_order_id="", trade_account="",
+    )
+    assert actual == expected, (
+        f"\nExpected (Gemini): {expected.hex()}"
+        f"\nActual (mine):     {actual.hex()}"
+    )
+    assert struct.unpack("<H", actual[2:4])[0] == 300
+    assert len(actual) == 76
+
+
 # ── Direct byte-offset spot-checks (paranoia / drift catcher) ─────────────
 def test_account_balance_cash_at_byte_offset_8(captures: dict) -> None:
     """CashBalance double sits at byte offset 8 (4-byte header +
