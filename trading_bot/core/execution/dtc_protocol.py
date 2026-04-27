@@ -254,3 +254,327 @@ def unpack_heartbeat(data: bytes) -> HeartbeatMessage:
         raise ValueError(f"HEARTBEAT too short: {len(data)}b (need {size}b)")
     _size, _type, num_dropped, timestamp = struct.unpack(HEARTBEAT_FMT, data[:size])
     return HeartbeatMessage(num_dropped=num_dropped, timestamp=timestamp)
+
+
+# ── Sierra OrderStatusEnum (msg 301 OrderStatus field) ────────────────────
+# Per Sierra DTC v8 OrderStatusEnum. Engine maps these to StateStore's
+# string statuses (PENDING / WORKING / FILLED / CANCELLED / REJECTED).
+ORDER_STATUS_UNSPECIFIED              = 0
+ORDER_STATUS_ORDER_SENT               = 1
+ORDER_STATUS_PENDING_OPEN             = 2
+ORDER_STATUS_PENDING_CHILD            = 3
+ORDER_STATUS_OPEN                     = 4
+ORDER_STATUS_PENDING_CANCEL_REPLACE   = 5
+ORDER_STATUS_PENDING_CANCEL           = 6
+ORDER_STATUS_FILLED                   = 7
+ORDER_STATUS_CANCELED                 = 8
+ORDER_STATUS_REJECTED                 = 9
+ORDER_STATUS_PARTIALLY_FILLED         = 10
+
+
+# ── Inbound message struct formats (Sierra DTC v8) ────────────────────────
+# Source: COO Gemini's extraction from Sierra's DTCProtocol.h, 2026-04-27.
+# All formats are byte-packed (`<` little-endian, no alignment) — matches
+# the wire format Sierra accepted for outbound LOGON_REQUEST and
+# SubmitNewSingleOrder. As with LOGON_RESPONSE, we unpack only the stable
+# prefix and ignore trailing bytes; this insulates us against Sierra
+# appending capability flags in future versions.
+ORDER_UPDATE_FMT = (
+    "<HH"            # Size, Type
+    "iii"            # RequestID, TotalNumMessages, MessageNumber
+    "64s 16s"        # Symbol, Exchange
+    "32s 32s 32s 32s"# PreviousServerOrderID, ServerOrderID, ClientOrderID, ExchangeOrderID
+    "iiii"           # OrderStatus, OrderUpdateReason, OrderType, BuySell
+    "dd"             # Price1, Price2
+    "i"              # TimeInForce
+    "d"              # GoodTillDateTime
+    "dddd"           # OrderQuantity, FilledQuantity, RemainingQuantity, AverageFillPrice
+    "d"              # LastFillPrice
+    "q"              # LastFillDateTime (t_DateTimeWithMillisecondsInt — int64)
+    "d"              # LastFillQuantity
+    "64s"            # LastFillExecutionID
+    "32s"            # TradeAccount
+    "96s"            # InfoText
+    "B"              # NoOrders
+    "32s 32s"        # ParentServerOrderID, OCOLinkedOrderServerOrderID
+    "i"              # OpenOrClose
+    "32s"            # PreviousClientOrderID
+    "48s"            # FreeFormText
+    "d d"            # OrderReceivedDateTime, LatestTransactionDateTime
+    "32s"            # Username
+)
+ORDER_UPDATE_SIZE = struct.calcsize(ORDER_UPDATE_FMT)
+
+POSITION_UPDATE_FMT = (
+    "<HH"            # Size, Type
+    "iii"            # RequestID, TotalNumberMessages, MessageNumber
+    "64s 16s"        # Symbol, Exchange
+    "dd"             # Quantity (signed), AveragePrice
+    "32s 32s"        # PositionIdentifier, TradeAccount
+    "BB"             # NoPositions, Unsolicited
+    "d"              # MarginRequirement
+    "i"              # EntryDateTime (t_DateTime4Byte — int32)
+    "ddddd"          # OpenProfitLoss, HighPriceDuringPosition, LowPriceDuringPosition,
+                     # QuantityLimit, MaxPotentialPostionQuantity
+)
+POSITION_UPDATE_SIZE = struct.calcsize(POSITION_UPDATE_FMT)
+
+ACCOUNT_BALANCE_UPDATE_FMT = (
+    "<HH"            # Size, Type
+    "i"              # RequestID
+    "dd"             # CashBalance, BalanceAvailableForNewPositions
+    "8s"             # AccountCurrency
+    "32s"            # TradeAccount
+    "dd"             # SecuritiesValue, MarginRequirement
+    "ii"             # TotalNumberMessages, MessageNumber
+    "BB"             # NoAccountBalances, Unsolicited
+    "dd"             # OpenPositionsProfitLoss, DailyProfitLoss
+    "96s"            # InfoText
+    "Q"              # TransactionIdentifier (uint64)
+    "dd"             # DailyNetLossLimit, TrailingAccountValueToLimitPositions
+    "BBBB"           # DailyNetLossLimitReached, IsUnderRequiredMargin,
+                     # ClosePositionsAtEndOfDay, TradingIsDisabled
+    "96s"            # Description
+    "B"              # IsUnderRequiredAccountValue
+    "q"              # TransactionDateTime (t_DateTimeWithMicrosecondsInt — int64)
+    "ddd"            # MarginRequirementFull, MarginRequirementFullPositionsOnly,
+                     # PeakMarginRequirement
+    "32s"            # IntroducingBroker
+)
+ACCOUNT_BALANCE_UPDATE_SIZE = struct.calcsize(ACCOUNT_BALANCE_UPDATE_FMT)
+
+
+# ── Inbound message dataclasses ───────────────────────────────────────────
+@dataclass(frozen=True)
+class OrderUpdate:
+    """Subset of s_OrderUpdate (msg 301) the engine cares about.
+
+    Engine maps `order_status` → StateStore status string via
+    `dtc_order_status_to_state_store()`. `info_text` becomes the
+    `rejected_reason` when status indicates rejection.
+    """
+    client_order_id: str
+    server_order_id: str
+    symbol: str
+    exchange: str
+    order_status: int        # raw enum; use dtc_order_status_to_state_store
+    order_update_reason: int
+    side: int                # BUY / SELL
+    filled_quantity: float
+    remaining_quantity: float
+    average_fill_price: float
+    last_fill_price: float
+    last_fill_quantity: float
+    trade_account: str
+    info_text: str
+    raw_size: int
+
+
+@dataclass(frozen=True)
+class PositionUpdate:
+    """Subset of s_PositionUpdate (msg 311) the engine cares about.
+
+    `quantity` is signed: positive = long, negative = short — matches the
+    Reconciler's RemotePosition convention.
+    """
+    symbol: str
+    exchange: str
+    trade_account: str
+    quantity: float
+    average_price: float
+    margin_requirement: float
+    open_profit_loss: float
+    no_positions: bool       # True when broker reports "no positions" snapshot
+    raw_size: int
+
+
+@dataclass(frozen=True)
+class AccountBalanceUpdate:
+    """Subset of s_AccountBalanceUpdate (msg 402) the engine cares about.
+
+    NLV computed as cash + securities. `margin_requirement` feeds the risk
+    engine's open_positions_margin field. Risk-management flag bytes
+    (daily_net_loss_limit_reached, trading_is_disabled, etc.) surface
+    broker-side circuit breakers.
+    """
+    cash_balance: float
+    balance_available: float
+    securities_value: float
+    margin_requirement: float
+    margin_requirement_full: float
+    open_positions_profit_loss: float
+    daily_profit_loss: float
+    account_currency: str
+    trade_account: str
+    daily_net_loss_limit_reached: bool
+    is_under_required_margin: bool
+    trading_is_disabled: bool
+    is_under_required_account_value: bool
+    raw_size: int
+
+    @property
+    def net_liquidation_value(self) -> float:
+        return self.cash_balance + self.securities_value
+
+
+# ── Unpack helpers ────────────────────────────────────────────────────────
+def unpack_order_update(data: bytes) -> OrderUpdate:
+    """Parse ORDER_UPDATE (msg 301). Tolerates oversized buffers (Sierra
+    may append fields in future versions); reads only the documented
+    prefix."""
+    raw_size = len(data)
+    if raw_size < ORDER_UPDATE_SIZE:
+        raise ValueError(
+            f"ORDER_UPDATE too short: {raw_size}b "
+            f"(need at least {ORDER_UPDATE_SIZE}b)"
+        )
+    fields = struct.unpack(ORDER_UPDATE_FMT, data[:ORDER_UPDATE_SIZE])
+    (
+        _size, _type, _request_id, _total_msgs, _msg_num,
+        symbol_b, exchange_b,
+        _prev_server_oid_b, server_oid_b, client_oid_b, _exch_oid_b,
+        order_status, order_update_reason, _order_type, side,
+        _price1, _price2,
+        _tif,
+        _good_till_dt,
+        _order_qty, filled_qty, remaining_qty, avg_fill_price,
+        last_fill_price,
+        _last_fill_dt,
+        last_fill_qty,
+        _last_fill_exec_id_b,
+        trade_account_b,
+        info_text_b,
+        _no_orders,
+        _parent_oid_b, _oco_oid_b,
+        _open_close,
+        _prev_client_oid_b,
+        _free_form_b,
+        _order_received_dt, _latest_txn_dt,
+        _username_b,
+    ) = fields
+    return OrderUpdate(
+        client_order_id=_decode_cstr(client_oid_b),
+        server_order_id=_decode_cstr(server_oid_b),
+        symbol=_decode_cstr(symbol_b),
+        exchange=_decode_cstr(exchange_b),
+        order_status=order_status,
+        order_update_reason=order_update_reason,
+        side=side,
+        filled_quantity=filled_qty,
+        remaining_quantity=remaining_qty,
+        average_fill_price=avg_fill_price,
+        last_fill_price=last_fill_price,
+        last_fill_quantity=last_fill_qty,
+        trade_account=_decode_cstr(trade_account_b),
+        info_text=_decode_cstr(info_text_b),
+        raw_size=raw_size,
+    )
+
+
+def unpack_position_update(data: bytes) -> PositionUpdate:
+    """Parse POSITION_UPDATE (msg 311)."""
+    raw_size = len(data)
+    if raw_size < POSITION_UPDATE_SIZE:
+        raise ValueError(
+            f"POSITION_UPDATE too short: {raw_size}b "
+            f"(need at least {POSITION_UPDATE_SIZE}b)"
+        )
+    fields = struct.unpack(POSITION_UPDATE_FMT, data[:POSITION_UPDATE_SIZE])
+    (
+        _size, _type, _request_id, _total_msgs, _msg_num,
+        symbol_b, exchange_b,
+        quantity, avg_price,
+        _position_id_b, trade_account_b,
+        no_positions, _unsolicited,
+        margin_req,
+        _entry_dt,
+        open_pnl, _high_price, _low_price,
+        _qty_limit, _max_potential_qty,
+    ) = fields
+    return PositionUpdate(
+        symbol=_decode_cstr(symbol_b),
+        exchange=_decode_cstr(exchange_b),
+        trade_account=_decode_cstr(trade_account_b),
+        quantity=quantity,
+        average_price=avg_price,
+        margin_requirement=margin_req,
+        open_profit_loss=open_pnl,
+        no_positions=bool(no_positions),
+        raw_size=raw_size,
+    )
+
+
+def unpack_account_balance_update(data: bytes) -> AccountBalanceUpdate:
+    """Parse ACCOUNT_BALANCE_UPDATE (msg 402)."""
+    raw_size = len(data)
+    if raw_size < ACCOUNT_BALANCE_UPDATE_SIZE:
+        raise ValueError(
+            f"ACCOUNT_BALANCE_UPDATE too short: {raw_size}b "
+            f"(need at least {ACCOUNT_BALANCE_UPDATE_SIZE}b)"
+        )
+    fields = struct.unpack(
+        ACCOUNT_BALANCE_UPDATE_FMT,
+        data[:ACCOUNT_BALANCE_UPDATE_SIZE],
+    )
+    (
+        _size, _type, _request_id,
+        cash_balance, balance_available,
+        currency_b,
+        trade_account_b,
+        securities_value, margin_req,
+        _total_msgs, _msg_num,
+        _no_balances, _unsolicited,
+        open_pnl, daily_pnl,
+        _info_text_b,
+        _txn_id,
+        _daily_loss_limit, _trailing_value_limit,
+        daily_loss_reached, under_margin, _close_at_eod, trading_disabled,
+        _description_b,
+        under_account_value,
+        _txn_dt,
+        margin_full, _margin_full_pos, _peak_margin,
+        _introducing_broker_b,
+    ) = fields
+    return AccountBalanceUpdate(
+        cash_balance=cash_balance,
+        balance_available=balance_available,
+        securities_value=securities_value,
+        margin_requirement=margin_req,
+        margin_requirement_full=margin_full,
+        open_positions_profit_loss=open_pnl,
+        daily_profit_loss=daily_pnl,
+        account_currency=_decode_cstr(currency_b),
+        trade_account=_decode_cstr(trade_account_b),
+        daily_net_loss_limit_reached=bool(daily_loss_reached),
+        is_under_required_margin=bool(under_margin),
+        trading_is_disabled=bool(trading_disabled),
+        is_under_required_account_value=bool(under_account_value),
+        raw_size=raw_size,
+    )
+
+
+# ── Status mapping ────────────────────────────────────────────────────────
+# Maps Sierra OrderStatusEnum → StateStore status string. Used by the
+# engine when it receives an ORDER_UPDATE and needs to call
+# StateStore.update_order_status.
+_DTC_TO_STATE_STORE_STATUS: dict[int, str] = {
+    ORDER_STATUS_UNSPECIFIED:            "PENDING",
+    ORDER_STATUS_ORDER_SENT:             "PENDING",
+    ORDER_STATUS_PENDING_OPEN:           "PENDING",
+    ORDER_STATUS_PENDING_CHILD:          "PENDING",
+    ORDER_STATUS_OPEN:                   "WORKING",
+    ORDER_STATUS_PENDING_CANCEL_REPLACE: "WORKING",
+    ORDER_STATUS_PENDING_CANCEL:         "WORKING",
+    ORDER_STATUS_PARTIALLY_FILLED:       "WORKING",
+    ORDER_STATUS_FILLED:                 "FILLED",
+    ORDER_STATUS_CANCELED:               "CANCELLED",
+    ORDER_STATUS_REJECTED:               "REJECTED",
+}
+
+
+def dtc_order_status_to_state_store(status: int) -> str:
+    """Translate Sierra OrderStatusEnum → StateStore status string.
+
+    Unknown values map to PENDING (conservative — keeps the order in the
+    active set so the reconciler will pick up any drift)."""
+    return _DTC_TO_STATE_STORE_STATUS.get(status, "PENDING")
