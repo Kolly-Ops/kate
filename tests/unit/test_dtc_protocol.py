@@ -254,15 +254,32 @@ def test_account_balance_update_basic() -> None:
     assert msg.net_liquidation_value == 1080.0
 
 
-def test_account_balance_update_with_open_position_value() -> None:
-    """When there's an open position, securities value is non-zero and
-    contributes to NLV."""
+def test_account_balance_update_with_open_position_unrealized_profit() -> None:
+    """For futures, NLV = cash_balance + open_positions_profit_loss.
+    Unrealized profit on open positions pushes NLV above cash; an
+    unrealized loss pushes it below."""
+    profit = _pack_account_balance_update(
+        cash_balance=1080.0, open_pnl=50.0, margin_req=100.0,
+    )
+    assert proto.unpack_account_balance_update(profit).net_liquidation_value == 1130.0
+
+    loss = _pack_account_balance_update(
+        cash_balance=1080.0, open_pnl=-30.0, margin_req=100.0,
+    )
+    assert proto.unpack_account_balance_update(loss).net_liquidation_value == 1050.0
+
+
+def test_account_balance_update_securities_value_does_not_inflate_nlv() -> None:
+    """Sierra Sim reports SecuritiesValue ≈ CashBalance as redundant
+    bookkeeping. Our NLV formula must NOT add them — that would double-
+    count the account equity. Verified against COO Gemini's 2026-04-27
+    real-Sierra wire capture (cash=1080, securities=1080, expected NLV=1080)."""
     payload = _pack_account_balance_update(
-        cash_balance=900.0, balance_available=800.0,
-        securities_value=200.0, margin_req=100.0,
+        cash_balance=1080.0, securities_value=1080.0, open_pnl=0.0,
     )
     msg = proto.unpack_account_balance_update(payload)
-    assert msg.net_liquidation_value == 1100.0
+    assert msg.net_liquidation_value == 1080.0    # NOT 2160
+    assert msg.securities_value == 1080.0          # field still preserved
 
 
 def test_account_balance_update_carries_circuit_breaker_flags() -> None:

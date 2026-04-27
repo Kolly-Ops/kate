@@ -31,12 +31,16 @@ SUBMIT_NEW_SINGLE_ORDER          = 208
 OPEN_ORDERS_REQUEST              = 300
 ORDER_UPDATE                     = 301
 HISTORICAL_ORDER_FILLS_REQUEST   = 305
-HISTORICAL_ORDER_FILL_RESPONSE   = 306
+# Sierra DTC v8 msg IDs corrected per COO Gemini's 2026-04-27 wire capture:
+# real Sierra emits POSITION_UPDATE as 306 and ACCOUNT_BALANCE_UPDATE as 600.
+# My earlier 311 / 402 were guesses from public docs that were wrong for v8.
+# See tests/unit/test_dtc_protocol_wire.py — parses Gemini's actual Sierra
+# hex captures through these constants + the unpackers below.
+POSITION_UPDATE                  = 306
 CURRENT_POSITIONS_REQUEST        = 310
-POSITION_UPDATE                  = 311
 
 ACCOUNT_BALANCE_REQUEST          = 400
-ACCOUNT_BALANCE_UPDATE           = 402
+ACCOUNT_BALANCE_UPDATE           = 600
 
 # ── Trade mode (LogonRequest field) ───────────────────────────────────────
 TRADE_MODE_DEMO       = 1   # confirmed working in sim mode 2026-04-27
@@ -453,7 +457,16 @@ class AccountBalanceUpdate:
 
     @property
     def net_liquidation_value(self) -> float:
-        return self.cash_balance + self.securities_value
+        """Mark-to-market account value for FUTURES accounts:
+            NLV = CashBalance + OpenPositionsProfitLoss
+
+        Sierra's `SecuritiesValue` field reports total account equity for
+        sim accounts (i.e. ≈ CashBalance) and is NOT additive — using
+        cash + securities would double-count. For futures, MTM equity is
+        cash + unrealized P&L of open positions; that's the figure the
+        risk engine compares against the NLV floor + drawdown thresholds.
+        """
+        return self.cash_balance + self.open_positions_profit_loss
 
 
 # ── Unpack helpers ────────────────────────────────────────────────────────
