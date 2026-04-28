@@ -175,7 +175,7 @@ def pack_open_orders_request(
 def pack_current_positions_request(
     *, request_id: int = 0, trade_account: str = ""
 ) -> bytes:
-    """CURRENT_POSITIONS_REQUEST (msg 310). Empty `trade_account` requests
+    """CURRENT_POSITIONS_REQUEST (msg 305). Empty `trade_account` requests
     all accounts."""
     fmt = "<HH i 32s"
     size = struct.calcsize(fmt)
@@ -188,7 +188,7 @@ def pack_current_positions_request(
 def pack_account_balance_request(
     *, request_id: int = 0, trade_account: str = ""
 ) -> bytes:
-    """ACCOUNT_BALANCE_REQUEST (msg 400). Empty `trade_account` requests
+    """ACCOUNT_BALANCE_REQUEST (msg 601). Empty `trade_account` requests
     all accounts."""
     fmt = "<HH i 32s"
     size = struct.calcsize(fmt)
@@ -522,10 +522,25 @@ def unpack_order_update(data: bytes) -> OrderUpdate:
         _order_received_dt, _latest_txn_dt,
         _username_b,
     ) = fields
+    client_order_id = _decode_cstr(client_oid_b)
+    server_order_id = _decode_cstr(server_oid_b)
+    symbol = _decode_cstr(symbol_b)
+    # Sierra v8 build 56302 (observed 2026-04-28 06:51 UK) sends the
+    # OPEN_ORDERS_REQUEST sentinel response with the explicit NoOrders
+    # byte CLEARED — so we can't trust that field alone. Treat empty
+    # client_order_id + server_order_id + symbol + status=0 as the
+    # sentinel even when the byte is 0. Keep the explicit-byte check
+    # too in case a future Sierra build does set it.
+    is_no_orders_sentinel = bool(no_orders) or (
+        client_order_id == ""
+        and server_order_id == ""
+        and symbol == ""
+        and order_status == 0
+    )
     return OrderUpdate(
-        client_order_id=_decode_cstr(client_oid_b),
-        server_order_id=_decode_cstr(server_oid_b),
-        symbol=_decode_cstr(symbol_b),
+        client_order_id=client_order_id,
+        server_order_id=server_order_id,
+        symbol=symbol,
         exchange=_decode_cstr(exchange_b),
         order_status=order_status,
         order_update_reason=order_update_reason,
@@ -537,7 +552,7 @@ def unpack_order_update(data: bytes) -> OrderUpdate:
         last_fill_quantity=last_fill_qty,
         trade_account=_decode_cstr(trade_account_b),
         info_text=_decode_cstr(info_text_b),
-        no_orders=bool(no_orders),
+        no_orders=is_no_orders_sentinel,
         raw_size=raw_size,
     )
 

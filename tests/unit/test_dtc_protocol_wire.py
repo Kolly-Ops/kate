@@ -122,11 +122,20 @@ def test_real_order_update_unpacks_open_orders_request_response(
 ) -> None:
     """Gemini's capture was the response to OPEN_ORDERS_REQUEST on a
     flat sim account — Sierra returns a sentinel ORDER_UPDATE with no
-    real order data."""
+    real order data.
+
+    The `no_orders` assertion locks in the heuristic added 2026-04-28
+    after a live re-test showed Sierra v8 build 56302 sends the
+    sentinel with the explicit NoOrders byte cleared. Without the
+    heuristic, this empty-fielded message gets stored as a phantom
+    broker order and trips reconciliation drift on every poll."""
     data = _capture_bytes(captures, "ORDER_UPDATE")
     msg = proto.unpack_order_update(data)
     assert msg.symbol == ""
     assert msg.client_order_id == ""
+    assert msg.server_order_id == ""
+    assert msg.order_status == 0
+    assert msg.no_orders is True
     assert msg.raw_size == 720
 
 
