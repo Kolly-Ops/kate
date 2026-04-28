@@ -63,7 +63,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                    help="directory holding risk.json + instruments.json")
     p.add_argument("--dtc-host", default="127.0.0.1")
     p.add_argument("--dtc-port", type=int, default=11099)
-    p.add_argument("--trade-account", default="E8933")
+    # Default empty: Sierra Trade Simulation Mode rejects orders that
+    # specify a non-sim trade account (e.g. live "E8933"). Empty lets
+    # Sierra route the order to its internal sim. Same pattern as the
+    # seed requests. Override with --trade-account E8933 only when
+    # Sierra's sim mode is OFF and we're cleared for live trading.
+    p.add_argument("--trade-account", default="")
     p.add_argument("--client-name", default="OMNI_TRADING_BOT")
     p.add_argument("--trade-mode", choices=list(TRADE_MODE_LOOKUP), default="demo",
                    help="DTC trade-mode (demo=Sierra sim, live=real broker routing)")

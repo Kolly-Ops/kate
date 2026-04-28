@@ -50,7 +50,7 @@ def test_parse_args_defaults() -> None:
     assert args.symbols == ["MESM26"]
     assert args.dtc_host == "127.0.0.1"
     assert args.dtc_port == 11099
-    assert args.trade_account == "E8933"
+    assert args.trade_account == ""  # empty default — Sierra sim mode rejects live accounts
     assert args.trade_mode == "demo"
     assert args.timeframe_minutes == 1
     assert args.dry_run is False
