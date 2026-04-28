@@ -153,13 +153,22 @@ class ManagedFuturesEngine:
 
     # ── Public lifecycle ──────────────────────────────────────────────────
     async def start(self) -> None:
-        """Connect DTC, log on, seed candle history + initial broker state."""
-        await self.dtc.connect()
-        await self.dtc.logon(
-            client_name=self.client_name,
-            trade_mode=self.trade_mode,
-        )
+        """Warm candle history, then connect DTC + seed initial broker state.
 
+        Order matters: the scid backfill is synchronous file I/O that can
+        block the asyncio event loop for tens of seconds on multi-GB
+        history files (the KATE-derived scid_parser reads the last 1 GB
+        of ticks on startup — ~50 s observed on Contabo Win VPS for
+        MESM26 on 2026-04-28). If DTC is connected before that load
+        finishes, Sierra disconnects us for unacknowledged heartbeats
+        and the seed phase never runs.
+
+        Warming candles BEFORE dtc.connect() means Sierra only sees us
+        once the loop is responsive. TODO: replace this load-everything
+        approach with a bounded warmup (only need ATR + breakout
+        lookback worth of candles, not 43k) — see
+        `omni/proposals/2026-04-28-claude-kate-scid-warmup-bounded.md`.
+        """
         for symbol in self.symbols:
             meta = self.instruments[symbol]
             backfill = self.candle_manager.backfill(
@@ -169,6 +178,12 @@ class ManagedFuturesEngine:
             # Initialize tail baseline (first poll returns [] but baselines
             # the file position so subsequent polls see only new ticks).
             self.candle_manager.poll(meta.scid_filename)
+
+        await self.dtc.connect()
+        await self.dtc.logon(
+            client_name=self.client_name,
+            trade_mode=self.trade_mode,
+        )
 
         await self._seed_broker_state()
 
