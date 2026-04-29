@@ -69,6 +69,17 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     # seed requests. Override with --trade-account E8933 only when
     # Sierra's sim mode is OFF and we're cleared for live trading.
     p.add_argument("--trade-account", default="")
+    # Sierra DTC has split routing: seed requests (msgs 305/300/601) work
+    # with empty TradeAccount; SUBMIT (msg 208) does NOT — Sierra rejects
+    # "Trade Account is empty" in Trade Simulation Mode (verified via
+    # TradeActivityLog 2026-04-29). When set, this string is used for
+    # SUBMIT_NEW_SINGLE_ORDER while seeds stay empty. When omitted,
+    # submit reuses --trade-account (legacy behaviour).
+    p.add_argument("--submit-trade-account", default=None,
+                   help="trade_account string for SUBMIT_NEW_SINGLE_ORDER. "
+                        "If unset, falls back to --trade-account. Set this "
+                        "to Sierra's sim-account name (e.g. 'Sim1') in "
+                        "Trade Simulation Mode.")
     p.add_argument("--client-name", default="OMNI_TRADING_BOT")
     p.add_argument("--trade-mode", choices=list(TRADE_MODE_LOOKUP), default="demo",
                    help="DTC trade-mode (demo=Sierra sim, live=real broker routing)")
@@ -202,6 +213,7 @@ async def _run(args: argparse.Namespace) -> int:
             reconciler=reconciler,
             dtc_client=dtc_client,
             trade_account=args.trade_account,
+            submit_trade_account=args.submit_trade_account,
             client_name=args.client_name,
             trade_mode=TRADE_MODE_LOOKUP[args.trade_mode],
             tick_interval_seconds=args.tick_interval,

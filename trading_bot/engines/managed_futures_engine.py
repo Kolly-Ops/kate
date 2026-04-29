@@ -102,6 +102,7 @@ class ManagedFuturesEngine:
         reconciler: Reconciler,
         dtc_client: DTCClient,
         trade_account: str,
+        submit_trade_account: Optional[str] = None,
         client_name: str = "TRADING_BOT",
         trade_mode: int = proto.TRADE_MODE_DEMO,
         history_size: Optional[int] = None,
@@ -123,6 +124,19 @@ class ManagedFuturesEngine:
         self.reconciler = reconciler
         self.dtc = dtc_client
         self.trade_account = trade_account
+        # Sierra DTC has split routing: SEED requests (msgs 305/300/601)
+        # work with empty TradeAccount because Sierra infers from the
+        # logon's account context. SUBMIT (msg 208) does NOT — Sierra
+        # validates TradeAccount up front and rejects with "Trade Account
+        # is empty" in Trade Simulation Mode (verified via Sierra's
+        # TradeActivityLog 2026-04-29). Default to `trade_account` so
+        # behaviour is unchanged when callers haven't opted in; pass an
+        # explicit sim-account string here once we know what Sierra is
+        # configured to accept.
+        self.submit_trade_account = (
+            submit_trade_account if submit_trade_account is not None
+            else trade_account
+        )
         self.client_name = client_name
         self.trade_mode = trade_mode
         self.tick_interval_seconds = tick_interval_seconds
@@ -316,6 +330,18 @@ class ManagedFuturesEngine:
             self._broker_orders.clear()
             return
         store_status = proto.dtc_order_status_to_state_store(msg.order_status)
+        # Visibility: log every real ORDER_UPDATE so we can diagnose the
+        # submit→fill round-trip from the Kate log alone. Without this,
+        # silent fills/rejects/cancels look identical to "Sierra never
+        # responded" — see 2026-04-29 paper-validation drift incident.
+        logger.info(
+            "engine: ORDER_UPDATE coid=%s status=%d→%s reason=%d "
+            "filled=%g remaining=%g avg_fill=%g info=%r",
+            msg.client_order_id, msg.order_status, store_status,
+            msg.order_update_reason,
+            msg.filled_quantity, msg.remaining_quantity,
+            msg.average_fill_price, msg.info_text,
+        )
         # Always update our remote-orders snapshot
         self._broker_orders[msg.client_order_id] = RemoteOrder(
             client_order_id=msg.client_order_id, status=store_status,
@@ -326,6 +352,11 @@ class ManagedFuturesEngine:
         # external order activity.
         existing = self.state.get_order(client_order_id=msg.client_order_id)
         if existing is None:
+            logger.info(
+                "engine: ORDER_UPDATE for unknown coid=%s — not in local "
+                "StateStore, broker_orders updated only",
+                msg.client_order_id,
+            )
             return
         rejected_reason = msg.info_text if store_status == "REJECTED" else None
         fill_price = msg.average_fill_price if store_status == "FILLED" else None
@@ -442,7 +473,7 @@ class ManagedFuturesEngine:
             await self.dtc.submit_order(
                 symbol=meta.dtc_symbol,     # dtc_symbol on the wire
                 exchange=intent.exchange,
-                trade_account=self.trade_account,
+                trade_account=self.submit_trade_account,
                 client_order_id=intent.intent_id,
                 side=intent.side,
                 quantity=intent.quantity,
