@@ -24,6 +24,7 @@ gate per CLAUDE.md.
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import logging
 from collections import deque
 from dataclasses import dataclass
@@ -121,6 +122,7 @@ class ManagedFuturesEngine:
         dtc_client: DTCClient,
         trade_account: str,
         submit_trade_account: Optional[str] = None,
+        no_trade_windows_utc: Optional[list[tuple[dt.time, dt.time]]] = None,
         client_name: str = "TRADING_BOT",
         trade_mode: int = proto.TRADE_MODE_DEMO,
         history_size: Optional[int] = None,
@@ -154,6 +156,17 @@ class ManagedFuturesEngine:
         self.submit_trade_account = (
             submit_trade_account if submit_trade_account is not None
             else trade_account
+        )
+        # Volatility-blackout windows in UTC. The strategy is NOT invoked
+        # for candle-closes whose timestamp falls in any window — no
+        # signal generated, no risk-rejection log noise. Windows protect
+        # the entry path only; existing positions keep their bracket
+        # lifecycle untouched (force-closing into thin liquidity is
+        # worse than letting the bracket fire at predefined levels).
+        # See decisions/2026-04-30-paper-validation-operational-additions.md
+        # for the data-backed motivation.
+        self.no_trade_windows_utc: tuple[tuple[dt.time, dt.time], ...] = tuple(
+            no_trade_windows_utc or ()
         )
         self.client_name = client_name
         self.trade_mode = trade_mode
@@ -470,6 +483,18 @@ class ManagedFuturesEngine:
             logger.debug("engine: no account state yet, skipping strategy on %s", symbol)
             return
 
+        # Volatility-blackout: skip strategy invocation entirely if the
+        # bar's UTC timestamp falls inside any configured window. Existing
+        # positions are unaffected — their stop/target brackets remain in
+        # the broker's book and exit normally if hit. This only blocks
+        # NEW entries during the window.
+        if self._is_in_no_trade_window(candle.timestamp):
+            logger.debug(
+                "engine: blackout window active at %s — skipping strategy on %s",
+                candle.timestamp.time().strftime("%H:%M:%S"), symbol,
+            )
+            return
+
         meta = self.instruments[symbol]
         history = self.history(symbol)
         if len(history) < self.strategy.history_window:
@@ -676,6 +701,28 @@ class ManagedFuturesEngine:
     def _has_open_position(self, symbol: str, exchange: str) -> bool:
         pos = self._broker_positions.get((symbol, exchange))
         return pos is not None and pos.quantity != 0
+
+    def _is_in_no_trade_window(self, timestamp: dt.datetime) -> bool:
+        """True if the candle's UTC time-of-day falls in any configured
+        blackout window. Handles wrap-around windows (e.g. 23:30→00:30)
+        for future overnight-session blackouts; all-numeric, no DST math."""
+        if not self.no_trade_windows_utc:
+            return False
+        # Strategy and engine treat candle timestamps as UTC. Sierra's
+        # SCID base-date math in scid_parser.py produces naive UTC
+        # datetimes; we compare against naive time-of-day here. If we
+        # ever flip to tz-aware datetimes upstream, normalize via
+        # `.astimezone(dt.timezone.utc).time()` before comparing.
+        t = timestamp.time()
+        for start, end in self.no_trade_windows_utc:
+            if start <= end:
+                if start <= t < end:
+                    return True
+            else:
+                # Wrap-around window (start > end means crosses midnight)
+                if t >= start or t < end:
+                    return True
+        return False
 
     # ── Reconciliation ────────────────────────────────────────────────────
     def _run_reconciliation(self) -> ReconciliationReport:

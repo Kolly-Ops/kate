@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import datetime as dt
 import logging
 import signal
 import sys
@@ -80,6 +81,17 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                         "If unset, falls back to --trade-account. Set this "
                         "to Sierra's sim-account name (e.g. 'Sim1') in "
                         "Trade Simulation Mode.")
+    # Volatility-blackout windows in UTC. Strategy is NOT invoked when
+    # the candle timestamp falls inside any window. Format: comma-
+    # separated HH:MM-HH:MM ranges, e.g. "13:30-14:30" (one window) or
+    # "13:30-14:30,02:00-04:00" (multiple). Empty = always trade.
+    # Decision doc: omni/decisions/2026-04-30-paper-validation-operational-additions.md
+    # Default covers US cash-open vol expansion (13:30-14:30 UTC =
+    # 14:30-15:30 UK BST = 09:30-10:30 ET — first hour of NYSE).
+    p.add_argument("--no-trade-windows-utc", default="13:30-14:30",
+                   help="comma-separated UTC blackout windows HH:MM-HH:MM. "
+                        "Default '13:30-14:30' covers US cash-open vol spike. "
+                        "Pass '' to disable.")
     p.add_argument("--client-name", default="OMNI_TRADING_BOT")
     p.add_argument("--trade-mode", choices=list(TRADE_MODE_LOOKUP), default="demo",
                    help="DTC trade-mode (demo=Sierra sim, live=real broker routing)")
@@ -135,6 +147,35 @@ def _build_instruments(symbols: list[str]) -> dict[str, InstrumentMeta]:
             per_contract_margin=rt.per_contract_margin,
             round_trip_commission=rt.round_trip_commission,
         )
+    return out
+
+
+def _parse_no_trade_windows(spec: str) -> list[tuple[dt.time, dt.time]]:
+    """Parse the --no-trade-windows-utc CLI value into a list of UTC
+    (start, end) time-of-day tuples. Format: comma-separated HH:MM-HH:MM
+    ranges. Empty / whitespace input returns an empty list (no blackout).
+
+    Wrap-around windows are valid: '23:30-00:30' means "everything from
+    23:30 inclusive to 00:30 exclusive, crossing midnight". The engine's
+    _is_in_no_trade_window handles the half-open interval semantics."""
+    if not spec or not spec.strip():
+        return []
+    out: list[tuple[dt.time, dt.time]] = []
+    for piece in spec.split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        if "-" not in piece:
+            raise SystemExit(f"--no-trade-windows-utc: malformed range {piece!r}")
+        start_s, end_s = piece.split("-", 1)
+        try:
+            start = dt.time.fromisoformat(start_s.strip())
+            end = dt.time.fromisoformat(end_s.strip())
+        except ValueError as e:
+            raise SystemExit(
+                f"--no-trade-windows-utc: bad HH:MM in {piece!r} — {e}"
+            ) from e
+        out.append((start, end))
     return out
 
 
@@ -207,6 +248,7 @@ async def _run(args: argparse.Namespace) -> int:
         risk = RiskManager(_load_risk_policy(config_dir))
         reconciler = Reconciler()
         dtc_client = DTCClient(host=args.dtc_host, port=args.dtc_port)
+        no_trade_windows = _parse_no_trade_windows(args.no_trade_windows_utc)
 
         engine = ManagedFuturesEngine(
             symbols=args.symbols,
@@ -219,6 +261,7 @@ async def _run(args: argparse.Namespace) -> int:
             dtc_client=dtc_client,
             trade_account=args.trade_account,
             submit_trade_account=args.submit_trade_account,
+            no_trade_windows_utc=no_trade_windows,
             client_name=args.client_name,
             trade_mode=TRADE_MODE_LOOKUP[args.trade_mode],
             tick_interval_seconds=args.tick_interval,
