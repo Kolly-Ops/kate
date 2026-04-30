@@ -90,7 +90,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--breakout-lookback", type=int, default=20)
     p.add_argument("--ma-period", type=int, default=50)
     p.add_argument("--atr-period", type=int, default=14)
-    p.add_argument("--atr-stop-mult", type=float, default=2.0)
+    # Default kept in sync with AtrBreakoutStrategy ctor default in
+    # breakout.py — argparse here ALWAYS overrides the class default
+    # because we pass args.atr_stop_mult explicitly to the ctor below,
+    # so this is the load-bearing one. Lesson learned 2026-04-30:
+    # editing only the class default is a no-op at runtime.
+    p.add_argument("--atr-stop-mult", type=float, default=1.1)
     p.add_argument("--atr-target-mult", type=float, default=3.0)
     p.add_argument("--log-file", default=None,
                    help="optional log file path (in addition to stderr)")
