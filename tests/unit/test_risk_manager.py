@@ -129,7 +129,7 @@ def test_max_positions_blocks_at_limit(manager: RiskManager) -> None:
         nlv=1080.0,
         starting_nlv=1080.0,
         open_positions_margin=0.0,
-        open_position_count=3,    # at default policy limit
+        open_position_count=3,    # above default policy limit (was 3, now 1)
     )
     intent = make_intent(stop_loss=4998.0)
     verdict = manager.evaluate(intent, saturated)

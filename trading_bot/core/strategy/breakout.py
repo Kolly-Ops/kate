@@ -42,7 +42,7 @@ class AtrBreakoutStrategy(Strategy):
         breakout_lookback: int = 20,
         ma_period: int = 50,
         atr_period: int = 14,
-        atr_stop_mult: float = 1.5,
+        atr_stop_mult: float = 1.1,
         atr_target_mult: float = 3.0,
         quantity: float = 1.0,
     ) -> None:
