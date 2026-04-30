@@ -236,6 +236,35 @@ def pack_submit_order(
     )
 
 
+# CANCEL_ORDER (msg 203) — Sierra DTC v8 layout per DTCProtocol.h:
+#   Size, Type, ServerOrderID[32], ClientOrderID[32], TradeAccount[32]
+# Either ServerOrderID or ClientOrderID identifies the target order.
+# We use ClientOrderID since the engine assigns those deterministically
+# and stores them in StateStore.
+CANCEL_ORDER_FMT  = "<HH 32s 32s 32s"
+CANCEL_ORDER_SIZE = struct.calcsize(CANCEL_ORDER_FMT)
+
+
+def pack_cancel_order(
+    *,
+    client_order_id: str,
+    trade_account: str = "",
+    server_order_id: str = "",
+) -> bytes:
+    """Pack a CANCEL_ORDER (msg 203) targeting the given ClientOrderID.
+
+    Used by the bracket-order machinery: when stop or target fills, the
+    engine cancels its sibling so the position is fully closed by exactly
+    one of the two exit legs."""
+    return struct.pack(
+        CANCEL_ORDER_FMT,
+        CANCEL_ORDER_SIZE, CANCEL_ORDER,
+        server_order_id.encode("utf-8"),
+        client_order_id.encode("utf-8"),
+        trade_account.encode("utf-8"),
+    )
+
+
 # ── Unpack helpers ─────────────────────────────────────────────────────────
 def unpack_header(data: bytes) -> tuple[int | None, int | None]:
     if len(data) < HEADER_SIZE:

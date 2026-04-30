@@ -51,6 +51,24 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
+class _BracketSpec:
+    """Stop/target parameters cached when an entry order is submitted, used
+    when the entry's FILLED ORDER_UPDATE arrives to spawn the exit legs.
+
+    `entry_side` is the entry-order side; close orders use the opposite.
+    `dtc_symbol` and `exchange` are needed because by the time the exit
+    legs are submitted we no longer have the original TradeIntent in scope.
+    """
+    entry_coid: str
+    dtc_symbol: str
+    exchange: str
+    entry_side: int          # 1=BUY, 2=SELL — exits flip this
+    quantity: float
+    stop_loss: float
+    take_profit: Optional[float]
+
+
+@dataclass(frozen=True)
 class InstrumentMeta:
     """Per-instrument calibration. Sourced from config/instruments.json.
 
@@ -164,6 +182,21 @@ class ManagedFuturesEngine:
         self._account_state: Optional[AccountState] = None
         self._starting_nlv: Optional[float] = None
         self._running = False
+
+        # ── Bracket-order tracking (synthetic OCO) ────────────────────
+        # `_pending_brackets[entry_coid]` holds the stop/target params we'll
+        # submit once Sierra sends back ORDER_UPDATE status=FILLED for the
+        # entry. Submitting brackets only after entry-fill avoids the brief
+        # window where Sierra has the stop/target sitting in the book
+        # against a position that doesn't yet exist (some Sierra builds
+        # reject this; doing it sequentially is safer than relying on
+        # native bracket support whose wire format we haven't validated).
+        self._pending_brackets: dict[str, "_BracketSpec"] = {}
+        # `_sibling_orders` maps each exit-leg coid to its sibling's coid.
+        # When stop fills, cancel target. When target fills, cancel stop.
+        # Both directions populated when brackets are submitted; entries
+        # cleared once a sibling cancel has been issued.
+        self._sibling_orders: dict[str, str] = {}
 
     # ── Public lifecycle ──────────────────────────────────────────────────
     async def start(self) -> None:
@@ -290,10 +323,10 @@ class ManagedFuturesEngine:
                 )
             except asyncio.TimeoutError:
                 return count
-            self._handle_dtc_message(msg)
+            await self._handle_dtc_message(msg)
             count += 1
 
-    def _handle_dtc_message(self, msg: DTCMessage) -> None:
+    async def _handle_dtc_message(self, msg: DTCMessage) -> None:
         # Always log inbound traffic at INFO so paper-live logs are
         # diagnosable without flipping log levels mid-session.
         logger.info(
@@ -302,7 +335,7 @@ class ManagedFuturesEngine:
         )
         try:
             if msg.msg_type == proto.ORDER_UPDATE:
-                self._handle_order_update(proto.unpack_order_update(msg.body))
+                await self._handle_order_update(proto.unpack_order_update(msg.body))
             elif msg.msg_type == proto.POSITION_UPDATE:
                 self._handle_position_update(proto.unpack_position_update(msg.body))
             elif msg.msg_type == proto.ACCOUNT_BALANCE_UPDATE:
@@ -316,7 +349,7 @@ class ManagedFuturesEngine:
         except Exception:
             logger.exception("engine: failed to handle msg_type %d", msg.msg_type)
 
-    def _handle_order_update(self, msg: proto.OrderUpdate) -> None:
+    async def _handle_order_update(self, msg: proto.OrderUpdate) -> None:
         # Sierra sends a sentinel ORDER_UPDATE with NoOrders=1 when
         # responding to OPEN_ORDERS_REQUEST on a flat account. This is
         # NOT a real order update — skip it so the empty client_order_id
@@ -368,6 +401,24 @@ class ManagedFuturesEngine:
             fill_quantity=fill_qty,
             rejected_reason=rejected_reason,
         )
+
+        # ── Bracket-order side effects on FILL ────────────────────────
+        if store_status == "FILLED":
+            # 1. If this is an ENTRY for which we cached a bracket spec,
+            #    submit the stop + target legs now.
+            bracket = self._pending_brackets.pop(msg.client_order_id, None)
+            if bracket is not None:
+                await self._submit_exit_brackets(bracket)
+            # 2. If this is an EXIT leg, cancel its sibling so the
+            #    position closes via exactly one of the two legs.
+            sibling = self._sibling_orders.pop(msg.client_order_id, None)
+            if sibling is not None:
+                # Symmetric removal: the sibling no longer needs to know
+                # about us either.
+                self._sibling_orders.pop(sibling, None)
+                await self._cancel_sibling_after_fill(
+                    filled_coid=msg.client_order_id, sibling_coid=sibling,
+                )
 
     def _handle_position_update(self, msg: proto.PositionUpdate) -> None:
         if msg.no_positions:
@@ -494,6 +545,133 @@ class ManagedFuturesEngine:
                 rejected_reason="submit failed (transport error)",
             )
             raise
+
+        # Cache bracket params keyed by entry coid. Submitted only after
+        # the entry's FILLED ORDER_UPDATE arrives (see _handle_order_update).
+        # Risk policy already gates this — entries without stop_loss are
+        # rejected before reaching here when require_stop_loss=True.
+        if intent.stop_loss is not None:
+            self._pending_brackets[intent.intent_id] = _BracketSpec(
+                entry_coid=intent.intent_id,
+                dtc_symbol=meta.dtc_symbol,
+                exchange=intent.exchange,
+                entry_side=intent.side,
+                quantity=intent.quantity,
+                stop_loss=intent.stop_loss,
+                take_profit=intent.take_profit,
+            )
+
+    async def _submit_exit_brackets(self, bracket: _BracketSpec) -> None:
+        """Submit stop and (optional) take-profit close orders after the
+        entry fills. The two legs are mutually-cancelling: when one fills
+        we cancel the other via _handle_order_update's sibling logic.
+
+        ID convention: <entry_coid>-S for stop, <entry_coid>-T for target.
+        Both fit DTC's 32-byte ClientOrderID since entries are ≤30 chars."""
+        close_side = proto.SELL if bracket.entry_side == proto.BUY else proto.BUY
+        stop_coid = f"{bracket.entry_coid}-S"
+        target_coid = (
+            f"{bracket.entry_coid}-T" if bracket.take_profit is not None else None
+        )
+
+        # Track sibling links BEFORE submit so even if a fill races back
+        # the cancel-on-fill logic has the linkage to act on.
+        if target_coid is not None:
+            self._sibling_orders[stop_coid] = target_coid
+            self._sibling_orders[target_coid] = stop_coid
+
+        # 1) STOP leg — close at adverse price
+        # Logical symbol for StateStore; engine doesn't care about
+        # bracket-vs-entry distinction at the SQLite level.
+        # We look up logical from dtc_symbol via the reverse map.
+        logical = self._dtc_to_logical.get(bracket.dtc_symbol, bracket.dtc_symbol)
+        self.state.record_order(
+            client_order_id=stop_coid,
+            symbol=logical, exchange=bracket.exchange,
+            side=close_side, quantity=bracket.quantity,
+            order_type=proto.ORDER_TYPE_STOP,
+        )
+        try:
+            await self.dtc.submit_order(
+                symbol=bracket.dtc_symbol,
+                exchange=bracket.exchange,
+                trade_account=self.submit_trade_account,
+                client_order_id=stop_coid,
+                side=close_side,
+                quantity=bracket.quantity,
+                order_type=proto.ORDER_TYPE_STOP,
+                price1=bracket.stop_loss,
+                free_form_text=f"stop:{bracket.entry_coid[:40]}"[:48],
+            )
+            logger.info(
+                "submitted bracket STOP %s @ %.2f (entry=%s)",
+                stop_coid, bracket.stop_loss, bracket.entry_coid,
+            )
+        except Exception:
+            self.state.update_order_status(
+                client_order_id=stop_coid, status="REJECTED",
+                rejected_reason="bracket-stop submit failed (transport error)",
+            )
+            # Don't propagate — keep going to attempt target submit. A
+            # missing stop is a serious situation but better to have one
+            # exit leg in book than zero. Reconciler will surface this.
+            logger.exception("engine: bracket STOP submit failed")
+
+        # 2) TARGET leg — close at favorable price (optional)
+        if target_coid is not None:
+            self.state.record_order(
+                client_order_id=target_coid,
+                symbol=logical, exchange=bracket.exchange,
+                side=close_side, quantity=bracket.quantity,
+                order_type=proto.ORDER_TYPE_LIMIT,
+            )
+            try:
+                await self.dtc.submit_order(
+                    symbol=bracket.dtc_symbol,
+                    exchange=bracket.exchange,
+                    trade_account=self.submit_trade_account,
+                    client_order_id=target_coid,
+                    side=close_side,
+                    quantity=bracket.quantity,
+                    order_type=proto.ORDER_TYPE_LIMIT,
+                    price1=bracket.take_profit,
+                    free_form_text=f"target:{bracket.entry_coid[:38]}"[:48],
+                )
+                logger.info(
+                    "submitted bracket TARGET %s @ %.2f (entry=%s)",
+                    target_coid, bracket.take_profit, bracket.entry_coid,
+                )
+            except Exception:
+                self.state.update_order_status(
+                    client_order_id=target_coid, status="REJECTED",
+                    rejected_reason="bracket-target submit failed (transport error)",
+                )
+                logger.exception("engine: bracket TARGET submit failed")
+
+    async def _cancel_sibling_after_fill(
+        self, *, filled_coid: str, sibling_coid: str,
+    ) -> None:
+        """Issue a CANCEL_ORDER for the sibling exit leg after one side
+        fills. Sierra responds with an ORDER_UPDATE status=CANCELED for
+        the sibling, which `_handle_order_update` writes through to
+        StateStore via the normal flow."""
+        try:
+            await self.dtc.cancel_order(
+                client_order_id=sibling_coid,
+                trade_account=self.submit_trade_account,
+            )
+            logger.info(
+                "engine: cancelled sibling %s after %s filled",
+                sibling_coid, filled_coid,
+            )
+        except Exception:
+            # Cancel failed — the sibling may still be in book. Reconciler
+            # will detect the discrepancy on next pass; not auto-corrected
+            # here per CEO approval-gate policy.
+            logger.exception(
+                "engine: failed to cancel sibling %s after %s filled",
+                sibling_coid, filled_coid,
+            )
 
     def _has_open_position(self, symbol: str, exchange: str) -> bool:
         pos = self._broker_positions.get((symbol, exchange))

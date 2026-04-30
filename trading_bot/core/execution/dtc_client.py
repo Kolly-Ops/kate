@@ -177,6 +177,29 @@ class DTCClient:
         await self._writer.drain()
         return client_order_id
 
+    async def cancel_order(
+        self,
+        *,
+        client_order_id: str,
+        trade_account: str = "",
+        server_order_id: str = "",
+    ) -> None:
+        """Send CANCEL_ORDER (msg 203) for the given ClientOrderID.
+
+        Sierra acknowledges the cancel with an ORDER_UPDATE bearing
+        status=CANCELED (8) for the target. The engine's bracket-order
+        logic uses this to retire the sibling exit when the other side
+        fills."""
+        if not self._writer:
+            raise DTCError("not connected")
+        payload = proto.pack_cancel_order(
+            client_order_id=client_order_id,
+            trade_account=trade_account,
+            server_order_id=server_order_id,
+        )
+        self._writer.write(payload)
+        await self._writer.drain()
+
     async def subscribe_market_data(
         self, symbol_id: int, symbol: str, *, exchange: str = ""
     ) -> None:
