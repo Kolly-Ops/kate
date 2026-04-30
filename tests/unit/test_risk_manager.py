@@ -218,7 +218,7 @@ def test_policy_loads_from_json() -> None:
     assert policy.starting_nlv == 1080.0
     assert policy.nlv_floor == 300.0
     assert policy.kill_switch_drawdown_pct == 0.30
-    assert policy.max_risk_per_trade_pct_nlv == 0.015
+    assert policy.max_risk_per_trade_pct_nlv == 0.020
     assert policy.max_margin_utilization_pct == 0.40
 
 
@@ -241,7 +241,7 @@ def test_with_policy_returns_new_manager_with_overrides(
     assert not manager.evaluate(intent, healthy_account).approved
     assert relaxed.evaluate(intent, healthy_account).approved
     # Original manager unchanged
-    assert manager.policy.max_risk_per_trade_pct_nlv == 0.015
+    assert manager.policy.max_risk_per_trade_pct_nlv == 0.020
 
 
 # ── Commission integration into per-trade-risk ────────────────────────────
@@ -291,19 +291,19 @@ def test_commission_scales_with_quantity(
 def test_commission_can_push_borderline_trade_from_approve_to_reject(
     manager: RiskManager, healthy_account: AccountState
 ) -> None:
-    """A trade whose pure slippage risk fits under the 1.5% cap can be
-    rejected once commissions are added — exactly the systematic-over-
-    approval bug the integration prevents."""
-    # $1080 × 1.5% = $16.20 cap. Pick a stop where gross risk is $15.50
-    # (under cap) and commission pushes it to $16.88 (over cap).
-    # Stop 12.4 ticks = 3.1 pts: $15.50 gross at $1.25/tick.
-    # 3.1 pts → entry-stop = 5000 - 3.1 = 4996.9
-    intent = make_intent(stop_loss=4996.9, round_trip_commission=1.38)
+    """A trade whose pure slippage risk fits under the per-trade-risk cap
+    can be rejected once commissions are added — exactly the systematic-
+    over-approval bug the integration prevents."""
+    # $1080 × 2.0% = $21.60 cap. Pick a stop where gross risk is $20.50
+    # (under cap) and commission pushes it to $21.88 (over cap).
+    # Stop 16.4 ticks = 4.1 pts: $20.50 gross at $1.25/tick.
+    # 4.1 pts → entry-stop = 5000 - 4.1 = 4995.9
+    intent = make_intent(stop_loss=4995.9, round_trip_commission=1.38)
     # Without commission this would approve; with it, it should reject.
-    base = manager.evaluate(make_intent(stop_loss=4996.9), healthy_account)
+    base = manager.evaluate(make_intent(stop_loss=4995.9), healthy_account)
     assert base.approved, base.reasons       # baseline: pure slippage fits
     fees = manager.evaluate(intent, healthy_account)
-    assert not fees.approved, "commission should have pushed over the 1.5% cap"
+    assert not fees.approved, "commission should have pushed over the 2.0% cap"
     assert any("per_trade_risk" in r for r in fees.reasons)
 
 
