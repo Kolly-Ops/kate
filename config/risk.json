@@ -3,7 +3,7 @@
   "starting_nlv": 1080.0,
   "nlv_floor": 300.0,
   "kill_switch_drawdown_pct": 0.30,
-  "max_risk_per_trade_pct_nlv": 0.020,
+  "max_risk_per_trade_pct_nlv": 0.025,
   "max_margin_utilization_pct": 0.40,
   "max_open_positions": 1,
   "require_stop_loss": true

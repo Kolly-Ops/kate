@@ -33,7 +33,7 @@ class RiskPolicy:
     starting_nlv: float = 1080.0
     nlv_floor: float = 300.0
     kill_switch_drawdown_pct: float = 0.30
-    max_risk_per_trade_pct_nlv: float = 0.020
+    max_risk_per_trade_pct_nlv: float = 0.025
     max_margin_utilization_pct: float = 0.40
     max_open_positions: int = 1
     require_stop_loss: bool = True
