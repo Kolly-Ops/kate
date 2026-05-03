@@ -66,10 +66,16 @@ DELETE FROM orders
 WHERE status = 'PENDING'
   AND submitted_at < '2026-05-01';
 
--- Reset kill-switch with correct schema columns
+-- Reset kill-switch with correct schema columns.
+-- CEO-MANDATED CAVEAT: INACTIVE ≠ live-flip clearance. The reset resumes
+-- paper validation only. Live cash requires all gates in
+-- protocol/kate-pre-live-flip-gate.md to be green AND a separate
+-- explicit CEO + COO sign-off recorded in a decision doc. Do NOT
+-- interpret an INACTIVE kill-switch as authorisation for real-money
+-- routing.
 UPDATE kill_switch
 SET state      = 'INACTIVE',
-    reason     = 'cleanup-2026-05-03: 82 stale brackets from 2026-04-30 cleared; drift root cause (hypothesis b) confirmed by COO Gemini',
+    reason     = 'cleanup-2026-05-03 paper-validation only. NOT live-flip clearance. Gates in protocol/kate-pre-live-flip-gate.md must clear + CEO+COO sign-off before live cash. CEO-authorised reset 2026-05-03 evening. Drift root cause (hyp b) confirmed by COO Gemini.',
     since      = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
 WHERE id = 1;
