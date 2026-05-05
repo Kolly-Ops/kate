@@ -92,6 +92,35 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                    help="comma-separated UTC blackout windows HH:MM-HH:MM. "
                         "Default '13:30-14:30' covers US cash-open vol spike. "
                         "Pass '' to disable.")
+    # ── Sierra TradeActivityLog suffix validator (Gate #11/14 enforcement) ──
+    # Sierra writes TradeActivityLog_<YYYY-MM-DD>_UTC.<account>.<mode>.data
+    # files when its trade service initialises. The suffix encodes account
+    # name + mode. Pure binary DTC + Sim1 + sim mode → expected suffix is
+    # ".Sim1.simulated.data". Cycles 2-3 on 2026-05-04 saw Sierra come up
+    # with ".E8933.data" or ".None.data" (live mode) and silently drop
+    # submissions for hours. This validator fails Kate fast at startup if
+    # the suffix doesn't match — operator sees the wrong-mode error
+    # immediately instead of after orders accumulate. See
+    # protocol/kate-pre-live-flip-gate.md Gates #11 + #14 for context.
+    p.add_argument(
+        "--require-trade-activity-suffix", default="Sim1.simulated",
+        help="Required TradeActivityLog filename suffix (between the date and "
+             "'.data'). Default 'Sim1.simulated' for paper trading. Set to "
+             "'<account>' (no '.simulated.') for live trading after live-flip "
+             "sign-off. Set to '' to disable the check (NOT recommended).",
+    )
+    p.add_argument(
+        "--trade-activity-logs-dir",
+        default=r"C:\SierraChart\TradeActivityLogs",
+        help="Directory where Sierra writes TradeActivityLog_*.data files",
+    )
+    p.add_argument(
+        "--allow-no-trade-activity-log", action="store_true",
+        help="If set, supervisor proceeds even when no TradeActivityLog file "
+             "exists for today yet. Default: fail fast (Sierra session not "
+             "initialised). Useful for first-launch-after-Sierra-restart "
+             "windows where the file may not have been created yet.",
+    )
     p.add_argument("--client-name", default="OMNI_TRADING_BOT")
     p.add_argument("--trade-mode", choices=list(TRADE_MODE_LOOKUP), default="demo",
                    help="DTC trade-mode (demo=Sierra sim, live=real broker routing)")
@@ -206,6 +235,125 @@ def _on_intent_rejected(intent, verdict) -> None:  # type: ignore[no-untyped-def
     )
 
 
+def _validate_sierra_trade_activity_suffix(
+    *,
+    logs_dir: Path,
+    required_suffix: str,
+    allow_missing: bool,
+) -> None:
+    """Pre-flight check that Sierra's trade service is in the expected
+    account+mode before Kate connects.
+
+    Sierra writes a TradeActivityLog_<YYYY-MM-DD>_UTC.<account>.<mode>.data
+    file when its trade service initialises (typically at the 22:00 UTC
+    Globex daily reopen). The suffix between the UTC date and '.data'
+    encodes the active TradeAccount and (when sim mode is on) the
+    '.simulated.' segment. Examples:
+
+      .Sim1.simulated.data   — Sim1 + sim mode (paper validation)
+      .E8933.simulated.data  — E8933 + sim mode (Sierra rejects this combo)
+      .E8933.data            — E8933 + LIVE mode (real cash routing)
+      .None.data             — empty TradeAccount + LIVE mode
+
+    Cycles 2 + 3 on 2026-05-04 saw Sierra come up under '.E8933.data' or
+    '.None.data' after a session boundary and silently drop submissions
+    for hours. This check refuses to launch Kate into that state.
+
+    Empty `required_suffix` disables the check (escape hatch — log a
+    warning but proceed).
+
+    Raises SystemExit(99) on validation failure so the watchdog .bat can
+    distinguish "Sierra mode wrong" from other failure classes.
+    """
+    if not required_suffix:
+        LOGGER.warning(
+            "supervisor: TradeActivityLog suffix check disabled "
+            "(--require-trade-activity-suffix is empty). "
+            "Kate will launch into whatever Sierra mode is active."
+        )
+        return
+
+    if not logs_dir.exists():
+        msg = (
+            f"supervisor: TradeActivityLog directory not found: {logs_dir}. "
+            f"Is Sierra installed at the expected path? "
+            f"Override with --trade-activity-logs-dir."
+        )
+        LOGGER.error(msg)
+        raise SystemExit(99)
+
+    today_utc = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+    pattern = f"TradeActivityLog_{today_utc}_*.data"
+    matches = sorted(logs_dir.glob(pattern))
+
+    if not matches:
+        if allow_missing:
+            LOGGER.warning(
+                "supervisor: no TradeActivityLog for today (%s) in %s. "
+                "--allow-no-trade-activity-log is set; proceeding anyway. "
+                "Sierra may not have initialised its trade service yet.",
+                today_utc, logs_dir,
+            )
+            return
+        msg = (
+            f"supervisor: NO TradeActivityLog file for today ({today_utc}) "
+            f"in {logs_dir}. Sierra's trade service has not initialised "
+            f"for the current trading day. Either Sierra is down, the "
+            f"22:00 UTC Globex session-init failed, or sim/account mode "
+            f"is misconfigured. RDP to the VPS, verify Sierra is running "
+            f"in Sim1 + Trade Simulation Mode, save the chartbook, and "
+            f"reconnect the trade service before relaunching Kate. "
+            f"(Override with --allow-no-trade-activity-log to bypass.)"
+        )
+        LOGGER.error(msg)
+        raise SystemExit(99)
+
+    # Multiple files for the same day = mode flipped during the day.
+    # Take the most recently modified one (= current Sierra state).
+    latest = max(matches, key=lambda p: p.stat().st_mtime)
+    name = latest.name  # e.g. "TradeActivityLog_2026-05-05_UTC.Sim1.simulated.data"
+    # Strip prefix "TradeActivityLog_<YYYY-MM-DD>_" (UTC marker present
+    # in older versions; absent in some — match either) and the trailing
+    # ".data" to leave the suffix segment.
+    prefix = f"TradeActivityLog_{today_utc}_"
+    if not name.startswith(prefix):
+        # Fallback: split on first underscore-date and trailing .data
+        suffix_segment = name
+    else:
+        suffix_segment = name[len(prefix):]
+    if suffix_segment.endswith(".data"):
+        suffix_segment = suffix_segment[:-len(".data")]
+    # suffix_segment is now e.g. "UTC.Sim1.simulated" or "UTC.E8933"
+    # Sierra prepends "UTC." so strip it for clean comparison
+    if suffix_segment.startswith("UTC."):
+        suffix_segment = suffix_segment[len("UTC."):]
+
+    if suffix_segment == required_suffix:
+        LOGGER.info(
+            "supervisor: TradeActivityLog suffix check PASS — %s matches "
+            "required '%s'", latest.name, required_suffix,
+        )
+        return
+
+    # Mismatch — refuse to launch
+    other_files = ", ".join(p.name for p in matches if p != latest)
+    msg = (
+        f"supervisor: TradeActivityLog suffix check FAIL — found "
+        f"'{suffix_segment}', required '{required_suffix}'. "
+        f"Latest file: {latest.name}. "
+        + (f"Other files today: {other_files}. " if other_files else "")
+        + f"Sierra is NOT in the expected account+mode for this Kate "
+        f"invocation. RDP to VPS, set Trade Account = {required_suffix.split('.')[0]}, "
+        f"verify {'Trade Simulation Mode ON' if 'simulated' in required_suffix else 'live mode'}, "
+        f"save chartbook, reconnect trade service. Refusing to launch — "
+        f"submissions would silently drop. "
+        f"(Override with --require-trade-activity-suffix '' to bypass — "
+        f"NOT recommended unless you know what you are doing.)"
+    )
+    LOGGER.error(msg)
+    raise SystemExit(99)
+
+
 async def _verify_dtc_reachable(host: str, port: int, *, timeout: float = 3.0) -> None:
     """Quick TCP probe before the supervisor commits to a full DTC handshake.
     Fails with a clear error message if the host:port isn't accepting
@@ -282,6 +430,21 @@ async def _run(args: argparse.Namespace) -> int:
         if args.dry_run:
             LOGGER.info("supervisor: dry-run successful — exiting without connecting")
             return 0
+
+        # Pre-flight Sierra mode check (Gate #11/14 enforcement). Fails fast
+        # with a clear error if Sierra's TradeActivityLog filename suffix
+        # doesn't match the required account+mode — prevents Kate from
+        # silently dropping submissions for hours like cycles 2-3 did.
+        LOGGER.info(
+            "supervisor: validating Sierra TradeActivityLog suffix "
+            "(required '%s', dir %s)",
+            args.require_trade_activity_suffix, args.trade_activity_logs_dir,
+        )
+        _validate_sierra_trade_activity_suffix(
+            logs_dir=Path(args.trade_activity_logs_dir),
+            required_suffix=args.require_trade_activity_suffix,
+            allow_missing=args.allow_no_trade_activity_log,
+        )
 
         # Pre-flight TCP probe before the full DTC handshake. Fails fast
         # with a clear error if the host:port isn't reachable, instead of
