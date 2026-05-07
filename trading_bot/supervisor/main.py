@@ -103,6 +103,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     # immediately instead of after orders accumulate. See
     # protocol/kate-pre-live-flip-gate.md Gates #11 + #14 for context.
     p.add_argument(
+        "--trade-activity-log-dir",
+        dest="trade_activity_logs_dir",
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument(
         "--require-trade-activity-suffix", default="Sim1.simulated",
         help="Required TradeActivityLog filename suffix (between the date and "
              "'.data'). Default 'Sim1.simulated' for paper trading. Set to "
@@ -157,7 +162,37 @@ def _setup_logging(level: str, log_file: str | None) -> None:
     logging.basicConfig(level=level, format=fmt, handlers=handlers, force=True)
 
 
-def _build_instruments(symbols: list[str]) -> dict[str, InstrumentMeta]:
+def _resolve_scid_basename(scid_dir: Path, rt) -> str:
+    """Sierra installs vary in their .scid naming convention. VPS uses
+    e.g. 'MESM26_FUT_CME.scid'; Wiltshire's local lab uses 'MESM26-CME.scid'.
+    Try the configured basename first, then known alternates, return the
+    first that actually exists on disk. Raise SystemExit with a clear
+    message if none exist — a silent miss here means the engine polls a
+    non-existent file and the strategy never fires (caused 26 hours of
+    silent heartbeats on Wiltshire 2026-05-06/07 before this guard was
+    added).
+    """
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for cand in (rt.scid_basename, rt.dtc_symbol, f"{rt.strategy_symbol}-{rt.exchange}", rt.strategy_symbol):
+        if cand and cand not in seen:
+            candidates.append(cand)
+            seen.add(cand)
+    for cand in candidates:
+        if (scid_dir / f"{cand}.scid").exists():
+            if cand != rt.scid_basename:
+                logging.getLogger(__name__).info(
+                    "supervisor: scid for %s resolved to %s.scid (configured was %s.scid — Sierra install uses different convention on this rig)",
+                    rt.strategy_symbol, cand, rt.scid_basename,
+                )
+            return cand
+    raise SystemExit(
+        f"no .scid file found for {rt.strategy_symbol} in {scid_dir} — tried: {candidates}. "
+        f"Verify Sierra is recording bars for this symbol and check the filename convention."
+    )
+
+
+def _build_instruments(symbols: list[str], scid_dir: Path) -> dict[str, InstrumentMeta]:
     out: dict[str, InstrumentMeta] = {}
     for s in symbols:
         if s not in KNOWN_INSTRUMENTS:
@@ -169,7 +204,7 @@ def _build_instruments(symbols: list[str]) -> dict[str, InstrumentMeta]:
         out[s] = InstrumentMeta(
             symbol=rt.strategy_symbol,
             exchange=rt.exchange,
-            scid_filename=rt.scid_basename,
+            scid_filename=_resolve_scid_basename(scid_dir, rt),
             dtc_symbol=rt.dtc_symbol,
             tick_size=rt.tick_size,
             tick_value=rt.tick_value,
@@ -384,7 +419,7 @@ async def _run(args: argparse.Namespace) -> int:
 
     state = StateStore(db_path).open()
     try:
-        instruments = _build_instruments(args.symbols)
+        instruments = _build_instruments(args.symbols, scid_dir)
         candle_mgr = CandleManager(scid_dir=scid_dir, timeframe_minutes=args.timeframe_minutes)
         strategy = AtrBreakoutStrategy(
             breakout_lookback=args.breakout_lookback,

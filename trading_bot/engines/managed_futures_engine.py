@@ -211,6 +211,17 @@ class ManagedFuturesEngine:
         # cleared once a sibling cancel has been issued.
         self._sibling_orders: dict[str, str] = {}
 
+        # Missing-data canary. If no candles arrive for a symbol within
+        # 60s of the engine running, log a single WARNING. Wiltshire 2026
+        # -05-06/07 ate 26 hours of silent heartbeats because the .scid
+        # filename convention differed between rigs and CandleManager
+        # silently polled a file that didn't exist. The supervisor now
+        # resolves the filename at startup, but this canary catches any
+        # other path where Sierra stops writing bars (chart closed,
+        # subscription expired, file permissions, etc.).
+        self._first_run_time: Optional[float] = None
+        self._missing_data_warned: dict[str, bool] = {s: False for s in symbols}
+
     # ── Public lifecycle ──────────────────────────────────────────────────
     async def start(self) -> None:
         """Warm candle history, then connect DTC + seed initial broker state.
@@ -477,6 +488,21 @@ class ManagedFuturesEngine:
         for candle in closed:
             self._history[symbol].append(candle)
             await self._on_candle_close(symbol, candle)
+
+        # Missing-data canary: warn ONCE per symbol if no candles arrive
+        # within 60s of engine start. See note in __init__.
+        if not self._missing_data_warned[symbol] and not self._history[symbol]:
+            now = asyncio.get_running_loop().time()
+            if self._first_run_time is None:
+                self._first_run_time = now
+            elif now - self._first_run_time > 60:
+                logger.warning(
+                    "engine: NO CANDLES received for %s after 60s — check that "
+                    "Sierra is recording bars for %s.scid in the configured "
+                    "scid_dir; strategy will not fire without bar data",
+                    symbol, meta.scid_filename,
+                )
+                self._missing_data_warned[symbol] = True
 
     async def _on_candle_close(self, symbol: str, candle: Candle) -> None:
         if self._account_state is None:
