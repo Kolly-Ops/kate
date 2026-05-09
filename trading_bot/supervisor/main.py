@@ -35,7 +35,11 @@ from trading_bot.core.execution import dtc_protocol as proto
 from trading_bot.core.execution.dtc_client import DTCClient
 from trading_bot.core.risk import RiskManager, RiskPolicy
 from trading_bot.core.state import Reconciler, StateStore
-from trading_bot.core.strategy import AtrBreakoutStrategy
+from trading_bot.core.strategy import (
+    AtrBreakoutStrategy,
+    ORBStrategy,
+    SessionWindow,
+)
 from trading_bot.engines import InstrumentMeta, ManagedFuturesEngine
 from trading_bot.supervisor.runtime import KNOWN_INSTRUMENTS
 
@@ -133,16 +137,37 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--tick-interval", type=float, default=1.0)
     p.add_argument("--reconciliation-interval", type=float, default=30.0)
     p.add_argument("--seed-timeout", type=float, default=2.0)
-    p.add_argument("--breakout-lookback", type=int, default=20)
-    p.add_argument("--ma-period", type=int, default=50)
-    p.add_argument("--atr-period", type=int, default=14)
+    p.add_argument("--strategy", choices=["orb", "breakout"], default="orb",
+                   help="signal strategy: orb=multi-session Opening Range Breakout "
+                        "(validated 2026-05-09, default); breakout=legacy ATR breakout "
+                        "(retained for rollback / regression testing only).")
+    p.add_argument("--breakout-lookback", type=int, default=20,
+                   help="legacy AtrBreakoutStrategy: prior-N-bar high lookback")
+    p.add_argument("--ma-period", type=int, default=50,
+                   help="legacy AtrBreakoutStrategy: SMA filter period")
+    p.add_argument("--atr-period", type=int, default=14,
+                   help="ATR period (used by both strategies)")
     # Default kept in sync with AtrBreakoutStrategy ctor default in
     # breakout.py — argparse here ALWAYS overrides the class default
     # because we pass args.atr_stop_mult explicitly to the ctor below,
     # so this is the load-bearing one. Lesson learned 2026-04-30:
     # editing only the class default is a no-op at runtime.
-    p.add_argument("--atr-stop-mult", type=float, default=1.1)
-    p.add_argument("--atr-target-mult", type=float, default=3.0)
+    p.add_argument("--atr-stop-mult", type=float, default=1.1,
+                   help="ATR stop multiplier (used by both strategies)")
+    p.add_argument("--atr-target-mult", type=float, default=3.0,
+                   help="legacy AtrBreakoutStrategy: ATR target multiplier (R:R = mult/stop_mult)")
+    # ORB-specific defaults match the validated configuration from
+    # decisions/2026-05-09-kate-12-month-strategy-master-plan-v2.md.
+    p.add_argument("--orb-reward-risk", type=float, default=2.5,
+                   help="ORB: target = stop_distance × reward_risk (R:R)")
+    p.add_argument("--orb-ema-period", type=int, default=200,
+                   help="ORB: trend filter EMA period")
+    p.add_argument("--orb-direction", choices=["both", "long", "short"], default="both",
+                   help="ORB: which direction to trade")
+    p.add_argument("--orb-min-range-points", type=float, default=1.0,
+                   help="ORB: minimum opening-range width (filters chop)")
+    p.add_argument("--orb-max-range-points", type=float, default=25.0,
+                   help="ORB: maximum opening-range width (filters vol blowouts)")
     p.add_argument("--log-file", default=None,
                    help="optional log file path (in addition to stderr)")
     p.add_argument("--log-level", default="INFO",
@@ -421,13 +446,43 @@ async def _run(args: argparse.Namespace) -> int:
     try:
         instruments = _build_instruments(args.symbols, scid_dir)
         candle_mgr = CandleManager(scid_dir=scid_dir, timeframe_minutes=args.timeframe_minutes)
-        strategy = AtrBreakoutStrategy(
-            breakout_lookback=args.breakout_lookback,
-            ma_period=args.ma_period,
-            atr_period=args.atr_period,
-            atr_stop_mult=args.atr_stop_mult,
-            atr_target_mult=args.atr_target_mult,
-        )
+        if args.strategy == "orb":
+            # Multi-session Opening Range Breakout. Sessions are hardcoded
+            # to the validated Asian + US configuration from the 2026-05-09
+            # master plan. Future tuning (e.g. session-time overrides)
+            # routed via config/orb.json when needed; not exposed via CLI
+            # to keep the runtime profile auditable.
+            strategy = ORBStrategy(
+                sessions=[
+                    SessionWindow(
+                        name="asian",
+                        range_start=dt.time(0, 0),
+                        range_end=dt.time(0, 30),
+                        trade_end=dt.time(6, 0),
+                    ),
+                    SessionWindow(
+                        name="us",
+                        range_start=dt.time(14, 30),
+                        range_end=dt.time(15, 0),
+                        trade_end=dt.time(20, 45),
+                    ),
+                ],
+                ema_period=args.orb_ema_period,
+                atr_period=args.atr_period,
+                atr_stop_mult=args.atr_stop_mult,
+                reward_risk=args.orb_reward_risk,
+                min_range_points=args.orb_min_range_points,
+                max_range_points=args.orb_max_range_points,
+                direction=args.orb_direction,
+            )
+        else:  # "breakout" — legacy ATR breakout, retained for rollback
+            strategy = AtrBreakoutStrategy(
+                breakout_lookback=args.breakout_lookback,
+                ma_period=args.ma_period,
+                atr_period=args.atr_period,
+                atr_stop_mult=args.atr_stop_mult,
+                atr_target_mult=args.atr_target_mult,
+            )
         risk = RiskManager(_load_risk_policy(config_dir))
         reconciler = Reconciler()
         dtc_client = DTCClient(host=args.dtc_host, port=args.dtc_port)
@@ -456,10 +511,11 @@ async def _run(args: argparse.Namespace) -> int:
 
         LOGGER.info(
             "supervisor: composed engine — symbols=%s dtc=%s:%d mode=%s "
-            "db=%s scid_dir=%s policy=$%.0f NLV / %.1f%% per-trade",
+            "db=%s scid_dir=%s policy=$%.0f NLV / %.1f%% per-trade strategy=%s",
             args.symbols, args.dtc_host, args.dtc_port, args.trade_mode,
             db_path, scid_dir,
             risk.policy.starting_nlv, risk.policy.max_risk_per_trade_pct_nlv * 100,
+            strategy.name,
         )
 
         if args.dry_run:

@@ -56,3 +56,21 @@ def lowest_low(candles: Sequence[Candle], period: int) -> float:
     if period <= 0 or len(candles) < period:
         return 0.0
     return min(c.low for c in candles[-period:])
+
+
+def ema(candles: Sequence[Candle], period: int) -> float:
+    """Exponential moving average of close prices over the last `period`
+    candles. Uses pandas-equivalent smoothing factor α = 2/(period+1) and
+    seeds the recursion with the SMA of the first `period` bars (matches
+    pandas' `ewm(span=period, adjust=False).mean()` against an SMA seed).
+
+    Returns 0.0 if insufficient history.
+    """
+    if period <= 1 or len(candles) < period:
+        return 0.0
+    alpha = 2.0 / (period + 1)
+    seed = sum(c.close for c in candles[:period]) / period
+    value = seed
+    for c in candles[period:]:
+        value = alpha * c.close + (1.0 - alpha) * value
+    return value
