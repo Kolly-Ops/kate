@@ -222,6 +222,10 @@ class ManagedFuturesEngine:
         self._first_run_time: Optional[float] = None
         self._missing_data_warned: dict[str, bool] = {s: False for s in symbols}
 
+        # Sim-mode NLV fallback: log the fallback once per engine run.
+        # See _handle_account_balance_update for rationale.
+        self._sim_nlv_fallback_logged: bool = False
+
     # ── Public lifecycle ──────────────────────────────────────────────────
     async def start(self) -> None:
         """Warm candle history, then connect DTC + seed initial broker state.
@@ -468,7 +472,28 @@ class ManagedFuturesEngine:
     def _handle_account_balance_update(
         self, msg: proto.AccountBalanceUpdate
     ) -> None:
-        nlv = msg.net_liquidation_value
+        # Sierra Chart sim mode does NOT report synthetic NLV via DTC
+        # (confirmed by SC support 2026-05-09: "Simulation accounts do
+        # not show in the Trade Account Manager. That window only shows
+        # information for live accounts."). When sim mode reports
+        # NLV<=0, we fall back to the risk policy's configured
+        # starting_nlv so the risk gates have a meaningful denominator.
+        # In live mode we trust the broker's NLV unconditionally — a
+        # zero there is a real signal, not an artefact of sim mode.
+        raw_nlv = msg.net_liquidation_value
+        if self.trade_mode == proto.TRADE_MODE_DEMO and raw_nlv <= 0:
+            nlv = self.risk.policy.starting_nlv
+            if not self._sim_nlv_fallback_logged:
+                logger.warning(
+                    "engine: sim mode reports NLV=$%.2f via DTC (Sierra Chart "
+                    "by-design — sim accounts have no DTC-exposed balance); "
+                    "falling back to risk_policy.starting_nlv=$%.2f for risk "
+                    "gates. Drawdown tracking is approximate in sim mode.",
+                    raw_nlv, self.risk.policy.starting_nlv,
+                )
+                self._sim_nlv_fallback_logged = True
+        else:
+            nlv = raw_nlv
         if self._starting_nlv is None:
             self._starting_nlv = nlv
         self._account_state = AccountState(
