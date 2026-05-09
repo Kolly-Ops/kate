@@ -42,6 +42,7 @@ Stateless-by-policy compromise:
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import math
 from dataclasses import dataclass, field
 from typing import Optional
@@ -51,6 +52,9 @@ from trading_bot.core.risk import TradeIntent
 
 from .base import Strategy, StrategyContext
 from .indicators import atr, ema
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -79,6 +83,7 @@ class _SessionState:
     """Mutable state we maintain per session."""
     last_seen_date: Optional[dt.date] = None
     traded_in_current: bool = False
+    eval_logged_in_current: bool = False
 
 
 class ORBStrategy(Strategy):
@@ -175,6 +180,7 @@ class ORBStrategy(Strategy):
         if state.last_seen_date != bar_date:
             state.last_seen_date = bar_date
             state.traded_in_current = False
+            state.eval_logged_in_current = False
 
         # If we're still inside the opening-range window, don't trade —
         # range is still being built. Engine will keep calling us.
@@ -199,6 +205,15 @@ class ORBStrategy(Strategy):
 
         range_width = range_high - range_low
         if range_width < self.min_range_points or range_width > self.max_range_points:
+            self._log_eval_once(
+                state,
+                active_session,
+                c,
+                range_high,
+                range_low,
+                f"range_width={range_width:.2f} outside "
+                f"{self.min_range_points:.2f}-{self.max_range_points:.2f}",
+            )
             return None  # range too narrow (chop) or too wide (vol blowout)
 
         # Indicators on the just-closed bar.
@@ -243,6 +258,15 @@ class ORBStrategy(Strategy):
                 f"ATR{self.atr_period}={atr_value:.2f}, R:R={self.reward_risk}"
             )
         else:
+            self._log_eval_once(
+                state,
+                active_session,
+                c,
+                range_high,
+                range_low,
+                f"no entry: close={c.close:.2f}, EMA{self.ema_period}={ema_value:.2f}, "
+                f"ATR{self.atr_period}={atr_value:.2f}",
+            )
             return None
 
         # Mark session as having traded — single-trade-per-session rule.
@@ -250,11 +274,21 @@ class ORBStrategy(Strategy):
         # marks the session as "traded". That's intentional — we don't
         # retry within a session; one chance per ORB.
         state.traded_in_current = True
+        state.eval_logged_in_current = True
 
         # Compact deterministic intent_id (must fit DTC's ClientOrderID[32]).
         intent_id = (
             f"orb-{ctx.symbol[:8]}-{active_session.name[:3]}-"
             f"{c.timestamp.strftime('%y%m%d%H%M%S')}"
+        )
+
+        LOGGER.info(
+            "strategy eval: %s at %s range %.2f-%.2f -> intent %s",
+            active_session.name,
+            c.timestamp.isoformat(sep=" "),
+            range_low,
+            range_high,
+            intent_id,
         )
 
         return TradeIntent(
@@ -316,3 +350,24 @@ class ORBStrategy(Strategy):
             range_high = candle.high if math.isnan(range_high) else max(range_high, candle.high)
             range_low = candle.low if math.isnan(range_low) else min(range_low, candle.low)
         return range_high, range_low
+
+    def _log_eval_once(
+        self,
+        state: _SessionState,
+        session: SessionWindow,
+        candle,
+        range_high: float,
+        range_low: float,
+        outcome: str,
+    ) -> None:
+        if state.eval_logged_in_current:
+            return
+        state.eval_logged_in_current = True
+        LOGGER.info(
+            "strategy eval: %s at %s range %.2f-%.2f -> %s",
+            session.name,
+            candle.timestamp.isoformat(sep=" "),
+            range_low,
+            range_high,
+            outcome,
+        )
