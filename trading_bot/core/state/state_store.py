@@ -157,7 +157,14 @@ class StateStore:
     # ── Lifecycle ─────────────────────────────────────────────────────────
     def open(self) -> "StateStore":
         if self._conn is None:
-            self._conn = sqlite3.connect(self.db_path, isolation_level=None)
+            # Add timeout and check_same_thread=False to handle multi-process
+            # (engine + health-check script) access gracefully.
+            self._conn = sqlite3.connect(
+                self.db_path,
+                isolation_level=None,
+                timeout=30.0,
+                check_same_thread=False,
+            )
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA journal_mode = WAL")
             self._conn.execute("PRAGMA foreign_keys = ON")

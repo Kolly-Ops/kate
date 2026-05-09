@@ -378,7 +378,7 @@ ORDER_UPDATE_FMT = (
     "64s"            # LastFillExecutionID
     "32s"            # TradeAccount
     "96s"            # InfoText
-    "B"              # NoOrders
+    "B 7x"           # NoOrders (padding to 8-byte boundary)
     "32s 32s"        # ParentServerOrderID, OCOLinkedOrderServerOrderID
     "i"              # OpenOrClose
     "32s"            # PreviousClientOrderID
@@ -394,9 +394,9 @@ POSITION_UPDATE_FMT = (
     "64s 16s"        # Symbol, Exchange
     "dd"             # Quantity (signed), AveragePrice
     "32s 32s"        # PositionIdentifier, TradeAccount
-    "BB"             # NoPositions, Unsolicited
+    "BB 6x"          # NoPositions, Unsolicited (padding to 8-byte boundary)
     "d"              # MarginRequirement
-    "i"              # EntryDateTime (t_DateTime4Byte — int32)
+    "i 4x"           # EntryDateTime (t_DateTime4Byte — int32) (padding for double)
     "ddddd"          # OpenProfitLoss, HighPriceDuringPosition, LowPriceDuringPosition,
                      # QuantityLimit, MaxPotentialPostionQuantity
 )
@@ -410,19 +410,19 @@ ACCOUNT_BALANCE_UPDATE_FMT = (
     "32s"            # TradeAccount
     "dd"             # SecuritiesValue, MarginRequirement
     "ii"             # TotalNumberMessages, MessageNumber
-    "BB"             # NoAccountBalances, Unsolicited
+    "BB 6x"          # NoAccountBalances, Unsolicited (padding to 8-byte boundary)
     "dd"             # OpenPositionsProfitLoss, DailyProfitLoss
     "96s"            # InfoText
     "Q"              # TransactionIdentifier (uint64)
     "dd"             # DailyNetLossLimit, TrailingAccountValueToLimitPositions
-    "BBBB"           # DailyNetLossLimitReached, IsUnderRequiredMargin,
-                     # ClosePositionsAtEndOfDay, TradingIsDisabled
+    "BBBB 4x"        # DailyNetLossLimitReached, IsUnderRequiredMargin,
+                     # ClosePositionsAtEndOfDay, TradingIsDisabled (padding to 8-byte boundary)
     "96s"            # Description
-    "B"              # IsUnderRequiredAccountValue
+    "B 7x"           # IsUnderRequiredAccountValue (padding for int64)
     "q"              # TransactionDateTime (t_DateTimeWithMicrosecondsInt — int64)
     "ddd"            # MarginRequirementFull, MarginRequirementFullPositionsOnly,
                      # PeakMarginRequirement
-    "32s"            # IntroducingBroker
+    "32s 8x"         # IntroducingBroker (trailing padding to 416)
 )
 ACCOUNT_BALANCE_UPDATE_SIZE = struct.calcsize(ACCOUNT_BALANCE_UPDATE_FMT)
 

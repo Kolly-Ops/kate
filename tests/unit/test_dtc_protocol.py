@@ -136,16 +136,16 @@ def _pack_account_balance_update(
 # ── Sizes ────────────────────────────────────────────────────────────────
 def test_order_update_size_matches_known_layout() -> None:
     # Documented total: header (4) + body fields summed per Gemini's
-    # extraction. Anchor = 713 bytes.
-    assert proto.ORDER_UPDATE_SIZE == 713
+    # extraction. Aligned = 720 bytes.
+    assert proto.ORDER_UPDATE_SIZE == 720
 
 
 def test_position_update_size_matches_known_layout() -> None:
-    assert proto.POSITION_UPDATE_SIZE == 230
+    assert proto.POSITION_UPDATE_SIZE == 240
 
 
 def test_account_balance_update_size_matches_known_layout() -> None:
-    assert proto.ACCOUNT_BALANCE_UPDATE_SIZE == 391
+    assert proto.ACCOUNT_BALANCE_UPDATE_SIZE == 416
 
 
 # ── Order update ──────────────────────────────────────────────────────────

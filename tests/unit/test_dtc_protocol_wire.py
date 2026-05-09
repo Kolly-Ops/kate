@@ -61,8 +61,8 @@ def test_real_order_update_header(captures: dict) -> None:
     size, msg_type = proto.unpack_header(data)
     assert size == 720
     assert msg_type == proto.ORDER_UPDATE
-    # Wire is larger than my legacy struct (713) — oversized-tolerance path.
-    assert size > proto.ORDER_UPDATE_SIZE
+    # Wire is larger than or equal to my aligned struct (720).
+    assert size >= proto.ORDER_UPDATE_SIZE
 
 
 def test_real_position_update_header(captures: dict) -> None:
@@ -70,7 +70,7 @@ def test_real_position_update_header(captures: dict) -> None:
     size, msg_type = proto.unpack_header(data)
     assert size == 240
     assert msg_type == proto.POSITION_UPDATE
-    assert size > proto.POSITION_UPDATE_SIZE
+    assert size >= proto.POSITION_UPDATE_SIZE
 
 
 def test_real_account_balance_update_header(captures: dict) -> None:
@@ -78,7 +78,7 @@ def test_real_account_balance_update_header(captures: dict) -> None:
     size, msg_type = proto.unpack_header(data)
     assert size == 416
     assert msg_type == proto.ACCOUNT_BALANCE_UPDATE
-    assert size > proto.ACCOUNT_BALANCE_UPDATE_SIZE
+    assert size >= proto.ACCOUNT_BALANCE_UPDATE_SIZE
 
 
 # ── Full unpack: ACCOUNT_BALANCE_UPDATE ───────────────────────────────────
