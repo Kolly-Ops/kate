@@ -29,16 +29,29 @@ Design principles
    implementation translates from its native protocol into these.
 2. **Idempotent lifecycle.** `connect()` and `disconnect()` may be
    called multiple times; implementations must tolerate reconnection.
-3. **Explicit account state.** Balance / position state is requested
-   via `request_account_state()` rather than scraped from event
-   stream. Async-rithmic exposes this naturally; DTC requires a
-   light wrapper.
+3. **Explicit state seeding.** Account, positions, and open orders
+   are queried via `request_account_state()`, `request_positions()`,
+   `request_open_orders()` rather than scraped from event stream.
+   Avoids the Sierra-Chart trap (2026-05-08) of silently running
+   against opaque/zero account state. Engine refuses to begin
+   strategy evaluation until all three seed calls succeed.
 4. **Stateless ABC.** Adapter holds connection state internally;
    engine never reads or mutates internal adapter state directly.
 5. **Stop / target ticks vs absolute prices.** The current Kate
    engine submits absolute stop/target prices (computed from ATR).
    Rithmic prefers tick offsets. Adapters convert; the engine
    continues to think in absolute prices.
+6. **Logon is optional.** DTC has a discrete LOGON handshake;
+   Rithmic authenticates inside `connect()` via constructor creds.
+   The ABC's default `logon()` is a no-op so Rithmic-style adapters
+   don't have to fake one.
+7. **Symbol mapping is the adapter's job.** Engine speaks logical
+   symbols (e.g. "MESM26"). Different brokers want different
+   forms — DTC: "MESM26-CME", Rithmic: product root "MES" plus
+   `get_front_month_contract` resolution. The adapter holds the
+   `symbol_map: dict[str, BrokerSymbolSpec]` (or similar) at
+   construction and translates on every method call. Engine never
+   sees broker-specific symbol shapes.
 
 Migration path
 --------------
@@ -182,7 +195,6 @@ class BrokerAdapter(ABC):
     async def disconnect(self) -> None:
         """Tear down connection cleanly. Idempotent."""
 
-    @abstractmethod
     async def logon(
         self,
         *,
@@ -192,13 +204,19 @@ class BrokerAdapter(ABC):
         password: str = "",
         demo: bool = True,
     ) -> None:
-        """Authenticate against the broker.
+        """OPTIONAL: explicit authentication step after connect().
 
-        For DTC this is the LOGON_REQUEST handshake; for Rithmic it's
-        the per-plant login flow. Either way, on success the adapter
-        is ready to submit_order / subscribe_market_data.
-        Raises BrokerError on auth failure.
+        This shape exists for adapters that have a discrete logon
+        handshake separate from connection (DTC's LOGON_REQUEST).
+        Adapters that authenticate during `connect()` itself —
+        notably Rithmic, where credentials live in the
+        `RithmicClient` constructor and login happens during
+        plant connect — should leave this as a no-op (the default
+        implementation does nothing).
+
+        Adapters that DO need explicit logon override this method.
         """
+        return None
 
     # ── Order submission & cancellation ──────────────────────────────────
 
@@ -266,7 +284,40 @@ class BrokerAdapter(ABC):
         """Pull the current account snapshot synchronously. The result
         is also emitted on the event stream as ACCOUNT_BALANCE_UPDATE
         for engine state-sync, but having a synchronous request method
-        avoids race conditions on engine startup / reconnect."""
+        avoids race conditions on engine startup / reconnect.
+
+        REQUIRED. The engine refuses to begin strategy evaluation
+        until a successful account-state pull confirms NLV is real.
+        Lesson learned 2026-05-08: Sierra Chart silently reported
+        zero NLV for days because Sim1 was unconfigured; we never
+        want to paper-test risk gates against an opaque account
+        state again.
+        """
+
+    @abstractmethod
+    async def request_positions(
+        self,
+        *,
+        trade_account: str,
+    ) -> tuple[PositionEvent, ...]:
+        """Pull the current open-position snapshot synchronously.
+        Returns one PositionEvent per held position (empty tuple if
+        flat). Used at engine startup to seed the StateStore's
+        position table from broker truth and again after reconnect
+        to detect drift.
+        """
+
+    @abstractmethod
+    async def request_open_orders(
+        self,
+        *,
+        trade_account: str,
+    ) -> tuple[OrderEvent, ...]:
+        """Pull the current open-order snapshot synchronously.
+        Returns one OrderEvent per open order (empty tuple if no
+        active orders). Used at engine startup to reconcile
+        StateStore's pending-orders table with broker truth.
+        """
 
     # ── Event stream ─────────────────────────────────────────────────────
 
