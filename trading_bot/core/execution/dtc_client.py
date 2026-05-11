@@ -200,6 +200,47 @@ class DTCClient:
         self._writer.write(payload)
         await self._writer.drain()
 
+    async def request_account_balance(
+        self, *, request_id: int = 1, trade_account: str = ""
+    ) -> None:
+        """Send ACCOUNT_BALANCE_REQUEST (msg 601). Sierra responds with
+        one or more ACCOUNT_BALANCE_UPDATE (msg 600). Empty trade_account
+        is intentional in seed flow — Sierra filters server-side based on
+        the logon context (verified by COO Gemini's 2026-04-27 wire
+        capture; sending the real account name caused silent drops)."""
+        if not self._writer:
+            raise DTCError("not connected")
+        self._writer.write(proto.pack_account_balance_request(
+            request_id=request_id, trade_account=trade_account,
+        ))
+        await self._writer.drain()
+
+    async def request_current_positions(
+        self, *, request_id: int = 2, trade_account: str = ""
+    ) -> None:
+        """Send CURRENT_POSITIONS_REQUEST (msg 305). Sierra responds with
+        one POSITION_UPDATE per position, terminated by a no_positions=1
+        sentinel when flat. Empty trade_account per seed convention."""
+        if not self._writer:
+            raise DTCError("not connected")
+        self._writer.write(proto.pack_current_positions_request(
+            request_id=request_id, trade_account=trade_account,
+        ))
+        await self._writer.drain()
+
+    async def request_open_orders(
+        self, *, request_id: int = 3, trade_account: str = ""
+    ) -> None:
+        """Send OPEN_ORDERS_REQUEST (msg 300). Sierra responds with one
+        ORDER_UPDATE per open order, or a single ORDER_UPDATE with
+        no_orders=1 sentinel when flat."""
+        if not self._writer:
+            raise DTCError("not connected")
+        self._writer.write(proto.pack_open_orders_request(
+            request_id=request_id, trade_account=trade_account,
+        ))
+        await self._writer.drain()
+
     async def subscribe_market_data(
         self, symbol_id: int, symbol: str, *, exchange: str = ""
     ) -> None:

@@ -153,6 +153,39 @@ class MarketDataTick:
     ask: Optional[float] = None
 
 
+# ── Symbol mapping (Codex adapter-spec amendment 4) ──────────────────────
+
+@dataclass(frozen=True)
+class BrokerSymbolSpec:
+    """Per-instrument mapping between Kate's logical symbol and the
+    broker's on-the-wire form.
+
+    Kate's engine, strategies, risk gates, and StateStore all key off
+    `logical_symbol` (e.g. "MESM26"). Each broker has its own wire
+    representation:
+
+      DTC (Sierra Chart) — broker_symbol = "MESM26-CME"
+      Rithmic            — broker_symbol = "MES" (product root; the
+                           adapter resolves to a front-month contract
+                           via get_front_month_contract at startup)
+
+    The adapter constructor takes one BrokerSymbolSpec per logical
+    symbol the engine plans to trade. Translation happens inside the
+    adapter on every call; the engine never sees broker-specific
+    symbol shapes. This is what allows the same engine code to drive
+    Sierra DTC or Rithmic without conditional logic at the call site.
+
+    `tick_size` lives here because the Rithmic adapter needs it to
+    convert absolute stop/target prices into `stop_ticks` /
+    `target_ticks` offsets for native bracket submission. DTC adapter
+    ignores it (uses absolute prices on the wire).
+    """
+    logical_symbol: str
+    broker_symbol: str
+    exchange: str
+    tick_size: float
+
+
 @dataclass(frozen=True)
 class BrokerEvent:
     """Top-level event the engine receives.
