@@ -32,7 +32,8 @@ from pathlib import Path
 
 from trading_bot.core.data import CandleManager
 from trading_bot.core.execution import dtc_protocol as proto
-from trading_bot.core.execution.dtc_client import DTCClient
+from trading_bot.core.execution.broker_adapter import BrokerSymbolSpec
+from trading_bot.core.execution.dtc_broker_adapter import DTCBrokerAdapter
 from trading_bot.core.risk import RiskManager, RiskPolicy
 from trading_bot.core.state import Reconciler, StateStore
 from trading_bot.core.strategy import (
@@ -66,6 +67,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                    help="SQLite state-store path")
     p.add_argument("--config-dir", default="config",
                    help="directory holding risk.json + instruments.json")
+    # Broker selector — DTC (Sierra Chart) today; rithmic / ibkr will plug
+    # into the BrokerAdapter ABC as their concrete adapters complete. The
+    # engine is broker-agnostic; this flag picks which adapter the
+    # supervisor constructs.
+    p.add_argument(
+        "--broker", choices=["dtc"], default="dtc",
+        help="Broker adapter selector. Only 'dtc' is wired today; "
+             "rithmic / ibkr come online as their adapters graduate "
+             "from unit-green to runtime-green.",
+    )
     p.add_argument("--dtc-host", default="127.0.0.1")
     p.add_argument("--dtc-port", type=int, default=11099)
     # Default empty: Sierra Trade Simulation Mode rejects orders that
@@ -215,6 +226,45 @@ def _resolve_scid_basename(scid_dir: Path, rt) -> str:
         f"no .scid file found for {rt.strategy_symbol} in {scid_dir} — tried: {candidates}. "
         f"Verify Sierra is recording bars for this symbol and check the filename convention."
     )
+
+
+def _build_broker_adapter(*, args, instruments):
+    """Construct the BrokerAdapter for the selected `--broker` value.
+
+    Currently only `dtc` is wired. As Rithmic / IBKR adapters graduate
+    from unit-green to runtime-green, add branches here. The engine
+    code doesn't change; this is the seam.
+    """
+    if args.broker == "dtc":
+        # Sierra DTC seed-request quirk: empty TradeAccount on seeds,
+        # populated on submits. The DTCBrokerAdapter encapsulates this:
+        # caller passes `submit_trade_account` for SUBMIT_NEW_SINGLE_ORDER
+        # and the adapter sends "" on seed requests regardless of any
+        # trade_account kwarg passed in by the engine.
+        submit_account = (
+            args.submit_trade_account
+            if args.submit_trade_account is not None
+            else args.trade_account
+        )
+        symbol_map = {
+            inst.symbol: BrokerSymbolSpec(
+                logical_symbol=inst.symbol,
+                broker_symbol=inst.dtc_symbol,
+                exchange=inst.exchange,
+                tick_size=inst.tick_size,
+            )
+            for inst in instruments.values()
+        }
+        return DTCBrokerAdapter(
+            host=args.dtc_host,
+            port=args.dtc_port,
+            client_name=args.client_name,
+            trade_mode=TRADE_MODE_LOOKUP[args.trade_mode],
+            symbol_map=symbol_map,
+            submit_trade_account=submit_account,
+            seed_timeout=args.seed_timeout,
+        )
+    raise SystemExit(f"unsupported --broker value: {args.broker!r}")
 
 
 def _build_instruments(symbols: list[str], scid_dir: Path) -> dict[str, InstrumentMeta]:
@@ -485,8 +535,14 @@ async def _run(args: argparse.Namespace) -> int:
             )
         risk = RiskManager(_load_risk_policy(config_dir))
         reconciler = Reconciler()
-        dtc_client = DTCClient(host=args.dtc_host, port=args.dtc_port)
         no_trade_windows = _parse_no_trade_windows(args.no_trade_windows_utc)
+
+        # Build the broker adapter from the configured selector. Engine
+        # depends on the BrokerAdapter ABC; this is the only place the
+        # concrete adapter is chosen.
+        broker = _build_broker_adapter(
+            args=args, instruments=instruments,
+        )
 
         engine = ManagedFuturesEngine(
             symbols=args.symbols,
@@ -496,15 +552,13 @@ async def _run(args: argparse.Namespace) -> int:
             risk=risk,
             state=state,
             reconciler=reconciler,
-            dtc_client=dtc_client,
+            broker=broker,
             trade_account=args.trade_account,
-            submit_trade_account=args.submit_trade_account,
             no_trade_windows_utc=no_trade_windows,
             client_name=args.client_name,
             trade_mode=TRADE_MODE_LOOKUP[args.trade_mode],
             tick_interval_seconds=args.tick_interval,
             reconciliation_interval_seconds=args.reconciliation_interval,
-            seed_timeout_seconds=args.seed_timeout,
             on_drift=_on_drift,
             on_intent_rejected=_on_intent_rejected,
         )

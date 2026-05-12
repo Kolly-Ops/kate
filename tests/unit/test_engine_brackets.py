@@ -6,42 +6,32 @@ at intent.stop_loss and a LIMIT (target) order at intent.take_profit. When
 either exit leg fills, the engine should cancel the sibling so the position
 closes via exactly one of the two exit paths.
 
-Tests use a recording-only fake DTCClient that captures submit/cancel calls
-without speaking to a real Sierra. The synthetic ORDER_UPDATE bytes are
-packed via the shared helper from test_dtc_protocol so we exercise the
-real unpack path on the way in.
+Post-refactor: engine depends on BrokerAdapter ABC, not DTCClient. Tests
+use FakeBrokerAdapter (records submit/cancel calls, satisfies the ABC)
+and drive engine state by calling `engine._handle_broker_event(event)`
+with synthetic BrokerEvents. No raw DTC bytes — the BrokerAdapter ABC
+already normalized those out.
 """
 from __future__ import annotations
 
 import asyncio
 import pathlib
-from datetime import datetime, timezone
+import time
 from typing import Optional
 
 import pytest
 
-from tests.unit.test_dtc_protocol import _pack_order_update
+from tests.mocks.fake_broker_adapter import FakeBrokerAdapter
 from trading_bot.core.execution import dtc_protocol as proto
-from trading_bot.core.execution.dtc_client import DTCMessage
+from trading_bot.core.execution.broker_adapter import (
+    BrokerEvent,
+    BrokerEventKind,
+    OrderEvent,
+)
 from trading_bot.core.risk import RiskManager, RiskPolicy
 from trading_bot.core.state import Reconciler, StateStore
 from trading_bot.core.strategy import AtrBreakoutStrategy
 from trading_bot.engines import InstrumentMeta, ManagedFuturesEngine
-
-
-class FakeDTCClient:
-    """Records submit_order / cancel_order calls. No network."""
-
-    def __init__(self) -> None:
-        self.submitted: list[dict] = []
-        self.cancelled: list[dict] = []
-
-    async def submit_order(self, **kwargs) -> str:
-        self.submitted.append(kwargs)
-        return kwargs["client_order_id"]
-
-    async def cancel_order(self, **kwargs) -> None:
-        self.cancelled.append(kwargs)
 
 
 def _meta() -> InstrumentMeta:
@@ -52,9 +42,9 @@ def _meta() -> InstrumentMeta:
     )
 
 
-def _build_engine(tmp_path: pathlib.Path) -> tuple[ManagedFuturesEngine, FakeDTCClient, StateStore]:
+def _build_engine(tmp_path: pathlib.Path) -> tuple[ManagedFuturesEngine, FakeBrokerAdapter, StateStore]:
     state = StateStore(tmp_path / "state.db").open()
-    fake = FakeDTCClient()
+    fake = FakeBrokerAdapter()
     engine = ManagedFuturesEngine(
         symbols=["MESM26"],
         instruments={"MESM26": _meta()},
@@ -63,9 +53,8 @@ def _build_engine(tmp_path: pathlib.Path) -> tuple[ManagedFuturesEngine, FakeDTC
         risk=RiskManager(RiskPolicy()),
         state=state,
         reconciler=Reconciler(),
-        dtc_client=fake,                           # type: ignore[arg-type]
+        broker=fake,
         trade_account="",
-        submit_trade_account="Sim1",
     )
     return engine, fake, state
 
@@ -89,8 +78,8 @@ def _seed_entry_with_bracket(
     quantity: float = 1.0,
 ) -> None:
     """Mimics what _submit_order does: records the entry in StateStore and
-    caches a bracket spec keyed by the entry coid. Skips the actual DTC
-    submit so the test can drive ORDER_UPDATE traffic directly."""
+    caches a bracket spec keyed by the entry coid. Skips the actual broker
+    submit so the test can drive the fill event directly."""
     engine.state.record_order(
         client_order_id=entry_coid,
         symbol="MESM26", exchange="CME",
@@ -100,12 +89,34 @@ def _seed_entry_with_bracket(
     from trading_bot.engines.managed_futures_engine import _BracketSpec
     engine._pending_brackets[entry_coid] = _BracketSpec(
         entry_coid=entry_coid,
-        dtc_symbol="MESM26-CME",
+        symbol="MESM26",                       # logical — adapter translates
         exchange="CME",
         entry_side=entry_side,
         quantity=quantity,
         stop_loss=stop_loss,
         take_profit=take_profit,
+    )
+
+
+def _fill_event(
+    *,
+    client_order_id: str,
+    side: int = proto.BUY,
+    fill_price: float = 6125.0,
+    fill_quantity: float = 1.0,
+) -> BrokerEvent:
+    """Construct a BrokerEvent of kind ORDER_FILLED with the given payload."""
+    return BrokerEvent(
+        kind=BrokerEventKind.ORDER_FILLED,
+        received_at=time.time(),
+        order=OrderEvent(
+            client_order_id=client_order_id,
+            symbol="MESM26",
+            side=side,
+            quantity=fill_quantity,
+            fill_price=fill_price,
+            fill_quantity=fill_quantity,
+        ),
     )
 
 
@@ -118,16 +129,8 @@ def test_entry_fill_submits_stop_and_target(engine_setup) -> None:
         entry_side=proto.BUY, stop_loss=6100.0, take_profit=6150.0,
     )
 
-    # Sierra reports the entry as FILLED
-    payload = _pack_order_update(
-        client_order_id=entry_coid,
-        order_status=proto.ORDER_STATUS_FILLED,
-        side=proto.BUY, filled_qty=1.0, remaining_qty=0.0,
-        avg_fill_price=6125.0,
-    )
-    msg = DTCMessage(msg_type=proto.ORDER_UPDATE, body=payload, received_at=0.0)
     asyncio.get_event_loop().run_until_complete(
-        engine._handle_dtc_message(msg)
+        engine._handle_broker_event(_fill_event(client_order_id=entry_coid))
     )
 
     # Two submits — STOP then TARGET, both opposite-side, correct prices
@@ -137,15 +140,16 @@ def test_entry_fill_submits_stop_and_target(engine_setup) -> None:
     assert stop["client_order_id"] == f"{entry_coid}-S"
     assert stop["order_type"] == proto.ORDER_TYPE_STOP
     assert stop["side"] == proto.SELL                  # close-side flips
-    assert stop["price1"] == 6100.0
-    assert stop["trade_account"] == "Sim1"
-    assert stop["symbol"] == "MESM26-CME"
+    assert stop["price"] == 6100.0
+    # Engine speaks logical symbols to the adapter; adapter does the
+    # logical → broker translation internally.
+    assert stop["symbol"] == "MESM26"
 
     target = fake.submitted[1]
     assert target["client_order_id"] == f"{entry_coid}-T"
     assert target["order_type"] == proto.ORDER_TYPE_LIMIT
     assert target["side"] == proto.SELL
-    assert target["price1"] == 6150.0
+    assert target["price"] == 6150.0
 
 
 def test_entry_fill_submits_only_stop_when_no_target(engine_setup) -> None:
@@ -158,12 +162,9 @@ def test_entry_fill_submits_only_stop_when_no_target(engine_setup) -> None:
         stop_loss=6100.0, take_profit=None,
     )
 
-    payload = _pack_order_update(
-        client_order_id=entry_coid,
-        order_status=proto.ORDER_STATUS_FILLED,
+    asyncio.get_event_loop().run_until_complete(
+        engine._handle_broker_event(_fill_event(client_order_id=entry_coid))
     )
-    msg = DTCMessage(msg_type=proto.ORDER_UPDATE, body=payload, received_at=0.0)
-    asyncio.get_event_loop().run_until_complete(engine._handle_dtc_message(msg))
 
     assert len(fake.submitted) == 1
     assert fake.submitted[0]["client_order_id"] == f"{entry_coid}-S"
@@ -178,13 +179,11 @@ def test_entry_fill_with_short_entry_flips_close_side_to_buy(engine_setup) -> No
         entry_side=proto.SELL, stop_loss=6160.0, take_profit=6100.0,
     )
 
-    payload = _pack_order_update(
-        client_order_id=entry_coid,
-        order_status=proto.ORDER_STATUS_FILLED,
-        side=proto.SELL,
+    asyncio.get_event_loop().run_until_complete(
+        engine._handle_broker_event(
+            _fill_event(client_order_id=entry_coid, side=proto.SELL)
+        )
     )
-    msg = DTCMessage(msg_type=proto.ORDER_UPDATE, body=payload, received_at=0.0)
-    asyncio.get_event_loop().run_until_complete(engine._handle_dtc_message(msg))
 
     assert all(s["side"] == proto.BUY for s in fake.submitted)
 
@@ -196,7 +195,7 @@ def test_stop_fill_cancels_target(engine_setup) -> None:
     stop_coid = f"{entry_coid}-S"
     target_coid = f"{entry_coid}-T"
 
-    # Pre-wire: pretend brackets were already submitted and Sierra
+    # Pre-wire: pretend brackets were already submitted and the broker
     # acknowledged them. Engine state has the sibling map populated and
     # both child orders in StateStore.
     for coid, otype in ((stop_coid, proto.ORDER_TYPE_STOP),
@@ -209,17 +208,14 @@ def test_stop_fill_cancels_target(engine_setup) -> None:
     engine._sibling_orders[target_coid] = stop_coid
 
     # Stop fills
-    payload = _pack_order_update(
-        client_order_id=stop_coid,
-        order_status=proto.ORDER_STATUS_FILLED,
-        side=proto.SELL, avg_fill_price=6098.5,
+    asyncio.get_event_loop().run_until_complete(
+        engine._handle_broker_event(_fill_event(
+            client_order_id=stop_coid, side=proto.SELL, fill_price=6098.5,
+        ))
     )
-    msg = DTCMessage(msg_type=proto.ORDER_UPDATE, body=payload, received_at=0.0)
-    asyncio.get_event_loop().run_until_complete(engine._handle_dtc_message(msg))
 
     assert len(fake.cancelled) == 1
     assert fake.cancelled[0]["client_order_id"] == target_coid
-    assert fake.cancelled[0]["trade_account"] == "Sim1"
 
     # Sibling map cleared in both directions — second fill won't double-cancel.
     assert stop_coid not in engine._sibling_orders
@@ -241,12 +237,9 @@ def test_target_fill_cancels_stop(engine_setup) -> None:
     engine._sibling_orders[stop_coid] = target_coid
     engine._sibling_orders[target_coid] = stop_coid
 
-    payload = _pack_order_update(
-        client_order_id=target_coid,
-        order_status=proto.ORDER_STATUS_FILLED,
+    asyncio.get_event_loop().run_until_complete(
+        engine._handle_broker_event(_fill_event(client_order_id=target_coid))
     )
-    msg = DTCMessage(msg_type=proto.ORDER_UPDATE, body=payload, received_at=0.0)
-    asyncio.get_event_loop().run_until_complete(engine._handle_dtc_message(msg))
 
     assert len(fake.cancelled) == 1
     assert fake.cancelled[0]["client_order_id"] == stop_coid
@@ -266,12 +259,9 @@ def test_entry_without_stop_loss_does_not_seed_bracket(engine_setup) -> None:
     )
     # No bracket cached.
 
-    payload = _pack_order_update(
-        client_order_id=entry_coid,
-        order_status=proto.ORDER_STATUS_FILLED,
+    asyncio.get_event_loop().run_until_complete(
+        engine._handle_broker_event(_fill_event(client_order_id=entry_coid))
     )
-    msg = DTCMessage(msg_type=proto.ORDER_UPDATE, body=payload, received_at=0.0)
-    asyncio.get_event_loop().run_until_complete(engine._handle_dtc_message(msg))
 
     assert fake.submitted == []
     assert fake.cancelled == []

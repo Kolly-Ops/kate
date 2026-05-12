@@ -20,6 +20,7 @@ from typing import Optional
 
 import pytest
 
+from tests.mocks.fake_broker_adapter import FakeBrokerAdapter
 from trading_bot.core.data import Candle
 from trading_bot.core.risk import RiskManager, RiskPolicy, TradeIntent
 from trading_bot.core.state import Reconciler, StateStore
@@ -45,16 +46,6 @@ class RecordingStrategy(Strategy):
     def on_candle_close(self, ctx: StrategyContext) -> Optional[TradeIntent]:
         self.calls.append(ctx.candle)
         return None
-
-
-class FakeDTCClient:
-    """Minimal stand-in — engine doesn't call DTC during these tests."""
-
-    async def submit_order(self, **kwargs) -> str:
-        return kwargs.get("client_order_id", "")
-
-    async def cancel_order(self, **kwargs) -> None:
-        return
 
 
 def _meta() -> InstrumentMeta:
@@ -87,9 +78,8 @@ def _build_engine(
         risk=RiskManager(RiskPolicy()),
         state=state,
         reconciler=Reconciler(),
-        dtc_client=FakeDTCClient(),                # type: ignore[arg-type]
+        broker=FakeBrokerAdapter(),
         trade_account="",
-        submit_trade_account="Sim1",
         no_trade_windows_utc=no_trade_windows_utc,
     )
     # Engine needs an account_state to invoke the strategy at all.

@@ -6,15 +6,24 @@ with broker-event handling and periodic reconciliation.
 
 Lifecycle:
     engine = ManagedFuturesEngine(...)
-    await engine.start()        # connect DTC, logon, seed state + history
+    await engine.start()        # connect adapter, logon, seed state + history
     await engine.run()           # main loop until stop()
     await engine.stop()
 
 Per CLAUDE.md and architecture doc, the engine is single-threaded asyncio.
 There is one engine per direction (A here, C later). It loops at
-`tick_interval_seconds`, draining DTC events and polling candles.
+`tick_interval_seconds`, draining BrokerEvents and polling candles.
 Strategy evaluation runs on candle close. Reconciliation runs every
 `reconciliation_interval_seconds`.
+
+Broker abstraction
+------------------
+Engine depends on the BrokerAdapter ABC, not any concrete broker. The
+adapter pumps normalized BrokerEvents into a local asyncio.Queue via a
+background task; the main loop drains the queue with a tight timeout
+(replaces the prior raw DTC `recv_event()` poll). This means swapping
+broker (DTC → Rithmic → IBKR → etc.) is a constructor change, not an
+engine rewrite.
 
 Drift handling: when the Reconciler reports drift between local StateStore
 and broker POSITION_UPDATE snapshots, the engine emits a callback (or logs)
@@ -24,6 +33,7 @@ gate per CLAUDE.md.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime as dt
 import logging
 from collections import deque
@@ -32,7 +42,15 @@ from typing import Callable, Optional
 
 from trading_bot.core.data import Candle, CandleManager
 from trading_bot.core.execution import dtc_protocol as proto
-from trading_bot.core.execution.dtc_client import DTCClient, DTCMessage
+from trading_bot.core.execution.broker_adapter import (
+    AccountBalanceEvent,
+    BrokerAdapter,
+    BrokerError,
+    BrokerEvent,
+    BrokerEventKind,
+    OrderEvent,
+    PositionEvent,
+)
 from trading_bot.core.risk import (
     AccountState,
     RiskManager,
@@ -54,14 +72,13 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class _BracketSpec:
     """Stop/target parameters cached when an entry order is submitted, used
-    when the entry's FILLED ORDER_UPDATE arrives to spawn the exit legs.
+    when the entry's FILLED event arrives to spawn the exit legs.
 
     `entry_side` is the entry-order side; close orders use the opposite.
-    `dtc_symbol` and `exchange` are needed because by the time the exit
-    legs are submitted we no longer have the original TradeIntent in scope.
+    `symbol` is the logical symbol — the adapter translates to broker form.
     """
     entry_coid: str
-    dtc_symbol: str
+    symbol: str              # logical (e.g. "MESM26"); adapter translates
     exchange: str
     entry_side: int          # 1=BUY, 2=SELL — exits flip this
     quantity: float
@@ -73,8 +90,8 @@ class _BracketSpec:
 class InstrumentMeta:
     """Per-instrument calibration. Sourced from config/instruments.json.
 
-    The three name fields capture distinct identifiers we encounter in the
-    real Sierra+DTC stack — they often differ:
+    `symbol`, `scid_filename`, and `dtc_symbol` capture distinct identifiers
+    that may differ in real Sierra+DTC installs:
 
       symbol         — logical/display name. Used for strategy ctx,
                        TradeIntent, StateStore, log lines. Stable, short.
@@ -82,14 +99,16 @@ class InstrumentMeta:
       scid_filename  — name of the .scid file Sierra writes ticks to,
                        WITHOUT the .scid extension. Used by CandleManager
                        to find the file. Example: "MESM26_FUT_CME".
-      dtc_symbol     — what Sierra accepts on the DTC wire as Symbol[64]
-                       in SUBMIT_NEW_SINGLE_ORDER and what it returns in
-                       POSITION_UPDATE. Example: "MESM26-CME".
+      dtc_symbol     — Sierra's wire form. Used by the supervisor when
+                       constructing a DTCBrokerAdapter's symbol_map.
+                       Engine no longer touches this directly — the
+                       broker adapter holds the logical→broker map.
+                       Example: "MESM26-CME".
 
     Phase A integration tests passed because the test fixtures used the
     same string for all three. In production they MUST be set
-    independently — the engine maps logical → scid for CandleManager
-    calls and logical → dtc for DTCClient calls.
+    independently — supervisor maps logical → scid for CandleManager
+    and logical → broker_symbol for the adapter via BrokerSymbolSpec.
     """
     symbol: str
     exchange: str
@@ -119,16 +138,14 @@ class ManagedFuturesEngine:
         risk: RiskManager,
         state: StateStore,
         reconciler: Reconciler,
-        dtc_client: DTCClient,
+        broker: BrokerAdapter,
         trade_account: str,
-        submit_trade_account: Optional[str] = None,
         no_trade_windows_utc: Optional[list[tuple[dt.time, dt.time]]] = None,
         client_name: str = "TRADING_BOT",
         trade_mode: int = proto.TRADE_MODE_DEMO,
         history_size: Optional[int] = None,
         tick_interval_seconds: float = 1.0,
         reconciliation_interval_seconds: float = 30.0,
-        seed_timeout_seconds: float = 1.0,
         on_drift: Optional[Callable[[ReconciliationReport], None]] = None,
         on_intent_rejected: Optional[Callable[[TradeIntent, RiskVerdict], None]] = None,
     ) -> None:
@@ -142,21 +159,8 @@ class ManagedFuturesEngine:
         self.risk = risk
         self.state = state
         self.reconciler = reconciler
-        self.dtc = dtc_client
+        self.broker = broker
         self.trade_account = trade_account
-        # Sierra DTC has split routing: SEED requests (msgs 305/300/601)
-        # work with empty TradeAccount because Sierra infers from the
-        # logon's account context. SUBMIT (msg 208) does NOT — Sierra
-        # validates TradeAccount up front and rejects with "Trade Account
-        # is empty" in Trade Simulation Mode (verified via Sierra's
-        # TradeActivityLog 2026-04-29). Default to `trade_account` so
-        # behaviour is unchanged when callers haven't opted in; pass an
-        # explicit sim-account string here once we know what Sierra is
-        # configured to accept.
-        self.submit_trade_account = (
-            submit_trade_account if submit_trade_account is not None
-            else trade_account
-        )
         # Volatility-blackout windows in UTC. The strategy is NOT invoked
         # for candle-closes whose timestamp falls in any window — no
         # signal generated, no risk-rejection log noise. Windows protect
@@ -172,7 +176,6 @@ class ManagedFuturesEngine:
         self.trade_mode = trade_mode
         self.tick_interval_seconds = tick_interval_seconds
         self.reconciliation_interval_seconds = reconciliation_interval_seconds
-        self.seed_timeout_seconds = seed_timeout_seconds
         self.on_drift = on_drift
         self.on_intent_rejected = on_intent_rejected
 
@@ -180,14 +183,7 @@ class ManagedFuturesEngine:
         self._history: dict[str, deque[Candle]] = {
             s: deque(maxlen=self._history_size) for s in symbols
         }
-        # Reverse lookup: dtc_symbol → logical symbol. Sierra reports
-        # POSITION_UPDATE in dtc_symbol form; we key broker_positions
-        # by logical symbol for clean reconciler compare against the
-        # local StateStore (which uses logical symbols).
-        self._dtc_to_logical: dict[str, str] = {
-            meta.dtc_symbol: logical for logical, meta in instruments.items()
-        }
-        # Latest broker-side position snapshot per (LOGICAL symbol, exchange).
+        # Latest broker-side position snapshot per (logical symbol, exchange).
         self._broker_positions: dict[tuple[str, str], RemotePosition] = {}
         # Latest broker-side order status per client_order_id
         self._broker_orders: dict[str, RemoteOrder] = {}
@@ -196,14 +192,23 @@ class ManagedFuturesEngine:
         self._starting_nlv: Optional[float] = None
         self._running = False
 
+        # ── Broker event plumbing ─────────────────────────────────────
+        # Background pump task consumes `broker.events()` and forwards
+        # each BrokerEvent onto this queue. Main loop drains the queue
+        # with a tight timeout (same shape as the prior raw-DTC drain).
+        self._event_queue: asyncio.Queue[BrokerEvent] = asyncio.Queue()
+        self._event_pump_task: Optional[asyncio.Task[None]] = None
+
         # ── Bracket-order tracking (synthetic OCO) ────────────────────
         # `_pending_brackets[entry_coid]` holds the stop/target params we'll
-        # submit once Sierra sends back ORDER_UPDATE status=FILLED for the
-        # entry. Submitting brackets only after entry-fill avoids the brief
-        # window where Sierra has the stop/target sitting in the book
-        # against a position that doesn't yet exist (some Sierra builds
-        # reject this; doing it sequentially is safer than relying on
-        # native bracket support whose wire format we haven't validated).
+        # submit once we see ORDER_FILLED for the entry. Submitting brackets
+        # only after entry-fill avoids the brief window where the broker has
+        # the stop/target sitting against a position that doesn't yet exist
+        # (some brokers reject this; doing it sequentially is safer than
+        # relying on native bracket support whose wire format varies).
+        # NOTE: brokers that DO support native brackets (Rithmic, IBKR)
+        # can short-circuit this by attaching stop_price/target_price on the
+        # entry submit. The DTC adapter ignores those and we use this flow.
         self._pending_brackets: dict[str, "_BracketSpec"] = {}
         # `_sibling_orders` maps each exit-leg coid to its sibling's coid.
         # When stop fills, cancel target. When target fills, cancel stop.
@@ -212,8 +217,8 @@ class ManagedFuturesEngine:
         self._sibling_orders: dict[str, str] = {}
 
         # Missing-data canary. If no candles arrive for a symbol within
-        # 60s of the engine running, log a single WARNING. Wiltshire 2026
-        # -05-06/07 ate 26 hours of silent heartbeats because the .scid
+        # 60s of the engine running, log a single WARNING. Wiltshire
+        # 2026-05-06/07 ate 26 hours of silent heartbeats because the .scid
         # filename convention differed between rigs and CandleManager
         # silently polled a file that didn't exist. The supervisor now
         # resolves the filename at startup, but this canary catches any
@@ -223,25 +228,25 @@ class ManagedFuturesEngine:
         self._missing_data_warned: dict[str, bool] = {s: False for s in symbols}
 
         # Sim-mode NLV fallback: log the fallback once per engine run.
-        # See _handle_account_balance_update for rationale.
+        # See _handle_account_balance_event for rationale.
         self._sim_nlv_fallback_logged: bool = False
 
     # ── Public lifecycle ──────────────────────────────────────────────────
     async def start(self) -> None:
-        """Warm candle history, then connect DTC + seed initial broker state.
+        """Warm candle history, then connect broker + seed initial state.
 
         Order matters: the scid backfill is synchronous file I/O that can
         block the asyncio event loop for tens of seconds on multi-GB
         history files (the KATE-derived scid_parser reads the last 1 GB
         of ticks on startup — ~50 s observed on Contabo Win VPS for
-        MESM26 on 2026-04-28). If DTC is connected before that load
-        finishes, Sierra disconnects us for unacknowledged heartbeats
-        and the seed phase never runs.
+        MESM26 on 2026-04-28). If the broker is connected before that
+        load finishes, Sierra disconnects us for unacknowledged
+        heartbeats and the seed phase never runs.
 
-        Warming candles BEFORE dtc.connect() means Sierra only sees us
-        once the loop is responsive. TODO: replace this load-everything
-        approach with a bounded warmup (only need ATR + breakout
-        lookback worth of candles, not 43k) — see
+        Warming candles BEFORE broker.connect() means the broker only
+        sees us once the loop is responsive. TODO: replace this
+        load-everything approach with a bounded warmup (only need ATR
+        + breakout lookback worth of candles, not 43k) — see
         `omni/proposals/2026-04-28-claude-kate-scid-warmup-bounded.md`.
         """
         for symbol in self.symbols:
@@ -254,10 +259,15 @@ class ManagedFuturesEngine:
             # the file position so subsequent polls see only new ticks).
             self.candle_manager.poll(meta.scid_filename)
 
-        await self.dtc.connect()
-        await self.dtc.logon(
+        await self.broker.connect()
+        # Spawn the background pump BEFORE logon: some adapters emit
+        # LOGON_OK on the event stream, and we want it captured.
+        self._event_pump_task = asyncio.create_task(
+            self._event_pump(), name="engine-event-pump"
+        )
+        await self.broker.logon(
             client_name=self.client_name,
-            trade_mode=self.trade_mode,
+            trade_account=self.trade_account,
         )
 
         await self._seed_broker_state()
@@ -273,7 +283,7 @@ class ManagedFuturesEngine:
         last_reconciliation = loop.time()
 
         while self._running:
-            await self._drain_dtc_events(timeout=0.001)
+            await self._drain_broker_events(timeout=0.001)
 
             for symbol in self.symbols:
                 await self._process_symbol(symbol)
@@ -287,7 +297,12 @@ class ManagedFuturesEngine:
 
     async def stop(self) -> None:
         self._running = False
-        await self.dtc.disconnect()
+        if self._event_pump_task is not None:
+            self._event_pump_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._event_pump_task
+            self._event_pump_task = None
+        await self.broker.disconnect()
 
     # ── State accessors (read-only for tests/observability) ───────────────
     @property
@@ -307,123 +322,170 @@ class ManagedFuturesEngine:
 
     # ── Initial state seeding ─────────────────────────────────────────────
     async def _seed_broker_state(self) -> None:
-        """Send the three snapshot requests and consume responses.
+        """Call the broker adapter's three seed methods and hydrate
+        engine state from the typed results. Each method returns
+        synchronously; failures raise BrokerError which propagates up
+        and prevents the engine from going active against unknown
+        broker state.
+        """
+        # Account state — REQUIRED. The adapter's contract is that this
+        # method either returns a valid AccountBalanceEvent or raises.
+        # We then apply the same sim-mode NLV fallback logic the engine
+        # has always had (see _hydrate_account_balance).
+        try:
+            balance = await self.broker.request_account_state(
+                trade_account=self.trade_account,
+            )
+            self._hydrate_account_balance(balance)
+        except BrokerError:
+            logger.exception(
+                "engine: broker.request_account_state failed; engine cannot "
+                "start without account state seed"
+            )
+            raise
 
-        Does NOT block forever — uses a bounded drain. If the broker
-        doesn't reply within the timeout, we proceed with whatever we
-        have (the reconciler will catch the gap on its next pass)."""
-        # Per COO Gemini's 2026-04-27 wire-capture diff: Sierra wants the
-        # TradeAccount field EMPTY in seed requests (it filters server-side
-        # based on the logon's account context). Sending "E8933" caused the
-        # initial connect to receive zero balance/positions responses — the
-        # account-name mismatch was a silent drop. Use empty here; the
-        # configured self.trade_account still flows through SUBMIT orders.
-        self.dtc._writer.write(   # noqa: SLF001 — direct send is fine here
-            proto.pack_account_balance_request(request_id=1, trade_account="")
-        )
-        self.dtc._writer.write(   # noqa: SLF001
-            proto.pack_current_positions_request(request_id=2, trade_account="")
-        )
-        self.dtc._writer.write(   # noqa: SLF001
-            proto.pack_open_orders_request(request_id=3, trade_account="")
-        )
-        await self.dtc._writer.drain()   # noqa: SLF001
+        # Positions — seed broker_positions snapshot from whatever the
+        # broker reports. Empty tuple means flat.
+        try:
+            positions = await self.broker.request_positions(
+                trade_account=self.trade_account,
+            )
+        except BrokerError:
+            logger.exception(
+                "engine: broker.request_positions failed; proceeding with "
+                "empty broker_positions (reconciler will catch any gap)"
+            )
+            positions = ()
+        for pos in positions:
+            meta = self.instruments.get(pos.symbol)
+            exchange = meta.exchange if meta is not None else ""
+            self._broker_positions[(pos.symbol, exchange)] = RemotePosition(
+                symbol=pos.symbol, exchange=exchange, quantity=pos.quantity,
+            )
 
-        # Drain responses up to the configured seed timeout. If the broker
-        # doesn't reply within the window we proceed anyway — the
-        # reconciler will catch any state gaps on its next pass.
-        await self._drain_dtc_events(timeout=self.seed_timeout_seconds)
+        # Open orders — seed broker_orders snapshot. Returned OrderEvents
+        # are by definition WORKING (otherwise they wouldn't be in the
+        # broker's open-order list).
+        try:
+            open_orders = await self.broker.request_open_orders(
+                trade_account=self.trade_account,
+            )
+        except BrokerError:
+            logger.exception(
+                "engine: broker.request_open_orders failed; proceeding with "
+                "empty broker_orders (reconciler will catch any gap)"
+            )
+            open_orders = ()
+        for order in open_orders:
+            self._broker_orders[order.client_order_id] = RemoteOrder(
+                client_order_id=order.client_order_id, status="WORKING",
+            )
 
-    # ── Event handling ────────────────────────────────────────────────────
-    async def _drain_dtc_events(self, *, timeout: float) -> int:
-        """Pull and dispatch all messages currently queued. Returns count."""
+    # ── Broker-event consumption ──────────────────────────────────────────
+    async def _event_pump(self) -> None:
+        """Background task: consume broker.events() onto the local queue.
+
+        Runs from start() until stop() cancels it. The adapter's events()
+        iterator terminates on disconnect; if it raises, we log and exit
+        — main loop's _drain will just see no events thereafter (and
+        the reconciler will surface any state staleness).
+        """
+        try:
+            async for event in self.broker.events():
+                await self._event_queue.put(event)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception(
+                "engine: broker event-pump exited unexpectedly; engine will "
+                "stop receiving broker events until restart"
+            )
+
+    async def _drain_broker_events(self, *, timeout: float) -> int:
+        """Pull and dispatch all queued BrokerEvents. Returns count."""
         count = 0
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         while True:
             remaining = deadline - loop.time()
             if remaining <= 0:
-                # Always at least try a non-blocking peek
                 remaining = 0.0001
             try:
-                msg = await asyncio.wait_for(
-                    self.dtc.recv_event(), timeout=remaining
+                event = await asyncio.wait_for(
+                    self._event_queue.get(), timeout=remaining
                 )
             except asyncio.TimeoutError:
                 return count
-            await self._handle_dtc_message(msg)
+            await self._handle_broker_event(event)
             count += 1
 
-    async def _handle_dtc_message(self, msg: DTCMessage) -> None:
-        # Always log inbound traffic at INFO so paper-live logs are
-        # diagnosable without flipping log levels mid-session.
-        logger.info(
-            "DTC inbound: msg_type=%d size=%d",
-            msg.msg_type, len(msg.body),
-        )
+    async def _handle_broker_event(self, event: BrokerEvent) -> None:
+        """Dispatch a normalized broker event to the right handler."""
         try:
-            if msg.msg_type == proto.ORDER_UPDATE:
-                await self._handle_order_update(proto.unpack_order_update(msg.body))
-            elif msg.msg_type == proto.POSITION_UPDATE:
-                self._handle_position_update(proto.unpack_position_update(msg.body))
-            elif msg.msg_type == proto.ACCOUNT_BALANCE_UPDATE:
-                self._handle_account_balance_update(
-                    proto.unpack_account_balance_update(msg.body)
+            if event.kind in (
+                BrokerEventKind.ORDER_FILLED,
+                BrokerEventKind.ORDER_PARTIAL_FILL,
+                BrokerEventKind.ORDER_REJECTED,
+                BrokerEventKind.ORDER_CANCELED,
+                BrokerEventKind.ORDER_ACK,
+            ):
+                if event.order is not None:
+                    await self._handle_order_event(event.kind, event.order)
+            elif event.kind == BrokerEventKind.POSITION_UPDATE:
+                if event.position is not None:
+                    self._handle_position_event(event.position)
+            elif event.kind == BrokerEventKind.ACCOUNT_BALANCE_UPDATE:
+                if event.balance is not None:
+                    self._handle_account_balance_event(event.balance)
+            elif event.kind in (
+                BrokerEventKind.CONNECTED,
+                BrokerEventKind.LOGON_OK,
+                BrokerEventKind.HEARTBEAT,
+                BrokerEventKind.MARKET_DATA_TICK,
+                BrokerEventKind.DISCONNECTED,
+                BrokerEventKind.ERROR,
+            ):
+                # Lifecycle/info events — logged at adapter level, not
+                # acted on by engine logic. (DISCONNECTED could trigger
+                # supervisor logic in future; for now main loop will
+                # naturally observe missing events.)
+                logger.info(
+                    "engine: broker event %s (no engine action)", event.kind.value,
                 )
-            elif msg.msg_type == proto.HEARTBEAT:
-                pass   # background heartbeat task handles outbound
             else:
-                logger.warning("engine: unhandled msg_type %d", msg.msg_type)
+                logger.warning("engine: unhandled broker event kind %r", event.kind)
         except Exception:
-            logger.exception("engine: failed to handle msg_type %d", msg.msg_type)
+            logger.exception("engine: failed to handle broker event %r", event.kind)
 
-    async def _handle_order_update(self, msg: proto.OrderUpdate) -> None:
-        # Sierra sends a sentinel ORDER_UPDATE with NoOrders=1 when
-        # responding to OPEN_ORDERS_REQUEST on a flat account. This is
-        # NOT a real order update — skip it so the empty client_order_id
-        # doesn't poison broker_orders and create false reconciliation
-        # drift against the empty local state.
-        if msg.no_orders:
-            logger.info(
-                "engine: ORDER_UPDATE no-orders sentinel (broker reports "
-                "no open orders) — broker_orders cleared"
-            )
-            self._broker_orders.clear()
-            return
-        store_status = proto.dtc_order_status_to_state_store(msg.order_status)
-        # Visibility: log every real ORDER_UPDATE so we can diagnose the
-        # submit→fill round-trip from the Kate log alone. Without this,
-        # silent fills/rejects/cancels look identical to "Sierra never
-        # responded" — see 2026-04-29 paper-validation drift incident.
+    async def _handle_order_event(
+        self, kind: BrokerEventKind, order: OrderEvent,
+    ) -> None:
+        # Map BrokerEventKind back to StateStore status string.
+        store_status = _broker_event_kind_to_state_store_status(kind)
         logger.info(
-            "engine: ORDER_UPDATE coid=%s status=%d→%s reason=%d "
-            "filled=%g remaining=%g avg_fill=%g info=%r",
-            msg.client_order_id, msg.order_status, store_status,
-            msg.order_update_reason,
-            msg.filled_quantity, msg.remaining_quantity,
-            msg.average_fill_price, msg.info_text,
+            "engine: order event coid=%s kind=%s store_status=%s "
+            "fill_price=%s fill_qty=%s rejected=%s",
+            order.client_order_id, kind.value, store_status,
+            order.fill_price, order.fill_quantity, order.rejected_reason,
         )
-        # Always update our remote-orders snapshot
-        self._broker_orders[msg.client_order_id] = RemoteOrder(
-            client_order_id=msg.client_order_id, status=store_status,
+        # Update remote-orders snapshot
+        self._broker_orders[order.client_order_id] = RemoteOrder(
+            client_order_id=order.client_order_id, status=store_status,
         )
-        # Update StateStore — but only if this client_order_id is one we
-        # submitted (record_order ran before submit). Updates to unknown
-        # IDs are dropped silently — those are echoes from concurrent
-        # external order activity.
-        existing = self.state.get_order(client_order_id=msg.client_order_id)
+        # Update StateStore — only if this coid is one we submitted.
+        existing = self.state.get_order(client_order_id=order.client_order_id)
         if existing is None:
             logger.info(
-                "engine: ORDER_UPDATE for unknown coid=%s — not in local "
+                "engine: order event for unknown coid=%s — not in local "
                 "StateStore, broker_orders updated only",
-                msg.client_order_id,
+                order.client_order_id,
             )
             return
-        rejected_reason = msg.info_text if store_status == "REJECTED" else None
-        fill_price = msg.average_fill_price if store_status == "FILLED" else None
-        fill_qty = msg.filled_quantity if store_status == "FILLED" else None
+        rejected_reason = order.rejected_reason if store_status == "REJECTED" else None
+        fill_price = order.fill_price if store_status == "FILLED" else None
+        fill_qty = order.fill_quantity if store_status == "FILLED" else None
         self.state.update_order_status(
-            client_order_id=msg.client_order_id,
+            client_order_id=order.client_order_id,
             status=store_status,
             fill_price=fill_price,
             fill_quantity=fill_qty,
@@ -432,63 +494,66 @@ class ManagedFuturesEngine:
 
         # ── Bracket-order side effects on FILL ────────────────────────
         if store_status == "FILLED":
-            # 1. If this is an ENTRY for which we cached a bracket spec,
-            #    submit the stop + target legs now.
-            bracket = self._pending_brackets.pop(msg.client_order_id, None)
+            # 1. ENTRY for which we cached a bracket spec → submit exits
+            bracket = self._pending_brackets.pop(order.client_order_id, None)
             if bracket is not None:
                 await self._submit_exit_brackets(bracket)
-            # 2. If this is an EXIT leg, cancel its sibling so the
-            #    position closes via exactly one of the two legs.
-            sibling = self._sibling_orders.pop(msg.client_order_id, None)
+            # 2. EXIT leg → cancel sibling
+            sibling = self._sibling_orders.pop(order.client_order_id, None)
             if sibling is not None:
-                # Symmetric removal: the sibling no longer needs to know
-                # about us either.
                 self._sibling_orders.pop(sibling, None)
                 await self._cancel_sibling_after_fill(
-                    filled_coid=msg.client_order_id, sibling_coid=sibling,
+                    filled_coid=order.client_order_id, sibling_coid=sibling,
                 )
 
-    def _handle_position_update(self, msg: proto.PositionUpdate) -> None:
-        if msg.no_positions:
-            self._broker_positions.clear()
-            return
-        # Sierra reports POSITION_UPDATE.symbol in dtc_symbol form
-        # (e.g. "MESM26-CME"). Map to logical for reconciler key consistency.
-        logical = self._dtc_to_logical.get(msg.symbol)
-        if logical is None:
+    def _handle_position_event(self, position: PositionEvent) -> None:
+        meta = self.instruments.get(position.symbol)
+        if meta is None:
             logger.debug(
-                "engine: POSITION_UPDATE for unmanaged dtc_symbol %r — ignored",
-                msg.symbol,
+                "engine: POSITION_UPDATE for unmanaged symbol %r — ignored",
+                position.symbol,
             )
             return
-        key = (logical, msg.exchange)
-        if msg.quantity == 0:
+        key = (position.symbol, meta.exchange)
+        if position.quantity == 0:
             self._broker_positions.pop(key, None)
         else:
             self._broker_positions[key] = RemotePosition(
-                symbol=logical, exchange=msg.exchange, quantity=msg.quantity,
+                symbol=position.symbol, exchange=meta.exchange,
+                quantity=position.quantity,
             )
 
-    def _handle_account_balance_update(
-        self, msg: proto.AccountBalanceUpdate
-    ) -> None:
-        # Sierra Chart sim mode does NOT report synthetic NLV via DTC
-        # (confirmed by SC support 2026-05-09: "Simulation accounts do
-        # not show in the Trade Account Manager. That window only shows
-        # information for live accounts."). When sim mode reports
-        # NLV<=0, we fall back to the risk policy's configured
-        # starting_nlv so the risk gates have a meaningful denominator.
-        # In live mode we trust the broker's NLV unconditionally — a
-        # zero there is a real signal, not an artefact of sim mode.
-        raw_nlv = msg.net_liquidation_value
+    def _handle_account_balance_event(self, balance: AccountBalanceEvent) -> None:
+        """Apply sim-mode NLV fallback then update local AccountState.
+
+        Sierra Chart sim mode does NOT report synthetic NLV via DTC
+        (confirmed by SC support 2026-05-09: "Simulation accounts do
+        not show in the Trade Account Manager. That window only shows
+        information for live accounts."). When sim mode reports
+        NLV<=0, we fall back to the risk policy's configured
+        starting_nlv so the risk gates have a meaningful denominator.
+        In live mode we trust the broker's NLV unconditionally — a
+        zero there is a real signal, not an artefact of sim mode.
+
+        Note: the adapter ABC carries no sim/live flag on the event —
+        we infer from `self.trade_mode`. Other adapters (Rithmic, IBKR)
+        don't have the Sim1 NLV-blindness issue but the fallback
+        gracefully degrades there too (they wouldn't report NLV<=0
+        unless the account is actually broken).
+        """
+        self._hydrate_account_balance(balance)
+
+    def _hydrate_account_balance(self, balance: AccountBalanceEvent) -> None:
+        raw_nlv = balance.nlv
         if self.trade_mode == proto.TRADE_MODE_DEMO and raw_nlv <= 0:
             nlv = self.risk.policy.starting_nlv
             if not self._sim_nlv_fallback_logged:
                 logger.warning(
-                    "engine: sim mode reports NLV=$%.2f via DTC (Sierra Chart "
-                    "by-design — sim accounts have no DTC-exposed balance); "
-                    "falling back to risk_policy.starting_nlv=$%.2f for risk "
-                    "gates. Drawdown tracking is approximate in sim mode.",
+                    "engine: sim mode reports NLV=$%.2f via broker (Sierra "
+                    "Chart by-design — sim accounts have no DTC-exposed "
+                    "balance); falling back to risk_policy.starting_nlv="
+                    "$%.2f for risk gates. Drawdown tracking is approximate "
+                    "in sim mode.",
                     raw_nlv, self.risk.policy.starting_nlv,
                 )
                 self._sim_nlv_fallback_logged = True
@@ -499,7 +564,7 @@ class ManagedFuturesEngine:
         self._account_state = AccountState(
             nlv=nlv,
             starting_nlv=self._starting_nlv,
-            open_positions_margin=msg.margin_requirement,
+            open_positions_margin=balance.margin_requirement,
             open_position_count=len(self._broker_positions),
         )
         self.state.record_account_snapshot(
@@ -589,28 +654,26 @@ class ManagedFuturesEngine:
         # mid-flight the reconciler can detect the orphan record.
         self.state.record_order(
             client_order_id=intent.intent_id,
-            symbol=intent.symbol,           # logical — for state
+            symbol=intent.symbol,
             exchange=intent.exchange,
             side=intent.side,
             quantity=intent.quantity,
             order_type=intent.order_type,
         )
-        meta = self.instruments[intent.symbol]
         try:
-            await self.dtc.submit_order(
-                symbol=meta.dtc_symbol,     # dtc_symbol on the wire
-                exchange=intent.exchange,
-                trade_account=self.submit_trade_account,
+            await self.broker.submit_order(
                 client_order_id=intent.intent_id,
+                symbol=intent.symbol,        # logical — adapter translates
+                exchange=intent.exchange,
                 side=intent.side,
                 quantity=intent.quantity,
                 order_type=intent.order_type,
-                price1=intent.price,
+                price=intent.price,
                 free_form_text=intent.strategy_name[:48],
             )
             logger.info(
-                "submitted order %s for %s (dtc_symbol=%s)",
-                intent.intent_id, intent.symbol, meta.dtc_symbol,
+                "submitted order %s for %s",
+                intent.intent_id, intent.symbol,
             )
         except Exception:
             # Mark the order REJECTED locally so the active-orders set is
@@ -623,13 +686,13 @@ class ManagedFuturesEngine:
             raise
 
         # Cache bracket params keyed by entry coid. Submitted only after
-        # the entry's FILLED ORDER_UPDATE arrives (see _handle_order_update).
+        # the entry's FILLED event arrives (see _handle_order_event).
         # Risk policy already gates this — entries without stop_loss are
         # rejected before reaching here when require_stop_loss=True.
         if intent.stop_loss is not None:
             self._pending_brackets[intent.intent_id] = _BracketSpec(
                 entry_coid=intent.intent_id,
-                dtc_symbol=meta.dtc_symbol,
+                symbol=intent.symbol,
                 exchange=intent.exchange,
                 entry_side=intent.side,
                 quantity=intent.quantity,
@@ -640,7 +703,7 @@ class ManagedFuturesEngine:
     async def _submit_exit_brackets(self, bracket: _BracketSpec) -> None:
         """Submit stop and (optional) take-profit close orders after the
         entry fills. The two legs are mutually-cancelling: when one fills
-        we cancel the other via _handle_order_update's sibling logic.
+        we cancel the other via _handle_order_event's sibling logic.
 
         ID convention: <entry_coid>-S for stop, <entry_coid>-T for target.
         Both fit DTC's 32-byte ClientOrderID since entries are ≤30 chars."""
@@ -657,26 +720,21 @@ class ManagedFuturesEngine:
             self._sibling_orders[target_coid] = stop_coid
 
         # 1) STOP leg — close at adverse price
-        # Logical symbol for StateStore; engine doesn't care about
-        # bracket-vs-entry distinction at the SQLite level.
-        # We look up logical from dtc_symbol via the reverse map.
-        logical = self._dtc_to_logical.get(bracket.dtc_symbol, bracket.dtc_symbol)
         self.state.record_order(
             client_order_id=stop_coid,
-            symbol=logical, exchange=bracket.exchange,
+            symbol=bracket.symbol, exchange=bracket.exchange,
             side=close_side, quantity=bracket.quantity,
             order_type=proto.ORDER_TYPE_STOP,
         )
         try:
-            await self.dtc.submit_order(
-                symbol=bracket.dtc_symbol,
-                exchange=bracket.exchange,
-                trade_account=self.submit_trade_account,
+            await self.broker.submit_order(
                 client_order_id=stop_coid,
+                symbol=bracket.symbol,
+                exchange=bracket.exchange,
                 side=close_side,
                 quantity=bracket.quantity,
                 order_type=proto.ORDER_TYPE_STOP,
-                price1=bracket.stop_loss,
+                price=bracket.stop_loss,
                 free_form_text=f"stop:{bracket.entry_coid[:40]}"[:48],
             )
             logger.info(
@@ -697,20 +755,19 @@ class ManagedFuturesEngine:
         if target_coid is not None:
             self.state.record_order(
                 client_order_id=target_coid,
-                symbol=logical, exchange=bracket.exchange,
+                symbol=bracket.symbol, exchange=bracket.exchange,
                 side=close_side, quantity=bracket.quantity,
                 order_type=proto.ORDER_TYPE_LIMIT,
             )
             try:
-                await self.dtc.submit_order(
-                    symbol=bracket.dtc_symbol,
-                    exchange=bracket.exchange,
-                    trade_account=self.submit_trade_account,
+                await self.broker.submit_order(
                     client_order_id=target_coid,
+                    symbol=bracket.symbol,
+                    exchange=bracket.exchange,
                     side=close_side,
                     quantity=bracket.quantity,
                     order_type=proto.ORDER_TYPE_LIMIT,
-                    price1=bracket.take_profit,
+                    price=bracket.take_profit,
                     free_form_text=f"target:{bracket.entry_coid[:38]}"[:48],
                 )
                 logger.info(
@@ -727,15 +784,12 @@ class ManagedFuturesEngine:
     async def _cancel_sibling_after_fill(
         self, *, filled_coid: str, sibling_coid: str,
     ) -> None:
-        """Issue a CANCEL_ORDER for the sibling exit leg after one side
-        fills. Sierra responds with an ORDER_UPDATE status=CANCELED for
-        the sibling, which `_handle_order_update` writes through to
-        StateStore via the normal flow."""
+        """Issue a cancel for the sibling exit leg after one side fills.
+        Broker responds with an ORDER_CANCELED event for the sibling,
+        which `_handle_order_event` writes through to StateStore via the
+        normal flow."""
         try:
-            await self.dtc.cancel_order(
-                client_order_id=sibling_coid,
-                trade_account=self.submit_trade_account,
-            )
+            await self.broker.cancel_order(client_order_id=sibling_coid)
             logger.info(
                 "engine: cancelled sibling %s after %s filled",
                 sibling_coid, filled_coid,
@@ -796,7 +850,23 @@ class ManagedFuturesEngine:
         return report
 
 
-import contextlib
+# ── Helpers ───────────────────────────────────────────────────────────────
+
+def _broker_event_kind_to_state_store_status(kind: BrokerEventKind) -> str:
+    """Map normalized BrokerEventKind back to the StateStore status string
+    convention. ORDER_ACK collapses to WORKING (the order is live on the
+    broker side); fills/rejects/cancels map directly."""
+    if kind == BrokerEventKind.ORDER_FILLED:
+        return "FILLED"
+    if kind == BrokerEventKind.ORDER_PARTIAL_FILL:
+        return "WORKING"
+    if kind == BrokerEventKind.ORDER_REJECTED:
+        return "REJECTED"
+    if kind == BrokerEventKind.ORDER_CANCELED:
+        return "CANCELLED"
+    # ORDER_ACK or anything else
+    return "WORKING"
+
 
 @contextlib.contextmanager
 def _suppress_callback_errors():
