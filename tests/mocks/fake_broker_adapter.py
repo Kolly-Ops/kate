@@ -70,6 +70,7 @@ class FakeBrokerAdapter(BrokerAdapter):
         # Submit/cancel call recordings — tests assert against these
         self.submitted: list[dict] = []
         self.cancelled: list[dict] = []
+        self.subscriptions: list[dict] = []
 
         # Lifecycle flags
         self.connected: bool = False
@@ -157,6 +158,17 @@ class FakeBrokerAdapter(BrokerAdapter):
         self.cancelled.append({
             "client_order_id": client_order_id,
             "server_order_id": server_order_id,
+        })
+
+    async def subscribe_market_data(
+        self,
+        *,
+        symbol: str,
+        exchange: str = "",
+    ) -> None:
+        self.subscriptions.append({
+            "symbol": symbol,
+            "exchange": exchange,
         })
 
     async def request_account_state(

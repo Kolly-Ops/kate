@@ -41,6 +41,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from trading_bot.core.data import Candle, CandleManager
+from trading_bot.core.data.tick_candle_aggregator import TickCandleAggregator
 from trading_bot.core.execution import dtc_protocol as proto
 from trading_bot.core.execution.broker_adapter import (
     AccountBalanceEvent,
@@ -48,6 +49,7 @@ from trading_bot.core.execution.broker_adapter import (
     BrokerError,
     BrokerEvent,
     BrokerEventKind,
+    MarketDataTick,
     OrderEvent,
     PositionEvent,
 )
@@ -143,6 +145,8 @@ class ManagedFuturesEngine:
         no_trade_windows_utc: Optional[list[tuple[dt.time, dt.time]]] = None,
         client_name: str = "TRADING_BOT",
         trade_mode: int = proto.TRADE_MODE_DEMO,
+        use_broker_market_data: bool = False,
+        use_native_brackets: bool = False,
         history_size: Optional[int] = None,
         tick_interval_seconds: float = 1.0,
         reconciliation_interval_seconds: float = 30.0,
@@ -174,6 +178,8 @@ class ManagedFuturesEngine:
         )
         self.client_name = client_name
         self.trade_mode = trade_mode
+        self.use_broker_market_data = use_broker_market_data
+        self.use_native_brackets = use_native_brackets
         self.tick_interval_seconds = tick_interval_seconds
         self.reconciliation_interval_seconds = reconciliation_interval_seconds
         self.on_drift = on_drift
@@ -183,6 +189,10 @@ class ManagedFuturesEngine:
         self._history: dict[str, deque[Candle]] = {
             s: deque(maxlen=self._history_size) for s in symbols
         }
+        timeframe_minutes = getattr(candle_manager, "timeframe_minutes", 1)
+        self._tick_aggregator = TickCandleAggregator(
+            timeframe_minutes=timeframe_minutes
+        )
         # Latest broker-side position snapshot per (logical symbol, exchange).
         self._broker_positions: dict[tuple[str, str], RemotePosition] = {}
         # Latest broker-side order status per client_order_id
@@ -249,17 +259,24 @@ class ManagedFuturesEngine:
         + breakout lookback worth of candles, not 43k) — see
         `omni/proposals/2026-04-28-claude-kate-scid-warmup-bounded.md`.
         """
-        for symbol in self.symbols:
-            meta = self.instruments[symbol]
-            backfill = self.candle_manager.backfill(
-                meta.scid_filename, max_candles=self._history_size
-            )
-            self._history[symbol].extend(backfill)
-            # Initialize tail baseline (first poll returns [] but baselines
-            # the file position so subsequent polls see only new ticks).
-            self.candle_manager.poll(meta.scid_filename)
+        if not self.use_broker_market_data:
+            for symbol in self.symbols:
+                meta = self.instruments[symbol]
+                backfill = self.candle_manager.backfill(
+                    meta.scid_filename, max_candles=self._history_size
+                )
+                self._history[symbol].extend(backfill)
+                # Initialize tail baseline (first poll returns [] but baselines
+                # the file position so subsequent polls see only new ticks).
+                self.candle_manager.poll(meta.scid_filename)
 
         await self.broker.connect()
+        if self.use_broker_market_data:
+            for symbol in self.symbols:
+                meta = self.instruments[symbol]
+                await self.broker.subscribe_market_data(
+                    symbol=symbol, exchange=meta.exchange,
+                )
         # Spawn the background pump BEFORE logon: some adapters emit
         # LOGON_OK on the event stream, and we want it captured.
         self._event_pump_task = asyncio.create_task(
@@ -437,11 +454,13 @@ class ManagedFuturesEngine:
             elif event.kind == BrokerEventKind.ACCOUNT_BALANCE_UPDATE:
                 if event.balance is not None:
                     self._handle_account_balance_event(event.balance)
+            elif event.kind == BrokerEventKind.MARKET_DATA_TICK:
+                if event.tick is not None:
+                    await self._handle_market_data_tick(event.tick)
             elif event.kind in (
                 BrokerEventKind.CONNECTED,
                 BrokerEventKind.LOGON_OK,
                 BrokerEventKind.HEARTBEAT,
-                BrokerEventKind.MARKET_DATA_TICK,
                 BrokerEventKind.DISCONNECTED,
                 BrokerEventKind.ERROR,
             ):
@@ -572,7 +591,26 @@ class ManagedFuturesEngine:
         )
 
     # ── Per-tick processing ───────────────────────────────────────────────
+    async def _handle_market_data_tick(self, tick: MarketDataTick) -> None:
+        if tick.symbol not in self._history:
+            logger.debug(
+                "engine: MARKET_DATA_TICK for unmanaged symbol %r ignored",
+                tick.symbol,
+            )
+            return
+        closed = self._tick_aggregator.ingest_tick(
+            symbol=tick.symbol,
+            timestamp=tick.timestamp,
+            price=tick.last_price,
+            size=tick.last_size,
+        )
+        for candle in closed:
+            self._history[tick.symbol].append(candle)
+            await self._on_candle_close(tick.symbol, candle)
+
     async def _process_symbol(self, symbol: str) -> None:
+        if self.use_broker_market_data:
+            return
         meta = self.instruments[symbol]
         closed = self.candle_manager.poll(meta.scid_filename)
         for candle in closed:
@@ -669,6 +707,8 @@ class ManagedFuturesEngine:
                 quantity=intent.quantity,
                 order_type=intent.order_type,
                 price=intent.price,
+                stop_price=intent.stop_loss if self.use_native_brackets else None,
+                target_price=intent.take_profit if self.use_native_brackets else None,
                 free_form_text=intent.strategy_name[:48],
             )
             logger.info(
@@ -689,7 +729,7 @@ class ManagedFuturesEngine:
         # the entry's FILLED event arrives (see _handle_order_event).
         # Risk policy already gates this — entries without stop_loss are
         # rejected before reaching here when require_stop_loss=True.
-        if intent.stop_loss is not None:
+        if intent.stop_loss is not None and not self.use_native_brackets:
             self._pending_brackets[intent.intent_id] = _BracketSpec(
                 entry_coid=intent.intent_id,
                 symbol=intent.symbol,

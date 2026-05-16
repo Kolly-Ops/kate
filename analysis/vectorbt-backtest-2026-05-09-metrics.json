@@ -1,0 +1,142 @@
+{
+  "data_start": "2025-06-16T13:00:00",
+  "data_end": "2026-05-07T22:00:00",
+  "bars": 4369,
+  "source_files": [
+    "MESH26-CME.scid",
+    "MESM26-CME.scid"
+  ],
+  "vectorbt_version": "1.0.0",
+  "vectorbt_import_error": null,
+  "params": {
+    "breakout_lookback": 20,
+    "ma_period": 50,
+    "atr_period": 14,
+    "atr_stop_mult": 1.1,
+    "atr_target_mult": 3.0,
+    "initial_nlv": 1080.0,
+    "risk_per_trade": 0.025,
+    "nlv_floor": 300.0,
+    "tick_size": 0.25,
+    "tick_value_gbp": 1.0,
+    "contracts": 1
+  },
+  "initial_nlv": 1080.0,
+  "ending_equity": 958.8928571428587,
+  "total_return_pct": -11.213624338624195,
+  "annualized_return_pct": -12.503848103796933,
+  "sharpe_ratio": -1.7887754030811265,
+  "max_drawdown_gbp": -174.03571428571377,
+  "max_drawdown_pct": -15.361578715087266,
+  "trade_count": 9,
+  "win_rate_pct": 11.11111111111111,
+  "avg_win_gbp": 52.92857142857247,
+  "avg_loss_gbp": -21.75446428571422,
+  "expectancy_gbp": -13.456349206349033,
+  "trades_per_day": 0.027692307692307693,
+  "trades_per_month": 0.8428846153846155,
+  "largest_losing_streak": 8,
+  "target_exits": 1,
+  "stop_exits": 8,
+  "trades": [
+    {
+      "entry_time": "2025-09-15T12:00:00",
+      "exit_time": "2025-09-15T14:00:00",
+      "entry_price": 6723.0,
+      "exit_price": 6736.232142857143,
+      "stop_loss": 6718.148214285714,
+      "take_profit": 6736.232142857143,
+      "pnl_gbp": 52.92857142857247,
+      "exit_reason": "target",
+      "bars_held": 2
+    },
+    {
+      "entry_time": "2025-09-15T14:00:00",
+      "exit_time": "2025-09-15T15:00:00",
+      "entry_price": 6738.0,
+      "exit_price": 6732.578571428571,
+      "stop_loss": 6732.578571428571,
+      "take_profit": 6752.785714285715,
+      "pnl_gbp": -21.68571428571522,
+      "exit_reason": "stop",
+      "bars_held": 1
+    },
+    {
+      "entry_time": "2025-09-16T04:00:00",
+      "exit_time": "2025-09-16T13:00:00",
+      "entry_price": 6742.25,
+      "exit_price": 6735.964285714285,
+      "stop_loss": 6735.964285714285,
+      "take_profit": 6759.392857142857,
+      "pnl_gbp": -25.142857142858702,
+      "exit_reason": "stop",
+      "bars_held": 8
+    },
+    {
+      "entry_time": "2025-10-02T11:00:00",
+      "exit_time": "2025-10-02T13:00:00",
+      "entry_price": 6836.5,
+      "exit_price": 6830.135714285714,
+      "stop_loss": 6830.135714285714,
+      "take_profit": 6853.857142857143,
+      "pnl_gbp": -25.45714285714348,
+      "exit_reason": "stop",
+      "bars_held": 2
+    },
+    {
+      "entry_time": "2025-10-03T09:00:00",
+      "exit_time": "2025-10-03T10:00:00",
+      "entry_price": 6845.5,
+      "exit_price": 6840.117857142857,
+      "stop_loss": 6840.117857142857,
+      "take_profit": 6860.178571428572,
+      "pnl_gbp": -21.528571428571013,
+      "exit_reason": "stop",
+      "bars_held": 1
+    },
+    {
+      "entry_time": "2025-10-07T12:00:00",
+      "exit_time": "2025-10-07T14:00:00",
+      "entry_price": 6856.5,
+      "exit_price": 6851.4517857142855,
+      "stop_loss": 6851.4517857142855,
+      "take_profit": 6870.267857142857,
+      "pnl_gbp": -20.192857142857974,
+      "exit_reason": "stop",
+      "bars_held": 2
+    },
+    {
+      "entry_time": "2025-12-22T13:00:00",
+      "exit_time": "2025-12-22T14:00:00",
+      "entry_price": 6969.75,
+      "exit_price": 6965.035714285715,
+      "stop_loss": 6965.035714285715,
+      "take_profit": 6982.607142857143,
+      "pnl_gbp": -18.857142857141298,
+      "exit_reason": "stop",
+      "bars_held": 1
+    },
+    {
+      "entry_time": "2025-12-22T14:00:00",
+      "exit_time": "2025-12-22T15:00:00",
+      "entry_price": 6974.75,
+      "exit_price": 6969.348214285715,
+      "stop_loss": 6969.348214285715,
+      "take_profit": 6989.482142857143,
+      "pnl_gbp": -21.607142857141298,
+      "exit_reason": "stop",
+      "bars_held": 1
+    },
+    {
+      "entry_time": "2026-01-07T14:00:00",
+      "exit_time": "2026-01-07T15:00:00",
+      "entry_price": 7045.0,
+      "exit_price": 7040.108928571429,
+      "stop_loss": 7040.108928571429,
+      "take_profit": 7058.339285714285,
+      "pnl_gbp": -19.56428571428478,
+      "exit_reason": "stop",
+      "bars_held": 1
+    }
+  ]
+}

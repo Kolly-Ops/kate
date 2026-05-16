@@ -10,6 +10,13 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
+rithmic = [
+    "async-rithmic==1.5.10",
+    "pytz>=2024.1",
+]
+mt5 = [
+    "MetaTrader5>=5.0.45",
+]
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",

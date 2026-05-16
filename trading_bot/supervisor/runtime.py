@@ -68,4 +68,14 @@ KNOWN_INSTRUMENTS: dict[str, InstrumentRuntime] = {
         per_contract_margin=100.0,    # placeholder
         round_trip_commission=0.0,    # sim default; live rate TBD
     ),
+    "GBPUSD": InstrumentRuntime(
+        strategy_symbol="GBPUSD",
+        dtc_symbol="GBPUSD",
+        exchange="ICMarketsSC-Demo",
+        scid_basename="GBPUSD",
+        tick_size=0.00001,
+        tick_value=1.0,
+        per_contract_margin=0.0,
+        round_trip_commission=0.0,
+    ),
 }

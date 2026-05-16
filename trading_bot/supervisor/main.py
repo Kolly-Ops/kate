@@ -25,19 +25,22 @@ from __future__ import annotations
 import argparse
 import asyncio
 import datetime as dt
+import json
 import logging
+import os
 import signal
 import sys
 from pathlib import Path
 
 from trading_bot.core.data import CandleManager
-from trading_bot.core.execution import dtc_protocol as proto
+from trading_bot.core.execution import MT5BrokerAdapter, MT5Config, dtc_protocol as proto
 from trading_bot.core.execution.broker_adapter import BrokerSymbolSpec
 from trading_bot.core.execution.dtc_broker_adapter import DTCBrokerAdapter
 from trading_bot.core.risk import RiskManager, RiskPolicy
 from trading_bot.core.state import Reconciler, StateStore
 from trading_bot.core.strategy import (
     AtrBreakoutStrategy,
+    FXLondonBreakoutStrategy,
     ORBStrategy,
     SessionWindow,
 )
@@ -72,11 +75,19 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     # engine is broker-agnostic; this flag picks which adapter the
     # supervisor constructs.
     p.add_argument(
-        "--broker", choices=["dtc"], default="dtc",
-        help="Broker adapter selector. Only 'dtc' is wired today; "
-             "rithmic / ibkr come online as their adapters graduate "
-             "from unit-green to runtime-green.",
+        "--broker", choices=["dtc", "mt5"], default="dtc",
+        help="Broker adapter selector.",
     )
+    p.add_argument("--mt5-login", type=int, default=None,
+                   help="MT5 account login. Defaults to MT5_LOGIN env or secrets file.")
+    p.add_argument("--mt5-password", default=None,
+                   help="MT5 password. Defaults to MT5_PASSWORD env or secrets file.")
+    p.add_argument("--mt5-server", default=None,
+                   help="MT5 server. Defaults to MT5_SERVER env or secrets file.")
+    p.add_argument("--mt5-path", default=None,
+                   help="MT5 terminal64.exe path. Defaults to MT5_PATH env or secrets file.")
+    p.add_argument("--mt5-secrets-path", default=None,
+                   help="optional secrets.json path containing mt5_ic_markets.demos[0]")
     p.add_argument("--dtc-host", default="127.0.0.1")
     p.add_argument("--dtc-port", type=int, default=11099)
     # Default empty: Sierra Trade Simulation Mode rejects orders that
@@ -148,10 +159,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--tick-interval", type=float, default=1.0)
     p.add_argument("--reconciliation-interval", type=float, default=30.0)
     p.add_argument("--seed-timeout", type=float, default=2.0)
-    p.add_argument("--strategy", choices=["orb", "breakout"], default="orb",
+    p.add_argument("--strategy", choices=["orb", "breakout", "fx-london-breakout"], default="orb",
                    help="signal strategy: orb=multi-session Opening Range Breakout "
                         "(validated 2026-05-09, default); breakout=legacy ATR breakout "
-                        "(retained for rollback / regression testing only).")
+                        "(retained for rollback / regression testing only); "
+                        "fx-london-breakout=GBPUSD MT5 Front 4 strategy.")
     p.add_argument("--breakout-lookback", type=int, default=20,
                    help="legacy AtrBreakoutStrategy: prior-N-bar high lookback")
     p.add_argument("--ma-period", type=int, default=50,
@@ -179,6 +191,14 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                    help="ORB: minimum opening-range width (filters chop)")
     p.add_argument("--orb-max-range-points", type=float, default=25.0,
                    help="ORB: maximum opening-range width (filters vol blowouts)")
+    p.add_argument("--fx-quantity", type=float, default=0.01,
+                   help="FX London breakout order size in lots")
+    p.add_argument("--fx-reward-risk", type=float, default=2.0,
+                   help="FX London breakout reward:risk")
+    p.add_argument("--fx-min-range-pips", type=float, default=5.0,
+                   help="FX London breakout minimum Asian range")
+    p.add_argument("--fx-max-range-pips", type=float, default=120.0,
+                   help="FX London breakout maximum Asian range")
     p.add_argument("--log-file", default=None,
                    help="optional log file path (in addition to stderr)")
     p.add_argument("--log-level", default="INFO",
@@ -264,10 +284,83 @@ def _build_broker_adapter(*, args, instruments):
             submit_trade_account=submit_account,
             seed_timeout=args.seed_timeout,
         )
+    if args.broker == "mt5":
+        symbol_map = {
+            inst.symbol: BrokerSymbolSpec(
+                logical_symbol=inst.symbol,
+                broker_symbol=inst.dtc_symbol,
+                exchange=inst.exchange,
+                tick_size=inst.tick_size,
+            )
+            for inst in instruments.values()
+        }
+        return MT5BrokerAdapter(
+            config=_build_mt5_config(args),
+            symbol_map=symbol_map,
+        )
     raise SystemExit(f"unsupported --broker value: {args.broker!r}")
 
 
-def _build_instruments(symbols: list[str], scid_dir: Path) -> dict[str, InstrumentMeta]:
+def _build_mt5_config(args) -> MT5Config:  # type: ignore[no-untyped-def]
+    base = MT5Config.from_env()
+    secret_values = _load_mt5_secret_values(args.mt5_secrets_path)
+    default_path = r"C:\Program Files\MetaTrader 5 IC Markets Global\terminal64.exe"
+    return MT5Config(
+        login=args.mt5_login if args.mt5_login is not None else int(
+            secret_values.get("login") or base.login
+        ),
+        password=args.mt5_password if args.mt5_password is not None else str(
+            secret_values.get("password") or base.password
+        ),
+        server=args.mt5_server if args.mt5_server is not None else str(
+            secret_values.get("server") or base.server
+        ),
+        path=args.mt5_path if args.mt5_path is not None else str(
+            secret_values.get("path") or base.path or default_path
+        ),
+        timeout_ms=base.timeout_ms,
+        portable=base.portable,
+        magic=base.magic,
+        deviation=base.deviation,
+        comment=base.comment,
+        poll_interval_seconds=base.poll_interval_seconds,
+    )
+
+
+def _load_mt5_secret_values(secrets_path: str | None) -> dict[str, object]:
+    candidates: list[Path] = []
+    if secrets_path:
+        candidates.append(Path(secrets_path))
+    env_path = os.getenv("MT5_SECRETS_PATH")
+    if env_path:
+        candidates.append(Path(env_path))
+    candidates.append(Path(r"C:\models\omni\.mcp-brain\config\secrets.json"))
+
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            mt5 = data.get("mt5_ic_markets", {})
+            demo = mt5.get("demos", [{}])[0]
+            return {
+                "login": demo.get("login") or demo.get("account"),
+                "password": demo.get("password"),
+                "server": demo.get("server") or mt5.get("server_demo"),
+                "path": demo.get("path") or mt5.get("path"),
+            }
+        except Exception:
+            LOGGER.warning("supervisor: could not read MT5 secrets from %s", path)
+    return {}
+
+
+def _build_instruments(
+    symbols: list[str],
+    scid_dir: Path | None = None,
+    *,
+    broker: str = "dtc",
+    require_scid: bool = True,
+) -> dict[str, InstrumentMeta]:
     out: dict[str, InstrumentMeta] = {}
     for s in symbols:
         if s not in KNOWN_INSTRUMENTS:
@@ -276,10 +369,15 @@ def _build_instruments(symbols: list[str], scid_dir: Path) -> dict[str, Instrume
                 f"(known: {sorted(KNOWN_INSTRUMENTS)})"
             )
         rt = KNOWN_INSTRUMENTS[s]
+        scid_filename = (
+            _resolve_scid_basename(scid_dir, rt)
+            if broker == "dtc" and require_scid and scid_dir is not None
+            else rt.scid_basename
+        )
         out[s] = InstrumentMeta(
             symbol=rt.strategy_symbol,
             exchange=rt.exchange,
-            scid_filename=_resolve_scid_basename(scid_dir, rt),
+            scid_filename=scid_filename,
             dtc_symbol=rt.dtc_symbol,
             tick_size=rt.tick_size,
             tick_value=rt.tick_value,
@@ -494,9 +592,23 @@ async def _run(args: argparse.Namespace) -> int:
 
     state = StateStore(db_path).open()
     try:
-        instruments = _build_instruments(args.symbols, scid_dir)
+        instruments = _build_instruments(
+            args.symbols,
+            scid_dir,
+            broker=args.broker,
+            require_scid=not args.dry_run,
+        )
         candle_mgr = CandleManager(scid_dir=scid_dir, timeframe_minutes=args.timeframe_minutes)
-        if args.strategy == "orb":
+        if args.strategy == "fx-london-breakout":
+            strategy = FXLondonBreakoutStrategy(
+                quantity=args.fx_quantity,
+                reward_risk=args.fx_reward_risk,
+                atr_period=args.atr_period,
+                atr_stop_multiplier=args.atr_stop_mult,
+                min_range_pips=args.fx_min_range_pips,
+                max_range_pips=args.fx_max_range_pips,
+            )
+        elif args.strategy == "orb":
             # Multi-session Opening Range Breakout. Sessions are hardcoded
             # to the validated Asian + US configuration from the 2026-05-09
             # master plan. Future tuning (e.g. session-time overrides)
@@ -557,6 +669,8 @@ async def _run(args: argparse.Namespace) -> int:
             no_trade_windows_utc=no_trade_windows,
             client_name=args.client_name,
             trade_mode=TRADE_MODE_LOOKUP[args.trade_mode],
+            use_broker_market_data=args.broker == "mt5",
+            use_native_brackets=args.broker == "mt5",
             tick_interval_seconds=args.tick_interval,
             reconciliation_interval_seconds=args.reconciliation_interval,
             on_drift=_on_drift,
@@ -580,23 +694,27 @@ async def _run(args: argparse.Namespace) -> int:
         # with a clear error if Sierra's TradeActivityLog filename suffix
         # doesn't match the required account+mode — prevents Kate from
         # silently dropping submissions for hours like cycles 2-3 did.
-        LOGGER.info(
+        if args.broker == "dtc":
+            LOGGER.info(
             "supervisor: validating Sierra TradeActivityLog suffix "
             "(required '%s', dir %s)",
             args.require_trade_activity_suffix, args.trade_activity_logs_dir,
-        )
-        _validate_sierra_trade_activity_suffix(
+            )
+            _validate_sierra_trade_activity_suffix(
             logs_dir=Path(args.trade_activity_logs_dir),
             required_suffix=args.require_trade_activity_suffix,
             allow_missing=args.allow_no_trade_activity_log,
-        )
+            )
 
         # Pre-flight TCP probe before the full DTC handshake. Fails fast
         # with a clear error if the host:port isn't reachable, instead of
         # the asyncio traceback wall the engine produces on a bad connect.
-        LOGGER.info("supervisor: probing DTC reachability at %s:%d", args.dtc_host, args.dtc_port)
-        await _verify_dtc_reachable(args.dtc_host, args.dtc_port)
-        LOGGER.info("supervisor: DTC port reachable — proceeding with logon")
+        if args.broker == "dtc":
+            LOGGER.info("supervisor: probing DTC reachability at %s:%d", args.dtc_host, args.dtc_port)
+            await _verify_dtc_reachable(args.dtc_host, args.dtc_port)
+            LOGGER.info("supervisor: DTC port reachable — proceeding with logon")
+        else:
+            LOGGER.info("supervisor: MT5 selected; skipping Sierra DTC preflights")
 
         stop_event = asyncio.Event()
 
