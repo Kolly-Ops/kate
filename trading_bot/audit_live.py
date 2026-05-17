@@ -437,17 +437,29 @@ class SecretsFileFreshnessCheck(LiveCheck):
                 status=LiveCheckStatus.FAIL,
                 message="secrets.json parsed empty",
             )
-        # Minimum keys required for any operational use.
-        if "telegram" not in data:
+        # Per Codex APPROVED-WITH-CONCERNS 2026-05-16 #P1.2: require
+        # telegram.bot_token + telegram.chat_id non-empty — this monitor's
+        # alert path depends on Telegram, so a present-but-empty telegram
+        # section is functionally as broken as a missing one.
+        tg = data.get("telegram") or {}
+        if not isinstance(tg, dict):
             return LiveCheckResult(
                 name=self.name,
                 status=LiveCheckStatus.FAIL,
-                message="secrets.json missing 'telegram' section",
+                message="secrets.json 'telegram' section is not an object",
+            )
+        missing = [k for k in ("bot_token", "chat_id") if not tg.get(k)]
+        if missing:
+            return LiveCheckResult(
+                name=self.name,
+                status=LiveCheckStatus.FAIL,
+                message=f"secrets.json telegram section missing/empty: {missing}",
+                details={"missing": missing},
             )
         return LiveCheckResult(
             name=self.name,
             status=LiveCheckStatus.PASS,
-            message=f"secrets.json present with {len(data)} sections",
+            message=f"secrets.json present with {len(data)} sections; telegram alert path ready",
         )
 
 
@@ -503,6 +515,15 @@ def _format_recovery(result: LiveCheckResult, prior_status: LiveCheckStatus) -> 
     )
 
 
+class UnknownCheckError(ValueError):
+    """Raised when --check filter names a check that doesn't exist.
+
+    Per Codex APPROVED-WITH-CONCERNS 2026-05-16 #P1.1: silent zero-checks-ran
+    on typo is dangerous for a service monitor — a misconfigured deploy
+    would look healthy while doing nothing.
+    """
+
+
 async def run_loop(
     *,
     interval_seconds: int = DEFAULT_INTERVAL_SECONDS,
@@ -511,6 +532,15 @@ async def run_loop(
     one_shot: bool = False,
 ) -> int:
     """Run the audit live loop. Returns final exit code."""
+    known_check_names = {cls().name for cls in ALL_CHECKS}
+    if only:
+        unknown = [n for n in only if n not in known_check_names]
+        if unknown:
+            raise UnknownCheckError(
+                f"unknown check name(s): {unknown}. "
+                f"Valid: {sorted(known_check_names)}"
+            )
+
     state = AuditLiveState()
     checks = [cls() for cls in ALL_CHECKS]
     if only:
@@ -587,6 +617,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             alerts_enabled=not args.no_alerts,
             one_shot=args.once,
         ))
+    except UnknownCheckError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 3
     except KeyboardInterrupt:
         print("\nstopped by operator")
         return 0

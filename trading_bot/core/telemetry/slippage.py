@@ -53,6 +53,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import statistics
 import threading
 import time
@@ -110,14 +111,19 @@ def _pip_units(side: str, signal_price: float, fill_price: float, pip_size: floa
     Convention: POSITIVE slippage = bad for the trader.
     - BUY: paid more than signal → positive slippage
     - SELL: received less than signal → positive slippage
+
+    Defense-in-depth: rejects invalid pip_size up front rather than
+    silently returning 0.0 (Codex AWC P1, 2026-05-16).
     """
+    if pip_size <= 0:
+        raise ValueError(f"pip_size must be > 0; got {pip_size}")
     if side.upper() == "BUY":
         delta = fill_price - signal_price
     elif side.upper() == "SELL":
         delta = signal_price - fill_price
     else:
         raise ValueError(f"unknown side: {side!r} (expected BUY or SELL)")
-    return delta, delta / pip_size if pip_size > 0 else 0.0
+    return delta, delta / pip_size
 
 
 class SlippageRecorder:
@@ -136,8 +142,20 @@ class SlippageRecorder:
         pip_size: float = 0.0001,
         max_pending: int = 100,
     ) -> None:
+        # Per Codex APPROVED-WITH-CONCERNS 2026-05-16:
+        # P1 - invalid pip_size silently returning 0.0 = false confidence
+        # P2 - max_pending <= 0 breaks eviction logic
+        # P2 - front_id used in filename; sanitize against path escape
         if not front_id:
             raise ValueError("front_id is required")
+        if not re.match(r"^[A-Za-z0-9_.-]+$", front_id):
+            raise ValueError(
+                f"front_id must match [A-Za-z0-9_.-]+; got {front_id!r}"
+            )
+        if pip_size <= 0:
+            raise ValueError(f"pip_size must be > 0; got {pip_size}")
+        if max_pending < 1:
+            raise ValueError(f"max_pending must be >= 1; got {max_pending}")
         self.front_id = front_id
         self.log_root = Path(log_root)
         self.pip_size = pip_size

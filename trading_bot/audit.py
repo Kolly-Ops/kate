@@ -46,16 +46,30 @@ NT_BRIDGE_DIR = OMNI_ROOT / "projects" / "kate" / "ninjatrader_bridge"
 
 # Paths whose edits trigger the audit protocol's review requirement.
 # Glob patterns (relative to OMNI_ROOT or KATE_ROOT depending on root).
+# Per Codex HARD-OBJECTION 2026-05-16 #P1.1: list was too narrow — future
+# changes to audit infra / telemetry / supervisor / strategy / risk / state
+# could avoid the review-records check entirely. Broadened to include all
+# load-bearing categories.
 TRIGGERED_ARTIFACT_PATHS = [
-    # Kate-side (paths relative to KATE_ROOT)
-    "trading_bot/core/execution/*_broker_adapter.py",
-    "trading_bot/core/execution/ninja_*.py",
+    # Kate-side (paths relative to KATE_ROOT) — load-bearing engineering
+    "trading_bot/audit.py",
+    "trading_bot/audit_live.py",
+    "trading_bot/core/execution/*.py",
     "trading_bot/core/alerts/*.py",
-    # Omni-side (paths relative to OMNI_ROOT)
+    "trading_bot/core/telemetry/*.py",
+    "trading_bot/core/risk/*.py",
+    "trading_bot/core/state/*.py",
+    "trading_bot/core/strategy/*.py",
+    "trading_bot/supervisor/*.py",
+    "trading_bot/engines/*.py",
+    # Omni-side (paths relative to OMNI_ROOT) — governance + cross-cutting
     "omni_cli/validate_fronts.py",
+    "omni_cli/logger.py",
     "protocol/*.md",
+    "decisions/*.md",
     "projects/kate/ninjatrader_bridge/*.cs",
     "projects/kate/ninjatrader_bridge/*.md",
+    "projects/kate/ninjatrader_bridge/*.py",
     ".mcp-brain/config/secrets-registry.md",
 ]
 
@@ -567,12 +581,17 @@ class ReviewRecordsCheck(Check):
                         triggered.add(rel)
 
         # Collect review records — scan recent handoffs/ for REVIEW-RESPONSE-* with
-        # APPROVED or APPROVED-WITH-CONCERNS outcome
+        # APPROVED or APPROVED-WITH-CONCERNS outcome.
+        # Per Codex HARD-OBJECTION 2026-05-16 #P1.2: read explicit UTF-8 (was
+        # using platform default, which crashes on cp1252 Windows hosts).
+        # Per Codex HARD-OBJECTION #P2.4: also parse `relates_to:` as a
+        # compatibility layer for review responses that listed artifacts there
+        # before the protocol pinned `artifact_paths:`.
         reviewed: dict[str, str] = {}  # artifact_path → latest outcome
         if HANDOFFS_DIR.exists():
             for handoff in HANDOFFS_DIR.glob("*-REVIEW-RESPONSE-*.md"):
                 try:
-                    text = handoff.read_text()
+                    text = handoff.read_text(encoding="utf-8", errors="replace")
                 except Exception:
                     continue
                 # Parse outcome from frontmatter
@@ -582,16 +601,17 @@ class ReviewRecordsCheck(Check):
                 outcome = outcome_match.group(1)
                 if outcome not in ("APPROVED", "APPROVED-WITH-CONCERNS"):
                     continue
-                # Parse artifact_paths from frontmatter (YAML list)
-                paths_section = re.search(
-                    r"artifact_paths:\s*\n((?:\s*-\s*\S+\n)+)", text
-                )
-                if not paths_section:
-                    continue
-                for line in paths_section.group(1).splitlines():
-                    m = re.match(r"\s*-\s*(\S+)", line)
-                    if m:
-                        reviewed[m.group(1).strip()] = outcome
+                # Parse artifact_paths (preferred) and relates_to (compat).
+                for key in ("artifact_paths", "relates_to", "artifacts"):
+                    section = re.search(
+                        rf"{key}:\s*\n((?:\s*-\s*\S+\n)+)", text
+                    )
+                    if not section:
+                        continue
+                    for line in section.group(1).splitlines():
+                        m = re.match(r"\s*-\s*(\S+)", line)
+                        if m:
+                            reviewed[m.group(1).strip()] = outcome
 
         # Now: which triggered artifacts have NO review record?
         unreviewed: list[str] = []
@@ -651,22 +671,40 @@ class ReviewInboxCheck(Check):
                 message=f"handoffs/ not found at {HANDOFFS_DIR}",
             )
 
-        # REVIEW-REQUEST handoffs addressed to `self.agent`
-        pattern = f"*-to-{self.agent}-REVIEW-REQUEST-*.md"
-        requests = list(HANDOFFS_DIR.glob(pattern))
+        # Per Codex HARD-OBJECTION 2026-05-16 #P1.3: filename-pattern alone
+        # misses team-addressed requests (`claude-to-team-REVIEW-REQUEST-*`).
+        # Scan ALL REVIEW-REQUEST handoffs + parse frontmatter `to:` for the
+        # actual recipient list — match agent against direct address, "team",
+        # or comma-separated lists like "codex, gemini".
+        all_requests = list(HANDOFFS_DIR.glob("*-REVIEW-REQUEST-*.md"))
+        agent_lower = self.agent.lower()
 
         unanswered: list[dict] = []
-        for req in requests:
+        for req in all_requests:
+            try:
+                text = req.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+
+            # Parse frontmatter `to:` to determine recipients
+            to_match = re.search(r"^to:\s*(.+)$", text, re.MULTILINE)
+            if not to_match:
+                continue
+            to_value = to_match.group(1).lower()
+            # Recipient match: agent named directly, "team", or comma-separated
+            # list containing the agent
+            recipients = re.split(r"[,\s\(\)]+", to_value)
+            if not (agent_lower in recipients or "team" in recipients):
+                continue
+
             slug_match = re.search(r"REVIEW-REQUEST-(.+)\.md$", req.name)
             if not slug_match:
                 continue
             slug = slug_match.group(1)
-            # Look for matching REVIEW-RESPONSE-{slug}.md from this agent
+            # Look for any REVIEW-RESPONSE for this slug FROM this agent
             response_pattern = f"*-{self.agent}-to-*-REVIEW-RESPONSE-{slug}.md"
             responses = list(HANDOFFS_DIR.glob(response_pattern))
             if not responses:
-                # Try parsing frontmatter for review_due
-                text = req.read_text()
                 due_match = re.search(r"review_due:\s*(\S+)", text)
                 due = due_match.group(1) if due_match else "no review_due declared"
                 unanswered.append({

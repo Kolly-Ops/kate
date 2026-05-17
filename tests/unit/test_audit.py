@@ -340,6 +340,64 @@ def test_review_records_passes_when_artifact_has_approved_review(tmp_path, monke
     assert result.status == CheckStatus.PASS, result.details
 
 
+def test_review_records_accepts_relates_to_as_compat(tmp_path, monkeypatch):
+    """Per Codex HARD-OBJECTION #P2.4: review responses that listed
+    artifacts under `relates_to:` (before the protocol pinned
+    `artifact_paths:`) should still count as having a review."""
+    from trading_bot import audit as audit_mod
+    fake_omni = tmp_path / "omni"
+    fake_kate = tmp_path / "kate"
+    fake_omni.mkdir()
+    fake_kate.mkdir()
+    handoffs = fake_omni / "handoffs"
+    handoffs.mkdir()
+
+    (fake_kate / "trading_bot" / "core" / "execution").mkdir(parents=True)
+    artifact = fake_kate / "trading_bot" / "core" / "execution" / "legacy_broker_adapter.py"
+    artifact.write_text("# triggered")
+
+    review = handoffs / "2026-05-15-codex-to-claude-REVIEW-RESPONSE-legacy.md"
+    review.write_text(
+        "---\n"
+        "review_outcome: APPROVED-WITH-CONCERNS\n"
+        "relates_to:\n"
+        "  - trading_bot/core/execution/legacy_broker_adapter.py\n"
+        "---\n"
+        "approved-with-concerns.\n"
+    )
+
+    monkeypatch.setattr(audit_mod, "OMNI_ROOT", fake_omni)
+    monkeypatch.setattr(audit_mod, "KATE_ROOT", fake_kate)
+    monkeypatch.setattr(audit_mod, "HANDOFFS_DIR", handoffs)
+
+    result = ReviewRecordsCheck().run()
+    assert result.status == CheckStatus.PASS, result.details
+
+
+def test_triggered_artifact_paths_includes_audit_modules():
+    """Per Codex HARD-OBJECTION #P1.1: the audit gate must include itself
+    + audit_live, telemetry, supervisor, strategy, risk, state in the
+    trigger list. Verify each load-bearing category is present."""
+    from trading_bot import audit as audit_mod
+    triggers = audit_mod.TRIGGERED_ARTIFACT_PATHS
+    expected_substrings = [
+        "audit.py",
+        "audit_live.py",
+        "telemetry",
+        "supervisor",
+        "strategy",
+        "risk",
+        "state",
+        "decisions/",
+        "logger.py",
+    ]
+    for needle in expected_substrings:
+        assert any(needle in t for t in triggers), (
+            f"trigger list missing category containing {needle!r}; "
+            f"current list: {triggers}"
+        )
+
+
 # ── ReviewInboxCheck ─────────────────────────────────────────────────────
 
 
@@ -358,10 +416,61 @@ def test_review_inbox_warns_on_unanswered_request(tmp_path, monkeypatch):
     handoffs = tmp_path / "handoffs"
     handoffs.mkdir()
     (handoffs / "2026-05-16-codex-to-claude-REVIEW-REQUEST-test-thing.md").write_text(
-        "---\nreview_due: 2026-05-16T13:00:00+01:00\n---\nplease review.\n"
+        "---\nfrom: codex\nto: claude\nreview_due: 2026-05-16T13:00:00+01:00\n---\nplease review.\n"
     )
     monkeypatch.setattr(audit_mod, "HANDOFFS_DIR", handoffs)
 
+    result = ReviewInboxCheck(agent="claude").run()
+    assert result.status == CheckStatus.WARN
+    assert len(result.details["unanswered"]) == 1
+
+
+def test_review_inbox_warns_on_team_addressed_request(tmp_path, monkeypatch):
+    """Per Codex HARD-OBJECTION #P1.3: filename-only routing misses
+    team-addressed requests. New `to:` parser must catch them."""
+    from trading_bot import audit as audit_mod
+    handoffs = tmp_path / "handoffs"
+    handoffs.mkdir()
+    (handoffs / "2026-05-16-claude-to-team-REVIEW-REQUEST-something.md").write_text(
+        "---\nfrom: claude\nto: codex, gemini\nreview_due: 2026-05-17T12:00:00+01:00\n---\nplease review.\n"
+    )
+    monkeypatch.setattr(audit_mod, "HANDOFFS_DIR", handoffs)
+
+    result = ReviewInboxCheck(agent="codex").run()
+    assert result.status == CheckStatus.WARN, result.details
+    assert len(result.details["unanswered"]) == 1
+
+
+def test_review_inbox_warns_on_team_keyword_recipient(tmp_path, monkeypatch):
+    """`to: team` should match any agent in the team."""
+    from trading_bot import audit as audit_mod
+    handoffs = tmp_path / "handoffs"
+    handoffs.mkdir()
+    (handoffs / "2026-05-16-claude-to-team-REVIEW-REQUEST-thing.md").write_text(
+        "---\nfrom: claude\nto: team (codex, gemini)\nreview_due: 2026-05-17T12:00:00+01:00\n---\n"
+    )
+    monkeypatch.setattr(audit_mod, "HANDOFFS_DIR", handoffs)
+
+    for agent in ("codex", "gemini"):
+        result = ReviewInboxCheck(agent=agent).run()
+        assert result.status == CheckStatus.WARN, f"{agent}: {result.details}"
+
+
+def test_review_inbox_handles_utf8_handoff(tmp_path, monkeypatch):
+    """Per Codex HARD-OBJECTION #P1.2: handoffs contain UTF-8 (£ symbol,
+    arrows, etc); read with explicit encoding to avoid Windows cp1252 crash."""
+    from trading_bot import audit as audit_mod
+    handoffs = tmp_path / "handoffs"
+    handoffs.mkdir()
+    # Write with explicit UTF-8 + non-ASCII characters that crash cp1252
+    (handoffs / "2026-05-16-codex-to-claude-REVIEW-REQUEST-utf8.md").write_text(
+        "---\nfrom: codex\nto: claude\nreview_due: 2026-05-17T12:00:00+01:00\n---\n"
+        "Review the £500 aggregate-DD cap → uses ↑ ↓ arrows + £ pound + ✅ emoji.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(audit_mod, "HANDOFFS_DIR", handoffs)
+
+    # Should not raise UnicodeDecodeError
     result = ReviewInboxCheck(agent="claude").run()
     assert result.status == CheckStatus.WARN
     assert len(result.details["unanswered"]) == 1
@@ -372,7 +481,7 @@ def test_review_inbox_passes_when_request_has_matching_response(tmp_path, monkey
     handoffs = tmp_path / "handoffs"
     handoffs.mkdir()
     (handoffs / "2026-05-16-codex-to-claude-REVIEW-REQUEST-test-thing.md").write_text(
-        "---\nreview_due: 2026-05-16T13:00:00+01:00\n---\nplease review.\n"
+        "---\nfrom: codex\nto: claude\nreview_due: 2026-05-16T13:00:00+01:00\n---\nplease review.\n"
     )
     (handoffs / "2026-05-16-claude-to-codex-REVIEW-RESPONSE-test-thing.md").write_text(
         "---\nreview_outcome: APPROVED\n---\napproved.\n"

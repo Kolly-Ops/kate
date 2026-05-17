@@ -59,6 +59,49 @@ def test_pip_units_handles_case_insensitive_side():
     assert pips_lower == pips_upper
 
 
+def test_pip_units_rejects_zero_pip_size():
+    """Per Codex AWC #P1: invalid pip_size silently returning 0.0 slippage
+    would let a bad config make every trade look like zero erosion."""
+    with pytest.raises(ValueError, match="pip_size must be > 0"):
+        _pip_units("BUY", 1.0, 1.0001, 0.0)
+
+
+def test_pip_units_rejects_negative_pip_size():
+    with pytest.raises(ValueError, match="pip_size must be > 0"):
+        _pip_units("BUY", 1.0, 1.0001, -0.0001)
+
+
+def test_recorder_rejects_invalid_pip_size(tmp_path):
+    with pytest.raises(ValueError, match="pip_size must be > 0"):
+        SlippageRecorder(front_id="front_4", log_root=tmp_path, pip_size=0.0)
+    with pytest.raises(ValueError, match="pip_size must be > 0"):
+        SlippageRecorder(front_id="front_4", log_root=tmp_path, pip_size=-1.0)
+
+
+def test_recorder_rejects_invalid_max_pending(tmp_path):
+    with pytest.raises(ValueError, match="max_pending must be >= 1"):
+        SlippageRecorder(front_id="front_4", log_root=tmp_path, max_pending=0)
+    with pytest.raises(ValueError, match="max_pending must be >= 1"):
+        SlippageRecorder(front_id="front_4", log_root=tmp_path, max_pending=-5)
+
+
+def test_recorder_rejects_front_id_with_unsafe_chars(tmp_path):
+    """Per Codex AWC #P2.4: front_id used directly in filename — guard
+    against escaping the intended naming convention."""
+    with pytest.raises(ValueError, match="front_id must match"):
+        SlippageRecorder(front_id="../etc/passwd", log_root=tmp_path)
+    with pytest.raises(ValueError, match="front_id must match"):
+        SlippageRecorder(front_id="front 4 with space", log_root=tmp_path)
+    with pytest.raises(ValueError, match="front_id must match"):
+        SlippageRecorder(front_id="front/4", log_root=tmp_path)
+
+
+def test_recorder_accepts_safe_front_ids(tmp_path):
+    """Allowed pattern: alphanumeric, underscores, dots, hyphens."""
+    for fid in ("front_4", "front-5", "front_5.v2", "FRONT_1", "f1"):
+        SlippageRecorder(front_id=fid, log_root=tmp_path)  # no exception
+
+
 # ── SlippageRecorder basic flow ──────────────────────────────────────────
 
 

@@ -278,12 +278,66 @@ def test_secrets_present_fails_when_no_telegram_section(tmp_path, monkeypatch):
     assert "telegram" in result.message
 
 
+def test_secrets_present_fails_when_telegram_keys_empty(tmp_path, monkeypatch):
+    """Per Codex AWC #P1.2: present-but-empty Telegram fields are
+    functionally as broken as missing — alert path won't work."""
+    s = tmp_path / "s.json"
+    s.write_text(json.dumps({"telegram": {"bot_token": "", "chat_id": ""}}))
+    monkeypatch.setattr(audit_live_mod, "SECRETS_PATH", s)
+    result = SecretsFileFreshnessCheck().run()
+    assert result.status == LiveCheckStatus.FAIL
+    assert "missing/empty" in result.message
+
+
+def test_secrets_present_fails_when_only_bot_token_present(tmp_path, monkeypatch):
+    s = tmp_path / "s.json"
+    s.write_text(json.dumps({"telegram": {"bot_token": "abc"}}))  # missing chat_id
+    monkeypatch.setattr(audit_live_mod, "SECRETS_PATH", s)
+    result = SecretsFileFreshnessCheck().run()
+    assert result.status == LiveCheckStatus.FAIL
+    assert "chat_id" in str(result.details.get("missing", []))
+
+
+def test_secrets_present_fails_when_telegram_is_not_dict(tmp_path, monkeypatch):
+    s = tmp_path / "s.json"
+    s.write_text(json.dumps({"telegram": "just-a-string"}))
+    monkeypatch.setattr(audit_live_mod, "SECRETS_PATH", s)
+    result = SecretsFileFreshnessCheck().run()
+    assert result.status == LiveCheckStatus.FAIL
+
+
 def test_secrets_present_passes_when_well_formed(tmp_path, monkeypatch):
     s = tmp_path / "s.json"
     s.write_text(json.dumps({"telegram": {"bot_token": "x", "chat_id": "y"}}))
     monkeypatch.setattr(audit_live_mod, "SECRETS_PATH", s)
     result = SecretsFileFreshnessCheck().run()
     assert result.status == LiveCheckStatus.PASS
+
+
+def test_run_loop_raises_on_unknown_check_name():
+    """Per Codex AWC #P1.1: typo in --check filter must NOT silently
+    exit 0 — that's how a misconfigured Windows service looks healthy
+    while doing nothing."""
+    from trading_bot.audit_live import UnknownCheckError
+
+    with pytest.raises(UnknownCheckError, match="unknown check name"):
+        asyncio.run(run_loop(
+            interval_seconds=60,
+            only=["definitely_not_a_check"],
+            alerts_enabled=False,
+            one_shot=True,
+        ))
+
+
+def test_run_loop_accepts_known_check_name():
+    rc = asyncio.run(run_loop(
+        interval_seconds=60,
+        only=["secrets_file_present"],
+        alerts_enabled=False,
+        one_shot=True,
+    ))
+    # Will FAIL or PASS depending on local secrets state; just shouldn't raise.
+    assert rc in (0, 2)
 
 
 # ── Alert formatting ─────────────────────────────────────────────────────
