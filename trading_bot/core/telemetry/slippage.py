@@ -1,5 +1,8 @@
 """Slippage telemetry — measure realised entry vs signal-time close.
 
+Default log location: `.mcp-brain/logs/slippage/` (per Gemini CFO/Ops
+review 2026-05-16 — durable audit trail, survives local-app log rotation).
+
 Motivation (FX backtest self-audit 2026-05-15):
 
 The biggest methodological gap in the FX London Breakout backtest was

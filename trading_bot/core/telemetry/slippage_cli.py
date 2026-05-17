@@ -22,8 +22,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--log-root",
         type=Path,
-        default=Path("logs/slippage"),
-        help="dir containing <front>_slippage.jsonl (default logs/slippage)",
+        default=Path(r"C:\models\omni\.mcp-brain\logs\slippage"),
+        help="dir containing <front>_slippage.jsonl "
+        "(default .mcp-brain/logs/slippage — Gemini CFO/Ops 2026-05-16: "
+        "durable audit trail)",
     )
     p.add_argument("--pip-size", type=float, default=0.0001)
     p.add_argument("--json", action="store_true", help="emit JSON instead of human")
