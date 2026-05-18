@@ -40,6 +40,19 @@ class TradeIntent:
     stop_loss: Optional[float] = None   # absolute price; required for entries
     take_profit: Optional[float] = None # absolute price; optional
 
+    # Bar-close price at the moment the strategy fired this intent. Used
+    # by adapters that publish slippage telemetry — fill slippage =
+    # fill_price - signal_close_price (sign-flipped for SELLs). For
+    # market-order strategies, `price` is 0.0 and this carries the bar
+    # close instead. For limit/stop strategies, `price` is the order
+    # price and this should be set separately to the actual bar close.
+    # Defaults to None — adapters that care must fall back to `price`
+    # when None. ORBStrategy populates this explicitly from
+    # `StrategyContext.candle.close` post the Codex 2026-05-18 wiring
+    # ask. See handoffs/2026-05-18-codex-to-team-REVIEW-RESPONSE-
+    # claude-ninja-skeleton-and-bar-publisher.md §3.
+    signal_close_price: Optional[float] = None
+
     # Margin the broker will hold for this position (per-contract). Caller
     # supplies it because broker margin tables are external to this module.
     per_contract_margin: float = 0.0

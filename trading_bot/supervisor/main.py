@@ -33,7 +33,13 @@ import sys
 from pathlib import Path
 
 from trading_bot.core.data import CandleManager
-from trading_bot.core.execution import MT5BrokerAdapter, MT5Config, dtc_protocol as proto
+from trading_bot.core.execution import (
+    MT5BrokerAdapter,
+    MT5Config,
+    NinjaBrokerAdapter,
+    NinjaConfig,
+    dtc_protocol as proto,
+)
 from trading_bot.core.execution.broker_adapter import BrokerSymbolSpec
 from trading_bot.core.execution.dtc_broker_adapter import DTCBrokerAdapter
 from trading_bot.core.risk import RiskManager, RiskPolicy
@@ -75,9 +81,22 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     # engine is broker-agnostic; this flag picks which adapter the
     # supervisor constructs.
     p.add_argument(
-        "--broker", choices=["dtc", "mt5"], default="dtc",
-        help="Broker adapter selector.",
+        "--broker", choices=["dtc", "mt5", "ninja"], default="dtc",
+        help="Broker adapter selector. NOTE: 'ninja' is order-routing-only "
+             "scaffold as of 2026-05-18 — engine.start() will fail at "
+             "market-data subscribe + account-state seed until the Option A "
+             "data path lands. See handoffs/2026-05-18-claude-to-team-"
+             "NT-data-architecture-Option-A-brainstorm.md",
     )
+    p.add_argument("--ninja-host", default="127.0.0.1",
+                   help="NinjaTrader bridge listen host (Python is the server).")
+    p.add_argument("--ninja-port", type=int, default=9876,
+                   help="NinjaTrader bridge listen port.")
+    p.add_argument("--ninja-secrets-path", default=None,
+                   help="optional secrets.json path containing nt_bridge.hmac_secret")
+    p.add_argument("--ninja-account-label", default="Sim101",
+                   help="NT account label for audit logs. Does not bind the "
+                        "ATM template — NT decides target account via template config.")
     p.add_argument("--mt5-login", type=int, default=None,
                    help="MT5 account login. Defaults to MT5_LOGIN env or secrets file.")
     p.add_argument("--mt5-password", default=None,
@@ -298,7 +317,75 @@ def _build_broker_adapter(*, args, instruments):
             config=_build_mt5_config(args),
             symbol_map=symbol_map,
         )
+    if args.broker == "ninja":
+        # Ninja branch wants the NT display form (e.g. "MES 06-26"), not
+        # the DTC wire form ("MESM26-CME"). KateBridgeStrategy.cs maps
+        # NT-display → MasterInstrument internally; passing DTC form would
+        # fail to resolve on the NT side.
+        symbol_map: dict[str, BrokerSymbolSpec] = {}
+        for inst_key, inst in instruments.items():
+            rt = KNOWN_INSTRUMENTS[inst_key]
+            if not rt.nt_symbol:
+                raise SystemExit(
+                    f"--broker ninja requires nt_symbol on InstrumentRuntime "
+                    f"for {inst_key!r}; add it to KNOWN_INSTRUMENTS in "
+                    f"trading_bot/supervisor/runtime.py"
+                )
+            symbol_map[inst.symbol] = BrokerSymbolSpec(
+                logical_symbol=inst.symbol,
+                broker_symbol=rt.nt_symbol,
+                exchange=inst.exchange,
+                tick_size=inst.tick_size,
+            )
+        return NinjaBrokerAdapter(
+            config=_build_ninja_config(args),
+            symbol_map=symbol_map,
+        )
     raise SystemExit(f"unsupported --broker value: {args.broker!r}")
+
+
+def _build_ninja_config(args) -> NinjaConfig:  # type: ignore[no-untyped-def]
+    secret = _load_ninja_hmac_secret(args.ninja_secrets_path)
+    return NinjaConfig(
+        hmac_secret=secret,
+        host=args.ninja_host,
+        port=args.ninja_port,
+        nt_account_label=args.ninja_account_label,
+    )
+
+
+def _load_ninja_hmac_secret(secrets_path: str | None) -> bytes:
+    candidates: list[Path] = []
+    if secrets_path:
+        candidates.append(Path(secrets_path))
+    env_path = os.getenv("NINJA_SECRETS_PATH")
+    if env_path:
+        candidates.append(Path(env_path))
+    candidates.append(Path(r"C:\models\omni\.mcp-brain\config\secrets.json"))
+
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            nt = data.get("nt_bridge", {})
+            secret_str = nt.get("hmac_secret")
+            if secret_str:
+                return secret_str.encode("utf-8")
+        except Exception:
+            LOGGER.warning("supervisor: could not read NT bridge secret from %s", path)
+    env_secret = os.getenv("NINJA_HMAC_SECRET")
+    if env_secret:
+        return env_secret.encode("utf-8")
+    # Match the placeholder used by auto_trigger.py + KateBridgeStrategy.cs
+    # dev defaults so the smoke harness keeps working when no secrets file
+    # is present. Production deploys MUST provide a real secret.
+    LOGGER.warning(
+        "supervisor: no NT bridge secret found in secrets.json or "
+        "NINJA_HMAC_SECRET env — falling back to dev placeholder. DO NOT "
+        "run --broker ninja in production with this secret."
+    )
+    return b"change-me-local-only"
 
 
 def _build_mt5_config(args) -> MT5Config:  # type: ignore[no-untyped-def]
@@ -669,8 +756,8 @@ async def _run(args: argparse.Namespace) -> int:
             no_trade_windows_utc=no_trade_windows,
             client_name=args.client_name,
             trade_mode=TRADE_MODE_LOOKUP[args.trade_mode],
-            use_broker_market_data=args.broker == "mt5",
-            use_native_brackets=args.broker == "mt5",
+            use_broker_market_data=args.broker in ("mt5", "ninja"),
+            use_native_brackets=args.broker in ("mt5", "ninja"),
             tick_interval_seconds=args.tick_interval,
             reconciliation_interval_seconds=args.reconciliation_interval,
             on_drift=_on_drift,
@@ -713,6 +800,12 @@ async def _run(args: argparse.Namespace) -> int:
             LOGGER.info("supervisor: probing DTC reachability at %s:%d", args.dtc_host, args.dtc_port)
             await _verify_dtc_reachable(args.dtc_host, args.dtc_port)
             LOGGER.info("supervisor: DTC port reachable — proceeding with logon")
+        elif args.broker == "ninja":
+            LOGGER.warning(
+                "supervisor: --broker ninja is order-routing scaffold only "
+                "(2026-05-18). subscribe_market_data + request_account_state "
+                "will fail. Use --broker dtc until Option A data path lands."
+            )
         else:
             LOGGER.info("supervisor: MT5 selected; skipping Sierra DTC preflights")
 

@@ -238,6 +238,7 @@ class MT5BrokerAdapter(BrokerAdapter):
         order_type: int,
         price: float = 0.0,
         stop_price: Optional[float] = None,
+        signal_close_price: Optional[float] = None,  # accepted; MT5 telemetry deferred
         target_price: Optional[float] = None,
         free_form_text: str = "",
     ) -> str:

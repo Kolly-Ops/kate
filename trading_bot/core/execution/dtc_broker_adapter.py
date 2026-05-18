@@ -281,6 +281,7 @@ class DTCBrokerAdapter(BrokerAdapter):
         price: float = 0.0,
         stop_price: Optional[float] = None,
         target_price: Optional[float] = None,
+        signal_close_price: Optional[float] = None,  # accepted; DTC slippage via .scid path, not adapter
         free_form_text: str = "",
     ) -> str:
         """Submit a single order via DTC SUBMIT_NEW_SINGLE_ORDER.

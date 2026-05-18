@@ -201,6 +201,7 @@ class RithmicBrokerAdapter(BrokerAdapter):
         price: float = 0.0,
         stop_price: Optional[float] = None,
         target_price: Optional[float] = None,
+        signal_close_price: Optional[float] = None,  # accepted; wire to Rithmic slippage when adapter goes live
         free_form_text: str = "",
     ) -> str:
         self._require_connected()

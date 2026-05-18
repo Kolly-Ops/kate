@@ -45,6 +45,7 @@ from trading_bot.core.data.tick_candle_aggregator import TickCandleAggregator
 from trading_bot.core.execution import dtc_protocol as proto
 from trading_bot.core.execution.broker_adapter import (
     AccountBalanceEvent,
+    BarEvent,
     BrokerAdapter,
     BrokerError,
     BrokerEvent,
@@ -457,6 +458,9 @@ class ManagedFuturesEngine:
             elif event.kind == BrokerEventKind.MARKET_DATA_TICK:
                 if event.tick is not None:
                     await self._handle_market_data_tick(event.tick)
+            elif event.kind == BrokerEventKind.MARKET_DATA_BAR:
+                if event.bar is not None:
+                    await self._handle_market_data_bar(event.bar)
             elif event.kind in (
                 BrokerEventKind.CONNECTED,
                 BrokerEventKind.LOGON_OK,
@@ -608,6 +612,48 @@ class ManagedFuturesEngine:
             self._history[tick.symbol].append(candle)
             await self._on_candle_close(tick.symbol, candle)
 
+    async def _handle_market_data_bar(self, bar: BarEvent) -> None:
+        """Consume a pre-aggregated bar (Option A path — NinjaTrader).
+
+        Distinct from `_handle_market_data_tick`: bars arrive already
+        closed from NinjaScript's `OnBarUpdate`, so we skip
+        `TickCandleAggregator` and feed the engine directly. Dedup +
+        bar-revision detection happens upstream in the adapter; by the
+        time a bar reaches here it's been validated as a fresh closed
+        bar for a known symbol.
+
+        Engine-side validation: symbol must be managed, timeframe must
+        match the engine's configured timeframe_minutes (mismatched
+        timeframes suggest NinjaScript-vs-engine config drift and are
+        dropped with a WARNING — not silently consumed against a
+        differently-sized history).
+        """
+        if bar.symbol not in self._history:
+            logger.debug(
+                "engine: MARKET_DATA_BAR for unmanaged symbol %r ignored",
+                bar.symbol,
+            )
+            return
+        configured_timeframe = getattr(self.candle_manager, "timeframe_minutes", 1)
+        if bar.timeframe_minutes != configured_timeframe:
+            logger.warning(
+                "engine: MARKET_DATA_BAR timeframe mismatch on %s — bar=%dm "
+                "engine=%dm. Verify NinjaScript chart timeframe matches "
+                "--timeframe-minutes. Bar dropped.",
+                bar.symbol, bar.timeframe_minutes, configured_timeframe,
+            )
+            return
+        candle = Candle(
+            timestamp=bar.timestamp,
+            open=bar.open,
+            high=bar.high,
+            low=bar.low,
+            close=bar.close,
+            volume=bar.volume,
+        )
+        self._history[bar.symbol].append(candle)
+        await self._on_candle_close(bar.symbol, candle)
+
     async def _process_symbol(self, symbol: str) -> None:
         if self.use_broker_market_data:
             return
@@ -709,6 +755,11 @@ class ManagedFuturesEngine:
                 price=intent.price,
                 stop_price=intent.stop_loss if self.use_native_brackets else None,
                 target_price=intent.take_profit if self.use_native_brackets else None,
+                signal_close_price=(
+                    intent.signal_close_price
+                    if intent.signal_close_price is not None
+                    else (intent.price if intent.price else None)
+                ),
                 free_form_text=intent.strategy_name[:48],
             )
             logger.info(

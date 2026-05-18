@@ -102,6 +102,7 @@ class BrokerEventKind(Enum):
     POSITION_UPDATE = "position_update"
     ACCOUNT_BALANCE_UPDATE = "account_balance_update"
     MARKET_DATA_TICK = "market_data_tick"   # if adapter does ticks
+    MARKET_DATA_BAR = "market_data_bar"     # if adapter does pre-aggregated bars (NT path)
     ERROR = "error"
 
 
@@ -153,6 +154,29 @@ class MarketDataTick:
     ask: Optional[float] = None
 
 
+@dataclass(frozen=True)
+class BarEvent:
+    """Per-symbol closed OHLCV bar for MARKET_DATA_BAR.
+
+    Used by adapters whose upstream source already aggregates ticks into
+    bars (e.g. NinjaTrader publishes via OnBarUpdate). The engine
+    consumes these directly — no TickCandleAggregator round-trip — so
+    bars must already be finalised before the adapter emits this event.
+
+    See `core/data/candle.Candle` for the shape the engine ultimately
+    stores; this dataclass mirrors that shape plus instrument metadata
+    needed for routing.
+    """
+    symbol: str                          # logical symbol (e.g. "MESM26")
+    timestamp: dt.datetime               # bar-start, UTC, tz-aware
+    timeframe_minutes: int
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: int
+
+
 # ── Symbol mapping (Codex adapter-spec amendment 4) ──────────────────────
 
 @dataclass(frozen=True)
@@ -200,6 +224,7 @@ class BrokerEvent:
     position: Optional[PositionEvent] = None
     balance: Optional[AccountBalanceEvent] = None
     tick: Optional[MarketDataTick] = None
+    bar: Optional["BarEvent"] = None
     error_message: Optional[str] = None
 
 
@@ -266,12 +291,22 @@ class BrokerAdapter(ABC):
         price: float = 0.0,              # absolute price for LIMIT/STOP
         stop_price: Optional[float] = None,
         target_price: Optional[float] = None,
+        signal_close_price: Optional[float] = None,
         free_form_text: str = "",
     ) -> str:
         """Submit a single order. Bracket orders (stop+target attached)
         are surfaced through stop_price/target_price; the adapter is
         responsible for translating to its native bracket model
         (Rithmic stop_ticks/target_ticks, DTC submit-then-attach, etc).
+
+        `signal_close_price` is the bar-close price at the moment the
+        strategy decision fired. Adapters that publish slippage telemetry
+        (NinjaBrokerAdapter, future Rithmic slippage path) wire this into
+        the on-the-wire payload so fill slippage can be computed against
+        the actual decision-time close. Adapters that don't care about
+        telemetry accept and ignore. Engine should pass
+        `intent.signal_close_price` if set, else `intent.price` as a
+        best-effort fallback.
 
         Returns the broker's accepted ClientOrderID (usually equal to
         the input client_order_id; adapters that mangle IDs return

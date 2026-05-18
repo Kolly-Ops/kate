@@ -133,6 +133,7 @@ class FakeBrokerAdapter(BrokerAdapter):
         price: float = 0.0,
         stop_price: Optional[float] = None,
         target_price: Optional[float] = None,
+        signal_close_price: Optional[float] = None,
         free_form_text: str = "",
     ) -> str:
         self.submitted.append({
@@ -145,6 +146,7 @@ class FakeBrokerAdapter(BrokerAdapter):
             "price": price,
             "stop_price": stop_price,
             "target_price": target_price,
+            "signal_close_price": signal_close_price,
             "free_form_text": free_form_text,
         })
         return client_order_id

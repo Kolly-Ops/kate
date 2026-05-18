@@ -33,6 +33,7 @@ class MsgType(str, Enum):
     RECONCILE_REQ = "reconcile_req"  # Python → NT on reconnect
     RECONCILE_RESP = "reconcile_resp"  # NT → Python with current state
     ACK = "ack"                     # generic acknowledgement (by seq)
+    BAR = "bar"                     # NT → Python: closed OHLCV bar (Option A data path)
 
 
 class Side(str, Enum):
@@ -122,6 +123,42 @@ class AckPayload:
     """Acknowledge receipt of a message by its sequence number."""
     ack_seq: int
     timestamp: str
+
+
+@dataclass(frozen=True)
+class BarPayload:
+    """NT → Python: a closed OHLCV bar from NinjaTrader's own data feed.
+
+    Emitted by `KateBridgeStrategy.cs` on `OnBarUpdate()` when the bar
+    finalises (`Calculate.OnBarClose`, `State == Realtime`). One bar per
+    instrument per timeframe boundary. Python consumes these via
+    NinjaBrokerAdapter and feeds them to the engine as closed candles —
+    bypassing TickCandleAggregator, which is the tick-path.
+
+    Dedup contract (Codex's design 2026-05-18):
+      - `bar_index` is NT's monotonically increasing CurrentBar value
+      - Python rejects duplicate (bar_index, bar_timestamp) pairs that
+        carry identical OHLCV (idempotent retransmit)
+      - Python flags BAR_REVISION + fails validation day if a duplicate
+        (bar_index, bar_timestamp) pair arrives with *different* OHLCV
+
+    Timestamp convention: ISO 8601 UTC, e.g. "2026-05-18T14:31:00+00:00".
+    NT emits in its bar-start convention (the timestamp of the bar that
+    just closed, not the wallclock at close). Python aligns to this.
+
+    Volume is an integer count of contracts traded inside the bar
+    (NinjaTrader's `BarsArray[0].Volumes[CurrentBar]`).
+    """
+    timestamp: str       # bar-start UTC ISO 8601
+    symbol: str          # logical symbol, e.g. "MESM26"
+    nt_symbol: str       # NT instrument FullName, e.g. "MES 06-26"
+    timeframe_minutes: int  # 1, 5, etc.
+    bar_index: int       # NT's CurrentBar at close
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: int
 
 
 # ── Wire envelope ────────────────────────────────────────────────────────
@@ -245,6 +282,7 @@ __all__ = [
     "PendingBracketSnapshot",
     "ReconcileResponsePayload",
     "AckPayload",
+    "BarPayload",
     "WireEnvelope",
     "canonical_json",
     "sign_payload",
