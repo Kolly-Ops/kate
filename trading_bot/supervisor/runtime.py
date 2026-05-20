@@ -109,4 +109,44 @@ KNOWN_INSTRUMENTS: dict[str, InstrumentRuntime] = {
         per_contract_margin=0.0,
         round_trip_commission=0.0,
     ),
+    # EURUSD — most liquid FX pair globally; deepest book, tightest spread.
+    # Added 2026-05-20 per CEO directive to broaden Front 4 setup count.
+    # Same tick/pip structure as GBPUSD (4-decimal pair). Compatible with
+    # FXLondonBreakoutStrategy default pip_size=0.0001 — no code change needed.
+    "EURUSD": InstrumentRuntime(
+        strategy_symbol="EURUSD",
+        dtc_symbol="EURUSD",
+        exchange="ICMarketsSC-Demo",
+        scid_basename="EURUSD",
+        tick_size=0.00001,
+        tick_value=1.0,
+        per_contract_margin=0.0,
+        round_trip_commission=0.0,
+    ),
+    # AUDUSD — Asian-session-driven (Australian data + commodities).
+    # Often produces clean Asian-range setups breaking at London open.
+    # Added 2026-05-20 per CEO directive. 4-decimal pip-compatible.
+    "AUDUSD": InstrumentRuntime(
+        strategy_symbol="AUDUSD",
+        dtc_symbol="AUDUSD",
+        exchange="ICMarketsSC-Demo",
+        scid_basename="AUDUSD",
+        tick_size=0.00001,
+        tick_value=1.0,
+        per_contract_margin=0.0,
+        round_trip_commission=0.0,
+    ),
+    # EURGBP — pure European cross. Classic London-session breakout pair;
+    # often produces narrow Asian ranges (5-20 pips) that break cleanly
+    # on London opening flow. Added 2026-05-20 per CEO directive.
+    "EURGBP": InstrumentRuntime(
+        strategy_symbol="EURGBP",
+        dtc_symbol="EURGBP",
+        exchange="ICMarketsSC-Demo",
+        scid_basename="EURGBP",
+        tick_size=0.00001,
+        tick_value=1.0,
+        per_contract_margin=0.0,
+        round_trip_commission=0.0,
+    ),
 }
