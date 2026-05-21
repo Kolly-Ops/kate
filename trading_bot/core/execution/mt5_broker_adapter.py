@@ -326,11 +326,13 @@ class MT5BrokerAdapter(BrokerAdapter):
         if not server_order_id:
             raise BrokerError("MT5 cancel_order requires server_order_id")
         mt5 = self._ensure_runtime()
+        import re as _re
+        clean_comment = _re.sub(r"[^a-zA-Z0-9_]", "_", client_order_id or "")[:31]
         request = {
             "action": mt5.TRADE_ACTION_REMOVE,
             "order": int(server_order_id),
             "magic": self.config.magic,
-            "comment": client_order_id,
+            "comment": clean_comment,
         }
         result = await asyncio.to_thread(mt5.order_send, request)
         retcode = int(_field(result, "retcode", 0) or 0)
@@ -548,12 +550,19 @@ class MT5BrokerAdapter(BrokerAdapter):
         mt5 = self._ensure_runtime()
         symbol = spec.broker_symbol
         mapped_type = self._map_order_type(side=side, order_type=order_type)
+        # MT5 IC Markets rejects comments with `-` (hyphen) and most
+        # non-alphanumerics with retcode (-2, 'Invalid "comment" argument').
+        # Observed live 2026-05-21 08:07 BST on the first real strategy fire
+        # (fxlon-EURGBP-2605210806). Sanitize aggressively: keep only
+        # [a-zA-Z0-9_], replace everything else with underscore, trim 31.
+        import re as _re
+        clean_comment = _re.sub(r"[^a-zA-Z0-9_]", "_", comment or "")[:31]
         request: dict[str, Any] = {
             "symbol": symbol,
             "volume": float(quantity),
             "type": mapped_type,
             "magic": self.config.magic,
-            "comment": comment[:31],
+            "comment": clean_comment,
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": getattr(mt5, "ORDER_FILLING_IOC", getattr(mt5, "ORDER_FILLING_RETURN", 0)),
             "deviation": self.config.deviation,
