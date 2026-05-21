@@ -993,6 +993,15 @@ class MT5BrokerAdapter(BrokerAdapter):
 def _field(value: Any, name: str, default: Any = None) -> Any:
     if isinstance(value, dict):
         return value.get(name, default)
+    # MT5's copy_rates_from_pos returns numpy structured arrays whose
+    # elements are `numpy.void` records — these support string-key
+    # subscript but NOT attribute access (getattr returns the default
+    # silently). Try subscript first, fall through to attribute for
+    # MT5's tick/account/position objects which expose attributes.
+    try:
+        return value[name]
+    except (TypeError, KeyError, ValueError, IndexError):
+        pass
     return getattr(value, name, default)
 
 
