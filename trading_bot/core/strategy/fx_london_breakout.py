@@ -6,9 +6,12 @@ Designed for the MT5 demo path first, with GBPUSD as the primary symbol.
 from __future__ import annotations
 
 import datetime as dt
+import logging
 from dataclasses import dataclass
 from typing import Optional, Sequence
 from zoneinfo import ZoneInfo
+
+logger = logging.getLogger(__name__)
 
 from trading_bot.core.data import Candle
 from trading_bot.core.execution import dtc_protocol as proto
@@ -87,31 +90,64 @@ class FXLondonBreakoutStrategy(Strategy):
 
     def on_candle_close(self, ctx: StrategyContext) -> Optional[TradeIntent]:
         if ctx.has_open_position:
+            logger.debug("fxlon %s: skip — open position", ctx.symbol)
             return None
 
         ts_uk = self._to_local(ctx.candle.timestamp)
         if not self._in_trade_window(ts_uk):
+            logger.debug(
+                "fxlon %s @ %s UK: outside trade window 07:00-10:00",
+                ctx.symbol, ts_uk.strftime("%Y-%m-%d %H:%M"),
+            )
             return None
+
+        # Inside the trade window — promote to INFO so we can see the
+        # strategy is actually being evaluated each minute.
+        logger.info(
+            "fxlon %s @ %s UK: IN trade window, evaluating (history=%d candles)",
+            ctx.symbol, ts_uk.strftime("%H:%M"), len(ctx.history),
+        )
 
         session_key = (ctx.symbol, ts_uk.date())
         if session_key in self._traded_sessions:
+            logger.info("fxlon %s: skip — already traded this session", ctx.symbol)
             return None
 
         if self._in_news_blackout(ts_uk):
+            logger.info("fxlon %s: skip — inside news blackout buffer", ctx.symbol)
             return None
 
         range_candles = self._asian_range_candles(ctx.history, ts_uk.date())
-        if not range_candles or len(ctx.history) < self.atr_period + 1:
+        if not range_candles:
+            logger.info(
+                "fxlon %s: skip — no Asian-range candles found for session %s",
+                ctx.symbol, ts_uk.date(),
+            )
+            return None
+        if len(ctx.history) < self.atr_period + 1:
+            logger.info(
+                "fxlon %s: skip — insufficient history (%d < %d for ATR%d)",
+                ctx.symbol, len(ctx.history), self.atr_period + 1, self.atr_period,
+            )
             return None
 
         range_high = max(c.high for c in range_candles)
         range_low = min(c.low for c in range_candles)
         range_pips = (range_high - range_low) / self.pip_size
+        logger.info(
+            "fxlon %s Asian range: high=%.5f low=%.5f pips=%.1f close=%.5f (n_bars=%d)",
+            ctx.symbol, range_high, range_low, range_pips, ctx.candle.close, len(range_candles),
+        )
         if range_pips < self.min_range_pips or range_pips > self.max_range_pips:
+            logger.info(
+                "fxlon %s: skip — range %.1f pips outside filter [%.0f, %.0f]",
+                ctx.symbol, range_pips, self.min_range_pips, self.max_range_pips,
+            )
             return None
 
         current_atr = atr(ctx.history, self.atr_period)
         if current_atr <= 0:
+            logger.info("fxlon %s: skip — ATR%d <= 0", ctx.symbol, self.atr_period)
             return None
 
         side: int
@@ -121,15 +157,28 @@ class FXLondonBreakoutStrategy(Strategy):
             stop_loss = max(range_low, ctx.candle.close - (current_atr * self.atr_stop_multiplier))
             risk = ctx.candle.close - stop_loss
             take_profit = ctx.candle.close + (risk * self.reward_risk)
+            logger.info(
+                "fxlon %s: BREAKOUT HIGH — BUY @ %.5f stop=%.5f tp=%.5f (range %.5f-%.5f)",
+                ctx.symbol, ctx.candle.close, stop_loss, take_profit, range_low, range_high,
+            )
         elif ctx.candle.close < range_low:
             side = proto.SELL
             stop_loss = min(range_high, ctx.candle.close + (current_atr * self.atr_stop_multiplier))
             risk = stop_loss - ctx.candle.close
             take_profit = ctx.candle.close - (risk * self.reward_risk)
+            logger.info(
+                "fxlon %s: BREAKOUT LOW — SELL @ %.5f stop=%.5f tp=%.5f (range %.5f-%.5f)",
+                ctx.symbol, ctx.candle.close, stop_loss, take_profit, range_low, range_high,
+            )
         else:
+            logger.info(
+                "fxlon %s: skip — no breakout (close %.5f inside range %.5f-%.5f)",
+                ctx.symbol, ctx.candle.close, range_low, range_high,
+            )
             return None
 
         if risk <= 0:
+            logger.info("fxlon %s: skip — risk computed <= 0", ctx.symbol)
             return None
 
         self._traded_sessions.add(session_key)

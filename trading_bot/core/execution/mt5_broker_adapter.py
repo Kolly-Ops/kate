@@ -133,6 +133,15 @@ class MT5BrokerAdapter(BrokerAdapter):
         # current disconnect cycle (avoids alert spam every poll tick).
         self._last_connected_at: float = 0.0
         self._heartbeat_alerted: bool = False
+        # MT5 server timezone offset in seconds. Many brokers (e.g.
+        # ICMarketsSC-Demo runs GMT+3) serve epoch values that represent
+        # server-local wall clock TREATED as if it were UTC. Without
+        # correction the engine sees timestamps 3h ahead of real UTC,
+        # which mis-aligned the FX London Breakout trade window for 10
+        # silent days. Detected on first successful connect() by sampling
+        # a tick and comparing to real wall clock — see
+        # `_detect_server_offset`.
+        self._mt5_server_offset_seconds: float = 0.0
 
     async def connect(self) -> None:
         if self._connected:
@@ -169,6 +178,9 @@ class MT5BrokerAdapter(BrokerAdapter):
         # always fire (now - 0.0 > threshold) on the very first poll tick.
         self._last_connected_at = time.time()
         self._heartbeat_alerted = False
+        # Detect broker's server timezone offset BEFORE polling starts so
+        # the very first emitted tick is normalized to real UTC.
+        self._mt5_server_offset_seconds = await self._detect_server_offset()
         await self._prime_poll_hashes()
         self._poll_task = asyncio.create_task(self._poll_loop(), name="mt5-adapter-poll")
         await self._events_q.put(BrokerEvent(
@@ -695,10 +707,67 @@ class MT5BrokerAdapter(BrokerAdapter):
         }
         return proto.BUY if order_type in buy_types else proto.SELL
 
+    async def _detect_server_offset(self) -> float:
+        """Detect MT5 server timezone offset from real UTC, in seconds.
+
+        MT5's `tick.time` is a Unix epoch, but many brokers' servers run
+        in a non-UTC zone (ICMarketsSC-Demo = GMT+3 / EEST). The
+        epoch values returned represent that server-local wall clock
+        treated as if it were UTC, so `datetime.utcfromtimestamp(tick.time)`
+        is the SERVER WALL CLOCK, not real UTC.
+
+        Without correction the engine misreads timestamps and any
+        UTC-based filter (trade window, blackout, news buffer) fires at
+        the wrong real-world hour. This silently mis-aligned the FX
+        London Breakout strategy's 07:00-10:00 UK window for 10 days
+        before detection.
+
+        Strategy: sample any subscribed symbol's tick, compare its
+        epoch to real wall clock, round to nearest hour to absorb
+        network jitter. Returns offset in seconds (positive = server is
+        ahead of real UTC).
+        """
+        mt5 = self._ensure_runtime()
+        sample_seconds: Optional[float] = None
+        for spec in self.symbol_map.values():
+            tick = await asyncio.to_thread(mt5.symbol_info_tick, spec.broker_symbol)
+            if tick is None:
+                continue
+            raw = _field(tick, "time", None)
+            if raw is None:
+                continue
+            try:
+                sample_seconds = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if sample_seconds > 0:
+                break
+        if sample_seconds is None or sample_seconds <= 0:
+            logger.warning(
+                "MT5 server offset detection failed (no tick sample); assuming offset=0"
+            )
+            return 0.0
+        real_utc = time.time()
+        delta = sample_seconds - real_utc
+        hours_off = round(delta / 3600.0)
+        offset_seconds = hours_off * 3600.0
+        logger.info(
+            "MT5 server timezone offset detected: %+d hour(s) "
+            "(raw delta %.1fs, server epoch %.0f, real UTC %.0f). "
+            "All emitted tick timestamps will be normalized to real UTC.",
+            hours_off, delta, sample_seconds, real_utc,
+        )
+        return offset_seconds
+
     def _tick_to_event(self, logical_symbol: str, tick: Any) -> MarketDataTick:
         timestamp = _coerce_time(_field(tick, "time_msc", None), millis=True)
         if timestamp is None:
             timestamp = _coerce_time(_field(tick, "time", None), millis=False)
+        # Normalize MT5 server clock to real UTC. See connect() +
+        # `_detect_server_offset` for the rationale (10 silent days of
+        # mis-aligned FX London Breakout window proved this is load-bearing).
+        if timestamp is not None and self._mt5_server_offset_seconds:
+            timestamp = timestamp - dt.timedelta(seconds=self._mt5_server_offset_seconds)
         return MarketDataTick(
             symbol=logical_symbol,
             timestamp=timestamp or dt.datetime.utcnow(),
