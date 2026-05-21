@@ -433,9 +433,27 @@ class ManagedFuturesEngine:
                     self._event_queue.get(), timeout=remaining
                 )
             except asyncio.TimeoutError:
+                # TEMP diag — every 30s log drain heartbeat so we can prove
+                # engine.run() is actually looping. Replace when Codex's
+                # observability patch lands.
+                now = loop.time()
+                if not hasattr(self, "_last_drain_heartbeat_at"):
+                    self._last_drain_heartbeat_at = 0.0
+                    self._drain_total_count = 0
+                if now - self._last_drain_heartbeat_at >= 30.0:
+                    self._last_drain_heartbeat_at = now
+                    logger.info(
+                        "DIAG engine drain heartbeat: total_events_drained=%d "
+                        "account_state_set=%s history_lens=%s",
+                        self._drain_total_count,
+                        self._account_state is not None,
+                        {s: len(h) for s, h in self._history.items()},
+                    )
                 return count
             await self._handle_broker_event(event)
             count += 1
+            if hasattr(self, "_drain_total_count"):
+                self._drain_total_count += 1
 
     async def _handle_broker_event(self, event: BrokerEvent) -> None:
         """Dispatch a normalized broker event to the right handler."""
