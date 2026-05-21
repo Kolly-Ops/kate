@@ -278,6 +278,44 @@ class ManagedFuturesEngine:
                 await self.broker.subscribe_market_data(
                     symbol=symbol, exchange=meta.exchange,
                 )
+                # Seed strategy history from the broker's bar API so
+                # strategies with large history_window (e.g. FX London
+                # Breakout: 480 1-min bars / 8h) can evaluate from
+                # minute 1 after a restart, rather than waiting 8h for
+                # live tick aggregation to catch up. Adapters that
+                # don't expose bar history return () and the engine
+                # transparently falls back to live aggregation.
+                # Lesson 2026-05-21: 11 consecutive London sessions
+                # missed because every restart wiped the in-memory
+                # history and the 480-bar threshold was never met.
+                try:
+                    backfill = await self.broker.get_recent_candles(
+                        symbol=symbol,
+                        count=self._history_size,
+                        timeframe_minutes=self._tick_aggregator.timeframe_minutes,
+                    )
+                except Exception:
+                    logger.exception(
+                        "engine: broker.get_recent_candles failed for %s — "
+                        "falling back to live aggregation (strategy will "
+                        "need %d ticks before firing)",
+                        symbol, self.strategy.history_window,
+                    )
+                    backfill = ()
+                if backfill:
+                    self._history[symbol].extend(backfill)
+                    logger.info(
+                        "engine: backfilled %d candles for %s (now history=%d, "
+                        "strategy needs %d to fire)",
+                        len(backfill), symbol, len(self._history[symbol]),
+                        self.strategy.history_window,
+                    )
+                else:
+                    logger.warning(
+                        "engine: no backfill candles for %s — strategy will "
+                        "need %d live ticks of aggregation before firing",
+                        symbol, self.strategy.history_window,
+                    )
         # Spawn the background pump BEFORE logon: some adapters emit
         # LOGON_OK on the event stream, and we want it captured.
         self._event_pump_task = asyncio.create_task(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import time
 from dataclasses import dataclass
 
 import pytest
@@ -90,6 +91,12 @@ class _FakeMT5:
     TRADE_RETCODE_DONE = 10009
     TRADE_RETCODE_REJECT = 10006
 
+    TIMEFRAME_M1 = 1
+    TIMEFRAME_M5 = 5
+    TIMEFRAME_M15 = 15
+    TIMEFRAME_M30 = 30
+    TIMEFRAME_H1 = 16385
+
     def __init__(self) -> None:
         self.initialized = False
         self.shutdown_called = False
@@ -108,6 +115,17 @@ class _FakeMT5:
         self.orders = [_Order(999, "GBPUSD", self.ORDER_TYPE_BUY_LIMIT, 1.0, 1.0, 1.2300, "pending-1")]
         self.tick = _Tick()
         self.error = (0, "ok")
+        # Bars returned by copy_rates_from_pos — tests override this to
+        # exercise the history backfill path. Each entry must be a dict
+        # supporting `b["time"|"open"|"high"|"low"|"close"|"tick_volume"]`
+        # so the adapter's iteration works on real numpy records OR
+        # dicts in test fixtures.
+        self.rates: list[dict] = []
+
+    def copy_rates_from_pos(self, symbol, timeframe, start_pos, count):
+        if not self.rates:
+            return None
+        return self.rates[start_pos: start_pos + count]
 
     def initialize(self, **kwargs):
         self.initialized = True
@@ -332,7 +350,113 @@ def test_subscribe_market_data_enqueues_normalized_tick():
         assert event.tick is not None
         assert event.tick.symbol == "GBPUSD"
         assert event.tick.last_price == pytest.approx(1.2501)
-        assert event.tick.timestamp == dt.datetime.utcfromtimestamp(1_715_601_600.123)
+        expected_ts = dt.datetime.utcfromtimestamp(1_715_601_600.123)
+        expected_ts -= dt.timedelta(seconds=adapter._mt5_server_offset_seconds)
+        assert event.tick.timestamp == expected_ts
+
+    _run(_impl())
+
+
+def test_poll_loop_emits_tick_delta_after_subscription():
+    async def _impl():
+        runtime = _FakeMT5()
+        adapter = MT5BrokerAdapter(
+            config=MT5Config(
+                login=123456,
+                password="pw",
+                server="Demo-Server",
+                poll_interval_seconds=0.01,
+            ),
+            symbol_map=SYMBOL_MAP,
+            runtime=runtime,
+        )
+        await adapter.connect()
+        await adapter.subscribe_market_data(symbol="GBPUSD")
+        stream = adapter.events()
+        assert (await stream.__anext__()).kind == BrokerEventKind.CONNECTED
+        assert (await stream.__anext__()).kind == BrokerEventKind.MARKET_DATA_TICK
+
+        runtime.tick = _Tick(
+            time=1_715_601_601,
+            time_msc=1_715_601_601_123,
+            bid=1.2503,
+            ask=1.2505,
+            last=1.2504,
+            volume=11.0,
+            volume_real=11.0,
+        )
+        event = await asyncio.wait_for(stream.__anext__(), timeout=1.0)
+        assert event.kind == BrokerEventKind.MARKET_DATA_TICK
+        assert event.tick is not None
+        assert event.tick.last_price == pytest.approx(1.2504)
+
+        await adapter.disconnect()
+
+    _run(_impl())
+
+
+def test_poll_loop_emits_error_when_subscribed_ticks_return_none():
+    async def _impl():
+        runtime = _FakeMT5()
+        adapter = MT5BrokerAdapter(
+            config=MT5Config(
+                login=123456,
+                password="pw",
+                server="Demo-Server",
+                poll_interval_seconds=0.01,
+                market_data_stale_seconds=0.01,
+            ),
+            symbol_map=SYMBOL_MAP,
+            runtime=runtime,
+        )
+        await adapter.connect()
+        await adapter.subscribe_market_data(symbol="GBPUSD")
+        stream = adapter.events()
+        assert (await stream.__anext__()).kind == BrokerEventKind.CONNECTED
+        assert (await stream.__anext__()).kind == BrokerEventKind.MARKET_DATA_TICK
+
+        runtime.tick = None
+        event = await asyncio.wait_for(stream.__anext__(), timeout=1.0)
+        assert event.kind == BrokerEventKind.ERROR
+        assert event.error_message is not None
+        assert "no tick returned" in event.error_message
+
+        await adapter.disconnect()
+
+    _run(_impl())
+
+
+def test_poll_loop_emits_error_when_subscribed_tick_is_stale():
+    async def _impl():
+        runtime = _FakeMT5()
+        adapter = MT5BrokerAdapter(
+            config=MT5Config(
+                login=123456,
+                password="pw",
+                server="Demo-Server",
+                poll_interval_seconds=0.01,
+                market_data_stale_seconds=0.01,
+            ),
+            symbol_map=SYMBOL_MAP,
+            runtime=runtime,
+        )
+        await adapter.connect()
+        await adapter.subscribe_market_data(symbol="GBPUSD")
+        stream = adapter.events()
+        assert (await stream.__anext__()).kind == BrokerEventKind.CONNECTED
+        assert (await stream.__anext__()).kind == BrokerEventKind.MARKET_DATA_TICK
+
+        event = None
+        for _ in range(5):
+            event = await asyncio.wait_for(stream.__anext__(), timeout=1.0)
+            if event.kind == BrokerEventKind.ERROR:
+                break
+        assert event is not None
+        assert event.kind == BrokerEventKind.ERROR
+        assert event.error_message is not None
+        assert "tick unchanged" in event.error_message
+
+        await adapter.disconnect()
 
     _run(_impl())
 
@@ -370,6 +494,111 @@ def test_poll_loop_emits_position_delta():
         assert event.kind == BrokerEventKind.POSITION_UPDATE
         assert event.position is not None
         assert event.position.quantity == 2.0
+
+        await adapter.disconnect()
+
+    _run(_impl())
+
+
+def test_get_recent_candles_returns_bars_with_tz_corrected_timestamps():
+    """Backfill: copy_rates_from_pos result -> chronological Candle tuple
+    with timestamps normalized via the detected MT5 server offset.
+
+    Regression guard for 2026-05-21 incident: 11 missed London sessions
+    because the engine's strategy.history_window=480 was never met after
+    restart. This method is the engine's startup seed path."""
+    async def _impl() -> None:
+        runtime = _FakeMT5()
+        # Place the fake "current" tick at server time = real_utc + 3h.
+        # The adapter's _detect_server_offset will round to +3h.
+        now = int(time.time())
+        runtime.tick = _Tick(
+            bid=1.34000, ask=1.34002, last=0.0,
+            volume=0, volume_real=0,
+            time=now + 3 * 3600,
+            time_msc=(now + 3 * 3600) * 1000,
+        )
+        # Build 5 fake M1 bars at server epochs running back from "now"
+        # by one minute increments. Real-UTC timestamps after correction
+        # should be the original epochs minus 3 hours.
+        runtime.rates = [
+            {
+                "time": (now - i * 60) + 3 * 3600,
+                "open": 1.3400 + i * 0.0001,
+                "high": 1.3410 + i * 0.0001,
+                "low": 1.3390 + i * 0.0001,
+                "close": 1.3405 + i * 0.0001,
+                "tick_volume": 100 + i,
+            }
+            for i in range(4, -1, -1)  # oldest first
+        ]
+
+        adapter = _adapter(runtime)
+        await adapter.connect()
+
+        candles = await adapter.get_recent_candles(
+            symbol="GBPUSD", count=5, timeframe_minutes=1,
+        )
+
+        assert len(candles) == 5, "should return all 5 backfilled bars"
+        # Each candle's timestamp must be 3h behind the raw server epoch
+        # (the offset detector rounds to +3h, so we subtract 3h exactly).
+        for c, raw in zip(candles, runtime.rates):
+            expected_utc = dt.datetime.utcfromtimestamp(raw["time"] - 3 * 3600)
+            assert c.timestamp == expected_utc, (
+                f"timestamp mismatch: got {c.timestamp}, expected {expected_utc} "
+                f"(raw_epoch={raw['time']})"
+            )
+            assert c.open == raw["open"]
+            assert c.high == raw["high"]
+            assert c.low == raw["low"]
+            assert c.close == raw["close"]
+            assert c.volume == raw["tick_volume"]
+
+        await adapter.disconnect()
+
+    _run(_impl())
+
+
+def test_get_recent_candles_returns_empty_when_broker_has_no_history():
+    """If copy_rates_from_pos returns None or empty, the method returns
+    an empty tuple (NOT an error) so the engine falls back to live
+    aggregation cleanly."""
+    async def _impl() -> None:
+        runtime = _FakeMT5()
+        runtime.rates = []  # no history available
+
+        adapter = _adapter(runtime)
+        await adapter.connect()
+
+        candles = await adapter.get_recent_candles(
+            symbol="GBPUSD", count=480, timeframe_minutes=1,
+        )
+
+        assert candles == ()
+        await adapter.disconnect()
+
+    _run(_impl())
+
+
+def test_get_recent_candles_rejects_unsupported_timeframe():
+    """Defensive: timeframes not in the M1/M5/M15/M30/H1 map raise
+    BrokerError instead of silently returning empty (which the engine
+    would treat as 'no backfill available' and run blind for 8h)."""
+    async def _impl() -> None:
+        runtime = _FakeMT5()
+
+        adapter = _adapter(runtime)
+        await adapter.connect()
+
+        try:
+            await adapter.get_recent_candles(
+                symbol="GBPUSD", count=10, timeframe_minutes=7,
+            )
+        except BrokerError as e:
+            assert "timeframe_minutes=7" in str(e)
+        else:
+            raise AssertionError("expected BrokerError for timeframe_minutes=7")
 
         await adapter.disconnect()
 

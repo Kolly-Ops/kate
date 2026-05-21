@@ -341,6 +341,36 @@ class BrokerAdapter(ABC):
             f"(.scid files, separate feed, etc.)"
         )
 
+    async def get_recent_candles(
+        self,
+        *,
+        symbol: str,
+        count: int,
+        timeframe_minutes: int = 1,
+    ) -> tuple:
+        """Return the most recent N completed candles in chronological
+        order (oldest first).
+
+        Optional. Default returns an empty tuple — the engine then falls
+        back to live tick aggregation, accumulating history from the
+        first tick onwards (the legacy behaviour). Override if the
+        broker exposes a bar history API the engine can use to seed
+        strategy history on startup.
+
+        Background: Strategies declare `history_window` for the minimum
+        history they need before generating signals (e.g.
+        FXLondonBreakoutStrategy needs 480 1-minute bars = 8 hours).
+        Without backfill, the engine cannot fire a strategy until that
+        many candles aggregate live after every restart. Lesson learned
+        2026-05-21 after 11 consecutive missed London sessions traced
+        to repeated supervisor restarts wiping the in-memory history.
+
+        Returns:
+            tuple[Candle, ...] in chronological order. Empty tuple means
+            "no backfill available", NOT an error.
+        """
+        return ()
+
     # ── State queries ────────────────────────────────────────────────────
 
     @abstractmethod

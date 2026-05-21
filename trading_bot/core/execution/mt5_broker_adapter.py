@@ -23,6 +23,7 @@ from typing import Any, AsyncIterator, Optional
 
 from . import dtc_protocol as proto
 from ..alerts import push_telegram_alert
+from ..data import Candle
 from .broker_adapter import (
     AccountBalanceEvent,
     BrokerAdapter,
@@ -57,6 +58,8 @@ class MT5Config:
     deviation: int = 10
     comment: str = "kate"
     poll_interval_seconds: float = 0.25
+    market_data_stale_seconds: float = 15.0
+    market_data_metrics_seconds: float = 30.0
     # Per Gemini's resilience directive 2026-05-15: if MT5
     # terminal_info().connected has been False for longer than this
     # threshold, push a P0 Telegram alert so silent disconnects can't
@@ -81,6 +84,8 @@ class MT5Config:
             deviation=int(os.getenv("MT5_DEVIATION", "10")),
             comment=os.getenv("MT5_COMMENT", "kate"),
             poll_interval_seconds=float(os.getenv("MT5_POLL_INTERVAL_SECONDS", "0.25")),
+            market_data_stale_seconds=float(os.getenv("MT5_MARKET_DATA_STALE_SECONDS", "15.0")),
+            market_data_metrics_seconds=float(os.getenv("MT5_MARKET_DATA_METRICS_SECONDS", "30.0")),
             heartbeat_disconnect_alert_seconds=float(
                 os.getenv("MT5_HEARTBEAT_DISCONNECT_ALERT_SECONDS", "300.0")
             ),
@@ -148,8 +153,8 @@ class MT5BrokerAdapter(BrokerAdapter):
         # unit tests). Until that lands, count per-symbol poll outcomes
         # so we can SEE which silent-failure mode is active when the
         # engine starves of ticks despite a spinning poll loop.
-        self._poll_diag: dict[str, dict[str, int]] = {}
-        self._last_diag_log_at: float = 0.0
+        self._market_data_diag: dict[str, dict[str, Any]] = {}
+        self._last_market_data_metrics_at: float = 0.0
 
     async def connect(self) -> None:
         if self._connected:
@@ -382,6 +387,78 @@ class MT5BrokerAdapter(BrokerAdapter):
             tick=event_tick,
         ))
 
+    async def get_recent_candles(
+        self,
+        *,
+        symbol: str,
+        count: int,
+        timeframe_minutes: int = 1,
+    ) -> tuple[Candle, ...]:
+        """Return the most recent N completed M1/M5/M15 bars from MT5.
+
+        Uses `copy_rates_from_pos` to seed the engine's strategy history
+        on startup so strategies with large `history_window` (e.g. FX
+        London Breakout: 480 bars / 8h) can evaluate from minute 1 after
+        a supervisor restart instead of waiting 8h for live aggregation.
+
+        Bar timestamps are returned in the broker's server timezone
+        (same offset as ticks). We apply the same
+        `_mt5_server_offset_seconds` correction so the engine receives
+        real-UTC timestamps consistent with live tick aggregation.
+        """
+        self._require_connected()
+        if count <= 0:
+            return ()
+        mt5 = self._ensure_runtime()
+        spec = self._spec(symbol)
+        tf_map = {
+            1: getattr(mt5, "TIMEFRAME_M1", 1),
+            5: getattr(mt5, "TIMEFRAME_M5", 5),
+            15: getattr(mt5, "TIMEFRAME_M15", 15),
+            30: getattr(mt5, "TIMEFRAME_M30", 30),
+            60: getattr(mt5, "TIMEFRAME_H1", 16385),
+        }
+        tf = tf_map.get(timeframe_minutes)
+        if tf is None:
+            raise BrokerError(
+                f"MT5 get_recent_candles: unsupported timeframe_minutes={timeframe_minutes}"
+            )
+        bars = await asyncio.to_thread(
+            mt5.copy_rates_from_pos, spec.broker_symbol, tf, 0, count,
+        )
+        if bars is None or len(bars) == 0:
+            logger.warning(
+                "MT5 get_recent_candles: copy_rates_from_pos returned empty for %s (broker=%s, count=%d, tf=%dm) — %s",
+                spec.logical_symbol, spec.broker_symbol, count, timeframe_minutes,
+                self._last_error(),
+            )
+            return ()
+        candles: list[Candle] = []
+        for b in bars:
+            # b is a numpy structured record from MT5; fields:
+            # time (epoch seconds in server tz), open, high, low, close,
+            # tick_volume, spread, real_volume. Apply the same TZ offset
+            # we detect for the tick path so candle timestamps are real UTC.
+            raw_epoch = float(b["time"])
+            corrected_epoch = raw_epoch - self._mt5_server_offset_seconds
+            ts = dt.datetime.utcfromtimestamp(corrected_epoch)
+            candles.append(Candle(
+                timestamp=ts,
+                open=float(b["open"]),
+                high=float(b["high"]),
+                low=float(b["low"]),
+                close=float(b["close"]),
+                volume=int(b["tick_volume"]),
+            ))
+        logger.info(
+            "MT5 get_recent_candles: returned %d bars for %s (timeframe=%dm, "
+            "first_ts=%s, last_ts=%s)",
+            len(candles), spec.logical_symbol, timeframe_minutes,
+            candles[0].timestamp.isoformat() if candles else "n/a",
+            candles[-1].timestamp.isoformat() if candles else "n/a",
+        )
+        return tuple(candles)
+
     async def request_account_state(
         self,
         *,
@@ -555,41 +632,104 @@ class MT5BrokerAdapter(BrokerAdapter):
 
         for logical_symbol in tuple(self._subscribed_symbols):
             spec = self._spec(logical_symbol)
-            diag = self._poll_diag.setdefault(
-                logical_symbol,
-                {"polled": 0, "none": 0, "unchanged": 0, "emitted": 0},
-            )
-            diag["polled"] += 1
+            diag = self._ensure_market_data_diag(logical_symbol)
+            diag["last_poll_at"] = time.time()
+            diag["poll_count"] += 1
             tick = await asyncio.to_thread(mt5.symbol_info_tick, spec.broker_symbol)
             if tick is None:
-                diag["none"] += 1
+                diag["none_count"] += 1
+                await self._check_market_data_stale(logical_symbol, "no tick returned")
                 continue
             tick_hash = self._tick_hash(tick)
             if tick_hash == self._last_tick_hashes.get(logical_symbol):
-                diag["unchanged"] += 1
+                diag["unchanged_count"] += 1
+                await self._check_market_data_stale(logical_symbol, "tick unchanged")
                 continue
             self._last_tick_hashes[logical_symbol] = tick_hash
-            diag["emitted"] += 1
+            self._record_market_data_emit(logical_symbol, tick)
             await self._events_q.put(BrokerEvent(
                 kind=BrokerEventKind.MARKET_DATA_TICK,
                 received_at=time.time(),
                 tick=self._tick_to_event(logical_symbol, tick),
             ))
 
-        # TEMP — log per-symbol poll diagnostics every 30s. Replace
-        # with Codex's MARKET_DATA_STALE + per-symbol metrics emission
-        # once his HARD-OBJECTION patch lands.
-        now = time.time()
-        if now - self._last_diag_log_at >= 30.0 and self._poll_diag:
-            self._last_diag_log_at = now
-            for sym, c in self._poll_diag.items():
-                logger.info(
-                    "DIAG mt5 poll[%s]: polled=%d none=%d unchanged=%d emitted=%d subscribed=%d",
-                    sym, c["polled"], c["none"], c["unchanged"], c["emitted"],
-                    len(self._subscribed_symbols),
-                )
+        self._log_market_data_metrics()
 
         await self._check_heartbeat_and_alert()
+
+    def _ensure_market_data_diag(self, logical_symbol: str) -> dict[str, Any]:
+        now = time.time()
+        return self._market_data_diag.setdefault(
+            logical_symbol,
+            {
+                "last_poll_at": 0.0,
+                "last_non_none_tick_at": 0.0,
+                "last_emitted_at": 0.0,
+                "last_tick_hash": None,
+                "poll_count": 0,
+                "none_count": 0,
+                "unchanged_count": 0,
+                "emitted_count": 0,
+                "stale_alerted": False,
+                "subscribed_at": now,
+            },
+        )
+
+    def _record_market_data_emit(self, logical_symbol: str, tick: Any) -> None:
+        diag = self._ensure_market_data_diag(logical_symbol)
+        now = time.time()
+        diag["last_non_none_tick_at"] = now
+        diag["last_emitted_at"] = now
+        diag["last_tick_hash"] = self._tick_hash(tick)
+        self._last_tick_hashes[logical_symbol] = diag["last_tick_hash"]
+        diag["emitted_count"] += 1
+        diag["stale_alerted"] = False
+
+    async def _check_market_data_stale(self, logical_symbol: str, reason: str) -> None:
+        diag = self._ensure_market_data_diag(logical_symbol)
+        now = time.time()
+        last_emitted_at = float(diag.get("last_emitted_at") or diag.get("subscribed_at") or now)
+        stale_for = now - last_emitted_at
+        if stale_for < self.config.market_data_stale_seconds or diag.get("stale_alerted"):
+            return
+
+        message = (
+            f"MT5 market data stale for {logical_symbol}: no emitted tick for "
+            f"{stale_for:.1f}s ({reason}); polls={diag['poll_count']} "
+            f"none={diag['none_count']} unchanged={diag['unchanged_count']} "
+            f"emitted={diag['emitted_count']}"
+        )
+        logger.error(message)
+        diag["stale_alerted"] = True
+        await self._events_q.put(BrokerEvent(
+            kind=BrokerEventKind.ERROR,
+            received_at=now,
+            error_message=message,
+        ))
+
+    def _log_market_data_metrics(self) -> None:
+        now = time.time()
+        if (
+            not self._market_data_diag
+            or now - self._last_market_data_metrics_at < self.config.market_data_metrics_seconds
+        ):
+            return
+        self._last_market_data_metrics_at = now
+        for sym, c in self._market_data_diag.items():
+            logger.info(
+                "MT5 market data metrics[%s]: last_poll_age=%.1fs "
+                "last_non_none_age=%.1fs last_emit_age=%.1fs polls=%d "
+                "none=%d unchanged=%d emitted=%d subscribed=%d",
+                sym,
+                now - float(c.get("last_poll_at") or now),
+                now - float(c.get("last_non_none_tick_at") or now),
+                now - float(c.get("last_emitted_at") or now),
+                c["poll_count"],
+                c["none_count"],
+                c["unchanged_count"],
+                c["emitted_count"],
+                len(self._subscribed_symbols),
+            )
 
     async def _check_heartbeat_and_alert(self) -> None:
         """Track terminal connection state, page operator on prolonged outage.
