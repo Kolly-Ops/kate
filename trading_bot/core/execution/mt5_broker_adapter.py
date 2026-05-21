@@ -142,6 +142,14 @@ class MT5BrokerAdapter(BrokerAdapter):
         # a tick and comparing to real wall clock — see
         # `_detect_server_offset`.
         self._mt5_server_offset_seconds: float = 0.0
+        # TEMP diagnostic counters — bridge measure pending Codex's full
+        # observability hardening per his 2026-05-20 HARD-OBJECTION
+        # (5-item patch: stale-tick events, ERROR emission, metrics,
+        # unit tests). Until that lands, count per-symbol poll outcomes
+        # so we can SEE which silent-failure mode is active when the
+        # engine starves of ticks despite a spinning poll loop.
+        self._poll_diag: dict[str, dict[str, int]] = {}
+        self._last_diag_log_at: float = 0.0
 
     async def connect(self) -> None:
         if self._connected:
@@ -356,6 +364,17 @@ class MT5BrokerAdapter(BrokerAdapter):
         tick = await asyncio.to_thread(mt5.symbol_info_tick, spec.broker_symbol)
         if tick is None:
             raise BrokerError(f"MT5 symbol_info_tick returned no data for {spec.broker_symbol}")
+        # TEMP — log subscription evidence at INFO so we can confirm seed
+        # tick + per-pair subscription succeeded. Codex's patch will
+        # replace with structured event emission.
+        logger.info(
+            "MT5 subscribe_market_data: logical=%s broker=%s seed_bid=%s seed_ask=%s "
+            "seed_time_msc=%s subscribed_count=%d",
+            spec.logical_symbol, spec.broker_symbol,
+            _field(tick, "bid", None), _field(tick, "ask", None),
+            _field(tick, "time_msc", None),
+            len(self._subscribed_symbols),
+        )
         event_tick = self._tick_to_event(spec.logical_symbol, tick)
         await self._events_q.put(BrokerEvent(
             kind=BrokerEventKind.MARKET_DATA_TICK,
@@ -536,18 +555,39 @@ class MT5BrokerAdapter(BrokerAdapter):
 
         for logical_symbol in tuple(self._subscribed_symbols):
             spec = self._spec(logical_symbol)
+            diag = self._poll_diag.setdefault(
+                logical_symbol,
+                {"polled": 0, "none": 0, "unchanged": 0, "emitted": 0},
+            )
+            diag["polled"] += 1
             tick = await asyncio.to_thread(mt5.symbol_info_tick, spec.broker_symbol)
             if tick is None:
+                diag["none"] += 1
                 continue
             tick_hash = self._tick_hash(tick)
             if tick_hash == self._last_tick_hashes.get(logical_symbol):
+                diag["unchanged"] += 1
                 continue
             self._last_tick_hashes[logical_symbol] = tick_hash
+            diag["emitted"] += 1
             await self._events_q.put(BrokerEvent(
                 kind=BrokerEventKind.MARKET_DATA_TICK,
                 received_at=time.time(),
                 tick=self._tick_to_event(logical_symbol, tick),
             ))
+
+        # TEMP — log per-symbol poll diagnostics every 30s. Replace
+        # with Codex's MARKET_DATA_STALE + per-symbol metrics emission
+        # once his HARD-OBJECTION patch lands.
+        now = time.time()
+        if now - self._last_diag_log_at >= 30.0 and self._poll_diag:
+            self._last_diag_log_at = now
+            for sym, c in self._poll_diag.items():
+                logger.info(
+                    "DIAG mt5 poll[%s]: polled=%d none=%d unchanged=%d emitted=%d subscribed=%d",
+                    sym, c["polled"], c["none"], c["unchanged"], c["emitted"],
+                    len(self._subscribed_symbols),
+                )
 
         await self._check_heartbeat_and_alert()
 
