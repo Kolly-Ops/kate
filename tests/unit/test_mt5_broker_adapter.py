@@ -121,8 +121,10 @@ class _FakeMT5:
         # so the adapter's iteration works on real numpy records OR
         # dicts in test fixtures.
         self.rates: list[dict] = []
+        self.copy_rates_calls = []
 
     def copy_rates_from_pos(self, symbol, timeframe, start_pos, count):
+        self.copy_rates_calls.append((symbol, timeframe, start_pos, count))
         if not self.rates:
             return None
         return self.rates[start_pos: start_pos + count]
@@ -518,9 +520,18 @@ def test_get_recent_candles_returns_bars_with_tz_corrected_timestamps():
             time=now + 3 * 3600,
             time_msc=(now + 3 * 3600) * 1000,
         )
-        # Build 5 fake M1 bars at server epochs running back from "now"
-        # by one minute increments. Real-UTC timestamps after correction
-        # should be the original epochs minus 3 hours.
+        # MT5 position 0 is the active, still-forming bar. Backfill must
+        # start at position 1 so the strategy history receives only
+        # completed candles. The completed bars are intentionally newest
+        # first to assert the adapter returns chronological history.
+        current_bar = {
+            "time": now + 3 * 3600,
+            "open": 9.9900,
+            "high": 9.9900,
+            "low": 9.9900,
+            "close": 9.9900,
+            "tick_volume": 999,
+        }
         runtime.rates = [
             {
                 "time": (now - i * 60) + 3 * 3600,
@@ -530,8 +541,10 @@ def test_get_recent_candles_returns_bars_with_tz_corrected_timestamps():
                 "close": 1.3405 + i * 0.0001,
                 "tick_volume": 100 + i,
             }
-            for i in range(4, -1, -1)  # oldest first
+            for i in range(0, 5)  # newest completed first
         ]
+        completed_bars_oldest_first = sorted(runtime.rates, key=lambda row: row["time"])
+        runtime.rates = [current_bar] + runtime.rates
 
         adapter = _adapter(runtime)
         await adapter.connect()
@@ -541,9 +554,10 @@ def test_get_recent_candles_returns_bars_with_tz_corrected_timestamps():
         )
 
         assert len(candles) == 5, "should return all 5 backfilled bars"
+        assert runtime.copy_rates_calls[-1] == ("GBPUSD", runtime.TIMEFRAME_M1, 1, 5)
         # Each candle's timestamp must be 3h behind the raw server epoch
         # (the offset detector rounds to +3h, so we subtract 3h exactly).
-        for c, raw in zip(candles, runtime.rates):
+        for c, raw in zip(candles, completed_bars_oldest_first):
             expected_utc = dt.datetime.utcfromtimestamp(raw["time"] - 3 * 3600)
             assert c.timestamp == expected_utc, (
                 f"timestamp mismatch: got {c.timestamp}, expected {expected_utc} "
@@ -554,6 +568,7 @@ def test_get_recent_candles_returns_bars_with_tz_corrected_timestamps():
             assert c.low == raw["low"]
             assert c.close == raw["close"]
             assert c.volume == raw["tick_volume"]
+        assert all(c.open != current_bar["open"] for c in candles)
 
         await adapter.disconnect()
 

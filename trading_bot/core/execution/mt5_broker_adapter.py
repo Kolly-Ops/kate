@@ -424,7 +424,7 @@ class MT5BrokerAdapter(BrokerAdapter):
                 f"MT5 get_recent_candles: unsupported timeframe_minutes={timeframe_minutes}"
             )
         bars = await asyncio.to_thread(
-            mt5.copy_rates_from_pos, spec.broker_symbol, tf, 0, count,
+            mt5.copy_rates_from_pos, spec.broker_symbol, tf, 1, count,
         )
         if bars is None or len(bars) == 0:
             logger.warning(
@@ -435,21 +435,25 @@ class MT5BrokerAdapter(BrokerAdapter):
             return ()
         candles: list[Candle] = []
         for b in bars:
+            # MT5 position 0 is the active, still-forming bar. We start
+            # from position 1 above so strategy history contains only
+            # completed candles.
             # b is a numpy structured record from MT5; fields:
             # time (epoch seconds in server tz), open, high, low, close,
             # tick_volume, spread, real_volume. Apply the same TZ offset
             # we detect for the tick path so candle timestamps are real UTC.
-            raw_epoch = float(b["time"])
+            raw_epoch = float(_field(b, "time", 0.0) or 0.0)
             corrected_epoch = raw_epoch - self._mt5_server_offset_seconds
             ts = dt.datetime.utcfromtimestamp(corrected_epoch)
             candles.append(Candle(
                 timestamp=ts,
-                open=float(b["open"]),
-                high=float(b["high"]),
-                low=float(b["low"]),
-                close=float(b["close"]),
-                volume=int(b["tick_volume"]),
+                open=float(_field(b, "open", 0.0) or 0.0),
+                high=float(_field(b, "high", 0.0) or 0.0),
+                low=float(_field(b, "low", 0.0) or 0.0),
+                close=float(_field(b, "close", 0.0) or 0.0),
+                volume=int(_field(b, "tick_volume", 0) or 0),
             ))
+        candles.sort(key=lambda candle: candle.timestamp)
         logger.info(
             "MT5 get_recent_candles: returned %d bars for %s (timeframe=%dm, "
             "first_ts=%s, last_ts=%s)",
