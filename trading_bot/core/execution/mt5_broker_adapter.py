@@ -155,6 +155,12 @@ class MT5BrokerAdapter(BrokerAdapter):
         # engine starves of ticks despite a spinning poll loop.
         self._market_data_diag: dict[str, dict[str, Any]] = {}
         self._last_market_data_metrics_at: float = 0.0
+        # Per-ticket snapshot of currently-open broker positions. Used by
+        # _poll_once to detect closures (SL/TP fills) so we can Telegram
+        # alert with P&L from history_deals_get. Without this, an empty
+        # positions_get response silently no-op'd the position-change
+        # branch and the engine never learned a trade resolved.
+        self._known_position_tickets: dict[int, dict[str, Any]] = {}
 
     async def connect(self) -> None:
         if self._connected:
@@ -300,13 +306,15 @@ class MT5BrokerAdapter(BrokerAdapter):
             raise BrokerError(f"MT5 order_send rejected: retcode={retcode} {reason}")
 
         server_order_id = str(_field(result, "order", "") or _field(result, "deal", "") or "")
+        fill_price = float(_field(result, "price", 0.0) or 0.0) or None
+        fill_quantity = float(_field(result, "volume", quantity) or quantity)
         order_event = OrderEvent(
             client_order_id=client_order_id,
             symbol=symbol,
             side=side,
             quantity=quantity,
-            fill_price=float(_field(result, "price", 0.0) or 0.0) or None,
-            fill_quantity=float(_field(result, "volume", quantity) or quantity),
+            fill_price=fill_price,
+            fill_quantity=fill_quantity,
             server_order_id=server_order_id or None,
         )
         await self._events_q.put(BrokerEvent(
@@ -314,6 +322,19 @@ class MT5BrokerAdapter(BrokerAdapter):
             received_at=time.time(),
             order=order_event,
         ))
+        # Telegram alert on successful order entry. CEO trust depends on
+        # being able to see fills land without scraping logs. Per the
+        # 2026-05-21 EURGBP TP outcome where the CEO had to manually
+        # check MT5 to confirm the trade closed — that gap closes here.
+        side_label = "BUY" if side == proto.BUY else "SELL" if side == proto.SELL else f"side={side}"
+        sl_str = f" SL={stop_price:.5f}" if stop_price else ""
+        tp_str = f" TP={target_price:.5f}" if target_price else ""
+        push_telegram_alert(
+            f"🟢 *Kate ORDER FILLED* — {symbol} {side_label}\n"
+            f"  qty={quantity} fill={fill_price or 0:.5f}{sl_str}{tp_str}\n"
+            f"  coid={client_order_id}\n"
+            f"  ticket={server_order_id}",
+        )
         return client_order_id
 
     async def cancel_order(
@@ -629,12 +650,32 @@ class MT5BrokerAdapter(BrokerAdapter):
         positions_hash = self._positions_hash(positions or ())
         if positions_hash != self._last_positions_hash:
             self._last_positions_hash = positions_hash
+            # Track per-ticket position state so we can detect closures
+            # (broker filled SL or TP and the position is now gone).
+            # Previously the empty-positions branch silently no-op'd,
+            # leaving the engine + Telegram alerts with no signal that a
+            # trade had resolved. Live evidence 2026-05-21 EURGBP TP fill
+            # produced no engine-side log; only the broker UI knew.
+            current_tickets: dict[int, dict[str, Any]] = {}
             for row in positions or ():
+                ticket = int(_field(row, "ticket", 0) or 0)
+                current_tickets[ticket] = {
+                    "symbol": _field(row, "symbol", ""),
+                    "volume": float(_field(row, "volume", 0.0) or 0.0),
+                    "type": int(_field(row, "type", 0) or 0),
+                    "price_open": float(_field(row, "price_open", 0.0) or 0.0),
+                    "profit": float(_field(row, "profit", 0.0) or 0.0),
+                }
                 await self._events_q.put(BrokerEvent(
                     kind=BrokerEventKind.POSITION_UPDATE,
                     received_at=time.time(),
                     position=self._position_to_event(row),
                 ))
+            closed_tickets = set(self._known_position_tickets.keys()) - set(current_tickets.keys())
+            for closed_ticket in closed_tickets:
+                prev = self._known_position_tickets[closed_ticket]
+                await self._alert_position_closed(closed_ticket, prev)
+            self._known_position_tickets = current_tickets
 
         orders = await asyncio.to_thread(mt5.orders_get)
         orders_hash = self._orders_hash(orders or ())
@@ -903,6 +944,77 @@ class MT5BrokerAdapter(BrokerAdapter):
             getattr(mt5, "ORDER_TYPE_BUY_STOP_LIMIT", -1),
         }
         return proto.BUY if order_type in buy_types else proto.SELL
+
+    async def _alert_position_closed(
+        self,
+        ticket: int,
+        prev_snapshot: dict[str, Any],
+    ) -> None:
+        """Push a Telegram alert announcing a broker-side position close.
+
+        Called from _poll_once when a previously-tracked ticket
+        disappears from positions_get — the broker has filled either
+        the SL or the TP bracket. We query history_deals_get to pull
+        the closing deal's profit so the alert carries P&L.
+
+        Failures here must not break the poll loop — this is
+        observability, not a trade-correctness path. Telegram alert
+        failures already log a warning inside push_telegram_alert.
+        """
+        try:
+            mt5 = self._ensure_runtime()
+            deals = await asyncio.to_thread(mt5.history_deals_get, position=ticket)
+            close_price = 0.0
+            profit = float(prev_snapshot.get("profit", 0.0) or 0.0)
+            close_reason = "CLOSED"
+            if deals:
+                # The closing deal (entry=DEAL_ENTRY_OUT or last deal in
+                # the position lifecycle) carries the realized profit.
+                # Different MT5 brokers differ on field availability so
+                # we accumulate profit defensively across deals tagged
+                # to this position.
+                total_profit = 0.0
+                latest_price = 0.0
+                latest_time = 0
+                for d in deals:
+                    d_profit = float(_field(d, "profit", 0.0) or 0.0)
+                    d_swap = float(_field(d, "swap", 0.0) or 0.0)
+                    d_commission = float(_field(d, "commission", 0.0) or 0.0)
+                    total_profit += d_profit + d_swap + d_commission
+                    d_time = int(_field(d, "time", 0) or 0)
+                    if d_time > latest_time:
+                        latest_time = d_time
+                        latest_price = float(_field(d, "price", 0.0) or 0.0)
+                if total_profit != 0.0:
+                    profit = total_profit
+                if latest_price > 0:
+                    close_price = latest_price
+            # Infer SL vs TP vs other from sign + which bracket was nearer
+            sym = prev_snapshot.get("symbol", "")
+            entry = float(prev_snapshot.get("price_open", 0.0) or 0.0)
+            if profit > 0:
+                close_reason = "TP HIT"
+                emoji = "✅"
+            elif profit < 0:
+                close_reason = "SL HIT"
+                emoji = "⛔"
+            else:
+                close_reason = "CLOSED (flat)"
+                emoji = "ℹ️"
+            push_telegram_alert(
+                f"{emoji} *Kate POSITION CLOSED* — {sym} {close_reason}\n"
+                f"  entry={entry:.5f} close={close_price:.5f}\n"
+                f"  realized P&L = £{profit:.2f}\n"
+                f"  ticket={ticket}",
+            )
+            logger.info(
+                "MT5 position closed: ticket=%d symbol=%s entry=%.5f close=%.5f profit=%.2f reason=%s",
+                ticket, sym, entry, close_price, profit, close_reason,
+            )
+        except Exception:
+            logger.exception(
+                "MT5 _alert_position_closed failed for ticket=%d — continuing", ticket,
+            )
 
     async def _detect_server_offset(self) -> float:
         """Detect MT5 server timezone offset from real UTC, in seconds.

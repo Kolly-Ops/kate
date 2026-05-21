@@ -1,9 +1,9 @@
 {
-  "_comment": "CEO-ratified risk policy. Source: decisions/2026-04-25-trading-policies-ml-and-capital.md (Omni). Edit only via proposal.",
-  "starting_nlv": 1080.0,
-  "nlv_floor": 300.0,
+  "_comment": "CEO-ratified risk policy. Source: decisions/2026-04-25-trading-policies-ml-and-capital.md (Omni). Edit only via proposal. Updated 2026-05-21 per omni/proposals/2026-05-21-claude-risk-policy-1pct-and-demo-top-up.md (CEO authorized in conversation post first-trade-fired milestone).",
+  "starting_nlv": 4998.0,
+  "nlv_floor": 1500.0,
   "kill_switch_drawdown_pct": 0.30,
-  "max_risk_per_trade_pct_nlv": 0.025,
+  "max_risk_per_trade_pct_nlv": 0.01,
   "max_margin_utilization_pct": 0.40,
   "max_open_positions": 1,
   "require_stop_loss": true
