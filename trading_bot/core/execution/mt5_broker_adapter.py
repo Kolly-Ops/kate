@@ -550,19 +550,23 @@ class MT5BrokerAdapter(BrokerAdapter):
         mt5 = self._ensure_runtime()
         symbol = spec.broker_symbol
         mapped_type = self._map_order_type(side=side, order_type=order_type)
-        # MT5 IC Markets rejects comments with `-` (hyphen) and most
-        # non-alphanumerics with retcode (-2, 'Invalid "comment" argument').
-        # Observed live 2026-05-21 08:07 BST on the first real strategy fire
-        # (fxlon-EURGBP-2605210806). Sanitize aggressively: keep only
-        # [a-zA-Z0-9_], replace everything else with underscore, trim 31.
-        import re as _re
-        clean_comment = _re.sub(r"[^a-zA-Z0-9_]", "_", comment or "")[:31]
+        # MT5 IC Markets rejects dynamic per-order comments (even ASCII
+        # alphanumeric+underscore) with retcode (-2, 'Invalid "comment"
+        # argument'). Observed live 2026-05-21 08:07 + 08:11 BST on two
+        # consecutive strategy fires after the backfill stack landed.
+        # The Python API does some pre-validation we don't fully
+        # understand — but the static `config.comment` (set via
+        # MT5_COMMENT env, default "kate") is consistently accepted.
+        # The MT5 `magic` number is the broker-side identifier we use
+        # to claim orders as ours; coid lives in the engine's StateStore
+        # for our own bookkeeping, so we don't actually need it in MT5's
+        # comment field.
         request: dict[str, Any] = {
             "symbol": symbol,
             "volume": float(quantity),
             "type": mapped_type,
             "magic": self.config.magic,
-            "comment": clean_comment,
+            "comment": (self.config.comment or "kate")[:31],
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": getattr(mt5, "ORDER_FILLING_IOC", getattr(mt5, "ORDER_FILLING_RETURN", 0)),
             "deviation": self.config.deviation,
