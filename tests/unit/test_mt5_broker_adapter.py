@@ -17,6 +17,27 @@ from trading_bot.core.execution.broker_adapter import (
 from trading_bot.core.execution.mt5_broker_adapter import MT5BrokerAdapter, MT5Config
 
 
+@pytest.fixture(autouse=True)
+def _block_real_telegram_alerts(monkeypatch):
+    """Replace push_telegram_alert with a no-op for every adapter test.
+
+    Without this guard, the unit tests trigger real Telegram alerts on
+    any workstation that has a valid `secrets.json` (the adapter's
+    submit_order path calls push_telegram_alert on success). Live
+    evidence 2026-05-21 14:12-14:13 BST: a single pytest run pushed
+    `🟢 Kate ORDER FILLED — GBPUSD BUY qty=1.0 fill=1.25020 coid=orb-1
+    ticket=123` and the matching SELL/stop-1 ticket=123 to the CEO's
+    Telegram. Fixture data leaked to production alert channel because
+    push_telegram_alert wasn't mocked.
+
+    Autouse so every test in this module is protected.
+    """
+    monkeypatch.setattr(
+        "trading_bot.core.execution.mt5_broker_adapter.push_telegram_alert",
+        lambda *args, **kwargs: True,
+    )
+
+
 @dataclass
 class _AccountInfo:
     balance: float = 1000.0
