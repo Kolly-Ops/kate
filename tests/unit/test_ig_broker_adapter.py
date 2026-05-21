@@ -373,7 +373,7 @@ def test_request_positions_translates_direction_to_signed_qty():
         positions = await adapter.request_positions(trade_account="Z6BHQ1")
         assert len(positions) == 1
         assert positions[0].symbol == "GBPUSD"
-        assert positions[0].quantity == -5.0  # SELL → negative
+        assert positions[0].quantity == -0.5  # SELL → negative; IG size normalized to lots
         assert positions[0].avg_price == 1.34000
         assert positions[0].side == proto.SELL
         if adapter._poll_task is not None:
@@ -425,7 +425,7 @@ def test_request_positions_skips_unknown_epics():
 
 # ── submit_order tests ──────────────────────────────────────────────────
 
-def test_submit_market_buy_sends_correct_payload_and_emits_ack():
+def test_submit_market_buy_sends_correct_payload_and_emits_fill():
     async def _impl():
         http = _FakeHttpSession()
         http.scripted = [
@@ -479,15 +479,17 @@ def test_submit_market_buy_sends_correct_payload_and_emits_ack():
         # dealReference sanitization: hyphens preserved, length <= 30
         assert "fxlon" in body["dealReference"]
         assert len(body["dealReference"]) <= 30
-        # ORDER_ACK emitted
+        # ORDER_FILLED emitted in Kate's normalized units, while the
+        # broker payload carries IG's GBP/point size.
         events = []
         while not adapter._events_q.empty():
             events.append(await adapter._events_q.get())
         kinds = [e.kind for e in events]
-        assert BrokerEventKind.ORDER_ACK in kinds
-        ack = next(e for e in events if e.kind == BrokerEventKind.ORDER_ACK)
-        assert ack.order.fill_price == 1.34050
-        assert ack.order.server_order_id == "DEAL-001"
+        assert BrokerEventKind.ORDER_FILLED in kinds
+        fill = next(e for e in events if e.kind == BrokerEventKind.ORDER_FILLED)
+        assert fill.order.fill_price == 1.34050
+        assert fill.order.fill_quantity == 0.5
+        assert fill.order.server_order_id == "DEAL-001"
         if adapter._poll_task is not None:
             adapter._poll_task.cancel()
             try:
@@ -533,6 +535,7 @@ def test_submit_order_rejection_emits_event_and_raises():
                 side=proto.BUY,
                 quantity=99999.0,
                 order_type=proto.ORDER_TYPE_MARKET,
+                stop_price=1.33950,
             )
         assert "REJECTED" in str(exc.value)
         assert "INSUFFICIENT_FUNDS" in str(exc.value)
@@ -582,6 +585,7 @@ def test_submit_order_sanitizes_dealreference_invalid_chars():
             side=proto.SELL,
             quantity=0.1,
             order_type=proto.ORDER_TYPE_MARKET,
+            stop_price=1.34100,
         )
         otc_call = next(c for c in http.calls if c.method == "POST" and "/positions/otc" in c.url)
         deal_ref = otc_call.json_body["dealReference"]
@@ -590,6 +594,74 @@ def test_submit_order_sanitizes_dealreference_invalid_chars():
             assert bad not in deal_ref
         # Length cap respected
         assert len(deal_ref) <= 30
+        if adapter._poll_task is not None:
+            adapter._poll_task.cancel()
+            try:
+                await adapter._poll_task
+            except asyncio.CancelledError:
+                pass
+
+    _run(_impl())
+
+
+def test_submit_order_fails_closed_without_native_stop():
+    async def _impl():
+        http = _FakeHttpSession()
+        http.scripted = [
+            ("POST", "/session", _FakeResponse(
+                status_code=200,
+                _json_body={"currentAccountId": "Z6BHQ1", "accounts": []},
+                headers={"CST": "cst", "X-SECURITY-TOKEN": "sec"},
+                content=b'{}',
+            )),
+        ]
+        adapter = _adapter(http)
+        await adapter.connect()
+        with pytest.raises(BrokerError, match="requires stop_price"):
+            await adapter.submit_order(
+                client_order_id="fxlon-GBPUSD-no-stop",
+                symbol="GBPUSD",
+                exchange="IG",
+                side=proto.BUY,
+                quantity=0.5,
+                order_type=proto.ORDER_TYPE_MARKET,
+            )
+        assert not any("/positions/otc" in c.url for c in http.calls)
+        if adapter._poll_task is not None:
+            adapter._poll_task.cancel()
+            try:
+                await adapter._poll_task
+            except asyncio.CancelledError:
+                pass
+
+    _run(_impl())
+
+
+def test_submit_order_rejects_separate_bracket_legs():
+    async def _impl():
+        http = _FakeHttpSession()
+        http.scripted = [
+            ("POST", "/session", _FakeResponse(
+                status_code=200,
+                _json_body={"currentAccountId": "Z6BHQ1", "accounts": []},
+                headers={"CST": "cst", "X-SECURITY-TOKEN": "sec"},
+                content=b'{}',
+            )),
+        ]
+        adapter = _adapter(http)
+        await adapter.connect()
+        with pytest.raises(BrokerError, match="only MARKET entries"):
+            await adapter.submit_order(
+                client_order_id="fxlon-GBPUSD-stop",
+                symbol="GBPUSD",
+                exchange="IG",
+                side=proto.SELL,
+                quantity=0.5,
+                order_type=proto.ORDER_TYPE_STOP,
+                price=1.33950,
+                stop_price=1.33950,
+            )
+        assert not any("/positions/otc" in c.url for c in http.calls)
         if adapter._poll_task is not None:
             adapter._poll_task.cancel()
             try:

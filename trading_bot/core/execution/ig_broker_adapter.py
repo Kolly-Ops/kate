@@ -418,7 +418,8 @@ class IGBrokerAdapter(BrokerAdapter):
                 # Position on an instrument we're not subscribed to — skip
                 continue
             direction = (pos.get("direction") or "").upper()
-            qty = float(pos.get("size") or 0.0)
+            spec = self._spec(logical)
+            qty = float(pos.get("size") or 0.0) / spec.quantity_per_lot
             if direction == "SELL":
                 qty = -qty
             out.append(PositionEvent(
@@ -446,11 +447,12 @@ class IGBrokerAdapter(BrokerAdapter):
             ref = order.get("dealReference") or deal_id
             direction = (order.get("direction") or "").upper()
             side = proto.BUY if direction == "BUY" else proto.SELL
+            spec = self._spec(logical)
             out.append(OrderEvent(
                 client_order_id=str(ref),
                 symbol=logical,
                 side=side,
-                quantity=float(order.get("orderSize") or 0.0),
+                quantity=float(order.get("orderSize") or 0.0) / spec.quantity_per_lot,
                 server_order_id=str(deal_id),
             ))
         return tuple(out)
@@ -616,6 +618,17 @@ class IGBrokerAdapter(BrokerAdapter):
         self._require_connected()
         spec = self._spec(symbol)
         direction = "BUY" if side == proto.BUY else "SELL"
+        if order_type != proto.ORDER_TYPE_MARKET:
+            raise BrokerError(
+                "IG adapter supports only MARKET entries with native "
+                "stopLevel/limitLevel brackets; separate stop/limit exit legs "
+                "must not be routed through /positions/otc"
+            )
+        if stop_price is None or stop_price <= 0:
+            raise BrokerError(
+                "IG adapter requires stop_price on every MARKET entry so the "
+                "broker receives a native protective stop in the same request"
+            )
         # Convert MT5-style lot to IG spread-bet size
         size = float(quantity) * spec.quantity_per_lot
         # Sanitize dealReference: IG docs say [A-Za-z0-9_-]{1,30}
@@ -683,11 +696,11 @@ class IGBrokerAdapter(BrokerAdapter):
             side=side,
             quantity=quantity,
             fill_price=level or None,
-            fill_quantity=size,
+            fill_quantity=quantity,
             server_order_id=deal_id or None,
         )
         await self._events_q.put(BrokerEvent(
-            kind=BrokerEventKind.ORDER_ACK,
+            kind=BrokerEventKind.ORDER_FILLED,
             received_at=time.time(),
             order=order_event,
         ))
@@ -786,7 +799,8 @@ class IGBrokerAdapter(BrokerAdapter):
                     if not logical:
                         continue
                     direction = (pos.get("direction") or "").upper()
-                    qty = float(pos.get("size") or 0.0)
+                    spec = self._spec(logical)
+                    qty = float(pos.get("size") or 0.0) / spec.quantity_per_lot
                     if direction == "SELL":
                         qty = -qty
                     await self._events_q.put(BrokerEvent(
