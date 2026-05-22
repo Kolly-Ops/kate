@@ -255,3 +255,98 @@ def test_unknown_symbol_with_fail_loud_raises() -> None:
 
     with pytest.raises(ValueError, match="no min_stop_pips configured"):
         strategy.on_candle_close(audusd_ctx(history, symbol="ZARJPY"))
+
+
+# Codex 2026-05-22 A-prime cross-check follow-up: range clamp can reduce
+# the effective stop below the configured floor when the breakout candle
+# closes near a range boundary. Documenting the current behaviour
+# (intact clamp, no skip) per Codex's "leave behaviour intact and watch
+# the metadata" directive. If we later decide the floor should be
+# absolute, swap this test's assertions for a `assert intent is None`
+# behaviour and add the skip guard in the strategy.
+def narrow_gbpusd_asian_range(day: dt.date) -> list[Candle]:
+    """Asian range of 5.5 pips at GBPUSD-level prices (safely > 5.0-pip filter
+    despite floating-point precision). 1 GBPUSD pip = 0.0001."""
+    candles: list[Candle] = []
+    start = dt.datetime.combine(day, dt.time(0, 0), tzinfo=UK)
+    # Bar 0: high marker at 1.30055
+    candles.append(Candle(
+        timestamp=start, open=1.30025, high=1.30055, low=1.30025,
+        close=1.30030, volume=100,
+    ))
+    # Bar 1: low marker at 1.30000
+    candles.append(Candle(
+        timestamp=start + dt.timedelta(minutes=1), open=1.30025,
+        high=1.30030, low=1.30000, close=1.30025, volume=100,
+    ))
+    # Remaining bars: 1-pip TR centered at 1.30025 to keep ATR collapsed.
+    for minute in range(2, 7 * 60):
+        ts = start + dt.timedelta(minutes=minute)
+        candles.append(Candle(
+            timestamp=ts, open=1.30025, high=1.30030, low=1.30020,
+            close=1.30025, volume=100,
+        ))
+    return candles
+
+
+def gbpusd_tight_warmup_before(day: dt.date) -> list[Candle]:
+    start = dt.datetime.combine(day, dt.time(23, 30), tzinfo=UK) - dt.timedelta(days=1)
+    return [
+        Candle(
+            timestamp=start + dt.timedelta(minutes=i),
+            open=1.30025, high=1.30030, low=1.30020,
+            close=1.30025, volume=100,
+        )
+        for i in range(30)
+    ]
+
+
+def test_gbpusd_range_clamp_pulls_effective_stop_strictly_below_floor() -> None:
+    """The edge case Codex flagged on 2026-05-22 A-prime cross-check:
+    GBPUSD floor=6 pips, Asian range=5.5 pips. Breakout closes 0.4 pips
+    below range_low, so range_high is only 5.9 pips above close.
+    Pre-clamp stop wants to be 6 pips above close (the floor), but
+    range_high clamps at 5.9 pips. Effective stop ends up strictly
+    below the configured floor.
+
+    Current behaviour: clamp wins, trade fires with effective_stop_pips
+    less than min_stop_pips. This is the documented intact-clamp
+    behaviour per Codex's "leave behaviour intact and watch the
+    metadata" directive. If we later decide the floor must be absolute,
+    swap `assert intent is not None` for `assert intent is None` and
+    add the skip guard in fx_london_breakout.on_candle_close.
+    """
+    day = dt.date(2026, 5, 22)
+    breakout_ts = dt.datetime(2026, 5, 22, 7, 18, tzinfo=UK)
+    # Close 0.4 pips below range_low (1.30000) -> close = 1.29996
+    breakout = Candle(
+        timestamp=breakout_ts, open=1.30000, high=1.30000, low=1.29996,
+        close=1.29996, volume=100,
+    )
+    history = tuple(gbpusd_tight_warmup_before(day) + narrow_gbpusd_asian_range(day) + [breakout])
+    strategy = FXLondonBreakoutStrategy(
+        quantity=0.01, reward_risk=2.0, atr_period=14, atr_stop_multiplier=1.1,
+    )
+
+    intent = strategy.on_candle_close(StrategyContext(
+        symbol="GBPUSD",
+        exchange="ICMarketsSC-Demo",
+        candle=history[-1],
+        history=history,
+        tick_size=0.00001,
+        tick_value=1.0,
+        per_contract_margin=0.0,
+        has_open_position=False,
+    ))
+
+    assert intent is not None
+    assert intent.side == proto.SELL
+    # range_high = 1.30055. Pre-clamp stop = 1.29996 + 0.0006 = 1.30056.
+    # min(1.30055, 1.30056) = 1.30055. effective stop = 1.30055 - 1.29996
+    # = 0.00059 = 5.9 pips.
+    assert intent.stop_loss == pytest.approx(1.30055, abs=1e-5)
+    assert intent.metadata["min_stop_pips"] == "6.00"
+    assert intent.metadata["floor_binding"] == "true"
+    # The KEY assertion: effective_stop_pips is STRICTLY LESS than the configured floor.
+    assert float(intent.metadata["effective_stop_pips"]) < 6.0
+    assert float(intent.metadata["effective_stop_pips"]) == pytest.approx(5.9, abs=0.1)

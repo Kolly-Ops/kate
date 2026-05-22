@@ -210,15 +210,20 @@ def test_multiple_gates_fire_simultaneously(manager: RiskManager) -> None:
 
 # ── Policy I/O ─────────────────────────────────────────────────────────────
 def test_policy_loads_from_json() -> None:
+    """Asserts the canonical risk.json matches the CEO-ratified policy.
+
+    Last update: 2026-05-21 per omni/proposals/2026-05-21-claude-risk-policy-1pct-and-demo-top-up.md
+    (demo topped up to $4998 + per-trade risk tightened to 1.0%).
+    """
     config_path = (
         pathlib.Path(__file__).resolve().parents[2] / "config" / "risk.json"
     )
     assert config_path.is_file(), config_path
     policy = RiskPolicy.from_json(config_path)
-    assert policy.starting_nlv == 1080.0
-    assert policy.nlv_floor == 300.0
+    assert policy.starting_nlv == 4998.0
+    assert policy.nlv_floor == 1500.0
     assert policy.kill_switch_drawdown_pct == 0.30
-    assert policy.max_risk_per_trade_pct_nlv == 0.025
+    assert policy.max_risk_per_trade_pct_nlv == 0.01
     assert policy.max_margin_utilization_pct == 0.40
 
 

@@ -687,6 +687,10 @@ async def _run(args: argparse.Namespace) -> int:
         )
         candle_mgr = CandleManager(scid_dir=scid_dir, timeframe_minutes=args.timeframe_minutes)
         if args.strategy == "fx-london-breakout":
+            # fail_on_unknown_symbol=True under --trade-mode live per Codex
+            # 2026-05-22 A-prime cross-check: a guessed min-stop floor on
+            # an unknown symbol is acceptable for demo/paper but not for
+            # live capital. Demo/simulated route to the fallback + warning.
             strategy = FXLondonBreakoutStrategy(
                 quantity=args.fx_quantity,
                 reward_risk=args.fx_reward_risk,
@@ -694,6 +698,7 @@ async def _run(args: argparse.Namespace) -> int:
                 atr_stop_multiplier=args.atr_stop_mult,
                 min_range_pips=args.fx_min_range_pips,
                 max_range_pips=args.fx_max_range_pips,
+                fail_on_unknown_symbol=(args.trade_mode == "live"),
             )
         elif args.strategy == "orb":
             # Multi-session Opening Range Breakout. Sessions are hardcoded

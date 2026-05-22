@@ -188,3 +188,89 @@ def test_trade_mode_lookup_matches_dtc_protocol_constants() -> None:
     assert TRADE_MODE_LOOKUP["demo"] == proto.TRADE_MODE_DEMO
     assert TRADE_MODE_LOOKUP["simulated"] == proto.TRADE_MODE_SIMULATED
     assert TRADE_MODE_LOOKUP["live"] == proto.TRADE_MODE_LIVE
+
+
+# ── FX London Breakout — trade-mode wires fail_on_unknown_symbol ─────────
+def _write_risk_json(cfg_dir: Path) -> None:
+    """Minimal risk.json honouring the post-2026-05-21 schema."""
+    cfg_dir.mkdir(exist_ok=True)
+    (cfg_dir / "risk.json").write_text(json.dumps({
+        "starting_nlv": 4998.0, "nlv_floor": 1500.0,
+        "kill_switch_drawdown_pct": 0.30,
+        "max_risk_per_trade_pct_nlv": 0.01,
+        "max_margin_utilization_pct": 0.40,
+        "max_open_positions": 1, "require_stop_loss": True,
+    }))
+
+
+def test_fx_london_breakout_live_mode_wires_fail_on_unknown_symbol(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per Codex 2026-05-22 A-prime cross-check: when --trade-mode live,
+    supervisor must construct FXLondonBreakoutStrategy with
+    fail_on_unknown_symbol=True. Guessing a min-stop floor on an
+    unknown symbol is acceptable for demo only."""
+    _write_risk_json(tmp_path / "config")
+
+    captured: dict[str, object] = {}
+    from trading_bot.supervisor import main as supervisor_main
+
+    real_cls = supervisor_main.FXLondonBreakoutStrategy
+
+    def capturing_ctor(**kwargs):
+        captured.update(kwargs)
+        return real_cls(**kwargs)
+
+    monkeypatch.setattr(supervisor_main, "FXLondonBreakoutStrategy", capturing_ctor)
+
+    args = _parse_args([
+        "--db-path", str(tmp_path / "data" / "state.db"),
+        "--config-dir", str(tmp_path / "config"),
+        "--scid-dir", str(tmp_path),
+        "--symbols", "GBPUSD",
+        "--broker", "mt5",
+        "--strategy", "fx-london-breakout",
+        "--trade-mode", "live",
+        "--dry-run",
+        "--log-level", "WARNING",
+    ])
+    rc = asyncio.run(_run(args))
+    assert rc == 0
+    assert captured.get("fail_on_unknown_symbol") is True, (
+        f"live mode must wire fail_on_unknown_symbol=True; got {captured}"
+    )
+
+
+def test_fx_london_breakout_demo_mode_does_not_fail_loud(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Demo mode keeps fallback + warning behaviour — fail_on_unknown_symbol=False."""
+    _write_risk_json(tmp_path / "config")
+
+    captured: dict[str, object] = {}
+    from trading_bot.supervisor import main as supervisor_main
+
+    real_cls = supervisor_main.FXLondonBreakoutStrategy
+
+    def capturing_ctor(**kwargs):
+        captured.update(kwargs)
+        return real_cls(**kwargs)
+
+    monkeypatch.setattr(supervisor_main, "FXLondonBreakoutStrategy", capturing_ctor)
+
+    args = _parse_args([
+        "--db-path", str(tmp_path / "data" / "state.db"),
+        "--config-dir", str(tmp_path / "config"),
+        "--scid-dir", str(tmp_path),
+        "--symbols", "GBPUSD",
+        "--broker", "mt5",
+        "--strategy", "fx-london-breakout",
+        "--trade-mode", "demo",
+        "--dry-run",
+        "--log-level", "WARNING",
+    ])
+    rc = asyncio.run(_run(args))
+    assert rc == 0
+    assert captured.get("fail_on_unknown_symbol") is False, (
+        f"demo mode must keep fallback behaviour; got {captured}"
+    )
