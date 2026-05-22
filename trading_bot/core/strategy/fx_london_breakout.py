@@ -21,6 +21,19 @@ from .base import Strategy, StrategyContext
 from .indicators import atr
 
 
+# Per-symbol minimum stop distance in pips. Guards against the failure mode
+# observed on AUDUSD 2026-05-22: ATR(14) can collapse below tradable
+# microstructure width during quiet sessions, producing stops inside normal
+# noise. See decisions/2026-05-22-... (codex-approved A-prime).
+DEFAULT_MIN_STOP_PIPS_BY_SYMBOL: dict[str, float] = {
+    "GBPUSD": 6.0,
+    "EURUSD": 5.0,
+    "AUDUSD": 5.0,
+    "EURGBP": 4.0,
+}
+DEFAULT_MIN_STOP_PIPS_FALLBACK: float = 5.0
+
+
 @dataclass(frozen=True)
 class NewsEvent:
     """High-impact event timestamp that blocks entries around release time."""
@@ -43,6 +56,9 @@ class FXLondonBreakoutStrategy(Strategy):
         pip_size: float = 0.0001,
         min_range_pips: float = 5.0,
         max_range_pips: float = 120.0,
+        min_stop_pips_by_symbol: Optional[dict[str, float]] = None,
+        min_stop_pips_fallback: float = DEFAULT_MIN_STOP_PIPS_FALLBACK,
+        fail_on_unknown_symbol: bool = False,
         timezone: str = "Europe/London",
         news_events: Sequence[NewsEvent | dt.datetime] = (),
         news_buffer_minutes: int = 2,
@@ -63,6 +79,8 @@ class FXLondonBreakoutStrategy(Strategy):
             raise ValueError("max_range_pips must be > 0")
         if min_range_pips > max_range_pips:
             raise ValueError("min_range_pips must be <= max_range_pips")
+        if min_stop_pips_fallback < 0:
+            raise ValueError("min_stop_pips_fallback must be >= 0")
 
         self.quantity = quantity
         self.reward_risk = reward_risk
@@ -71,6 +89,13 @@ class FXLondonBreakoutStrategy(Strategy):
         self.pip_size = pip_size
         self.min_range_pips = min_range_pips
         self.max_range_pips = max_range_pips
+        self.min_stop_pips_by_symbol = (
+            dict(min_stop_pips_by_symbol)
+            if min_stop_pips_by_symbol is not None
+            else dict(DEFAULT_MIN_STOP_PIPS_BY_SYMBOL)
+        )
+        self.min_stop_pips_fallback = min_stop_pips_fallback
+        self.fail_on_unknown_symbol = fail_on_unknown_symbol
         self.timezone = ZoneInfo(timezone)
         self.news_events = tuple(news_events)
         self.news_buffer = dt.timedelta(minutes=news_buffer_minutes)
@@ -150,11 +175,24 @@ class FXLondonBreakoutStrategy(Strategy):
             logger.info("fxlon %s: skip — ATR%d <= 0", ctx.symbol, self.atr_period)
             return None
 
+        atr_stop_distance = current_atr * self.atr_stop_multiplier
+        atr_stop_pips = atr_stop_distance / self.pip_size
+        min_stop_pips = self._min_stop_pips_for(ctx.symbol)
+        min_stop_distance = min_stop_pips * self.pip_size
+        stop_distance = max(atr_stop_distance, min_stop_distance)
+        floor_binding = min_stop_distance > atr_stop_distance
+        if floor_binding:
+            logger.info(
+                "fxlon %s: min-stop floor binding — atr_stop=%.2f pips < min=%.2f pips; "
+                "stop_distance=%.2f pips",
+                ctx.symbol, atr_stop_pips, min_stop_pips, stop_distance / self.pip_size,
+            )
+
         side: int
         stop_loss: float
         if ctx.candle.close > range_high:
             side = proto.BUY
-            stop_loss = max(range_low, ctx.candle.close - (current_atr * self.atr_stop_multiplier))
+            stop_loss = max(range_low, ctx.candle.close - stop_distance)
             risk = ctx.candle.close - stop_loss
             take_profit = ctx.candle.close + (risk * self.reward_risk)
             logger.info(
@@ -163,7 +201,7 @@ class FXLondonBreakoutStrategy(Strategy):
             )
         elif ctx.candle.close < range_low:
             side = proto.SELL
-            stop_loss = min(range_high, ctx.candle.close + (current_atr * self.atr_stop_multiplier))
+            stop_loss = min(range_high, ctx.candle.close + stop_distance)
             risk = stop_loss - ctx.candle.close
             take_profit = ctx.candle.close - (risk * self.reward_risk)
             logger.info(
@@ -183,6 +221,7 @@ class FXLondonBreakoutStrategy(Strategy):
 
         self._traded_sessions.add(session_key)
         ymdhm = ts_uk.strftime("%y%m%d%H%M")
+        effective_stop_pips = abs(ctx.candle.close - stop_loss) / self.pip_size
         return TradeIntent(
             intent_id=f"fxlon-{ctx.symbol}-{ymdhm}"[:32],
             strategy_name=self.name,
@@ -208,9 +247,30 @@ class FXLondonBreakoutStrategy(Strategy):
                 "asian_range_high": f"{range_high:.5f}",
                 "asian_range_pips": f"{range_pips:.1f}",
                 "atr": f"{current_atr:.5f}",
+                "atr_stop_pips": f"{atr_stop_pips:.2f}",
+                "min_stop_pips": f"{min_stop_pips:.2f}",
+                "effective_stop_pips": f"{effective_stop_pips:.2f}",
+                "floor_binding": "true" if floor_binding else "false",
                 "timezone": str(self.timezone),
             },
         )
+
+    def _min_stop_pips_for(self, symbol: str) -> float:
+        if symbol in self.min_stop_pips_by_symbol:
+            return self.min_stop_pips_by_symbol[symbol]
+        if self.fail_on_unknown_symbol:
+            raise ValueError(
+                f"fx_london_breakout: no min_stop_pips configured for {symbol!r}; "
+                f"add it to min_stop_pips_by_symbol or set "
+                f"fail_on_unknown_symbol=False to use the fallback "
+                f"({self.min_stop_pips_fallback} pips)"
+            )
+        logger.warning(
+            "fxlon %s: no min_stop_pips configured — using fallback %.1f pips. "
+            "Configure min_stop_pips_by_symbol for production.",
+            symbol, self.min_stop_pips_fallback,
+        )
+        return self.min_stop_pips_fallback
 
     def _to_local(self, timestamp: dt.datetime) -> dt.datetime:
         if timestamp.tzinfo is None:
