@@ -274,3 +274,122 @@ def test_fx_london_breakout_demo_mode_does_not_fail_loud(
     assert captured.get("fail_on_unknown_symbol") is False, (
         f"demo mode must keep fallback behaviour; got {captured}"
     )
+
+
+# ── --broker ig wiring (Front 7 UK spread-bet) ───────────────────────────
+def _write_ig_secrets(secrets_path: Path) -> None:
+    """Minimal IG secrets stub for dry-run tests — never hits the wire."""
+    secrets_path.parent.mkdir(parents=True, exist_ok=True)
+    secrets_path.write_text(json.dumps({
+        "ig": {
+            "api_key": "test-api-key",
+            "username": "test-user",
+            "password": "test-password",
+            "active_account_id": "Z6BHQ1",
+        }
+    }))
+
+
+def test_broker_ig_dry_run_constructs_adapter_with_verified_symbol_map(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--broker ig builds an IGBrokerAdapter with the 4 verified FX-mini
+    epics (CS.D.*.MINI.IP) loaded from supervisor's hard-coded ig_specs.
+    Per Codex 2026-05-21 review pre-condition: no guessed epics ever
+    reach the wire; supervisor rejects unverified symbols loudly.
+    """
+    _write_risk_json(tmp_path / "config")
+    _write_ig_secrets(tmp_path / "secrets" / "secrets.json")
+    monkeypatch.setenv("KATE_SECRETS_PATH", str(tmp_path / "secrets" / "secrets.json"))
+
+    args = _parse_args([
+        "--db-path", str(tmp_path / "data" / "state.db"),
+        "--config-dir", str(tmp_path / "config"),
+        "--scid-dir", str(tmp_path),
+        "--symbols", "GBPUSD", "EURUSD", "AUDUSD", "EURGBP",
+        "--broker", "ig",
+        "--strategy", "fx-london-breakout",
+        "--trade-mode", "demo",
+        "--dry-run",
+        "--log-level", "WARNING",
+    ])
+    rc = asyncio.run(_run(args))
+    assert rc == 0
+
+
+def test_broker_ig_enables_native_brackets_and_broker_market_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex 2026-05-21 review HARD requirement:
+
+       Adapter is REST-only with native /positions/otc brackets,
+       so the engine MUST receive use_native_brackets=True and
+       use_broker_market_data=True. Otherwise the engine would
+       try to submit stop/target as separate legs (uncovered or
+       malformed exposure).
+
+    Verifies the supervisor passes both flags = True when --broker ig.
+    """
+    _write_risk_json(tmp_path / "config")
+    _write_ig_secrets(tmp_path / "secrets" / "secrets.json")
+    monkeypatch.setenv("KATE_SECRETS_PATH", str(tmp_path / "secrets" / "secrets.json"))
+
+    from trading_bot.supervisor import main as supervisor_main
+    from trading_bot.engines.managed_futures_engine import ManagedFuturesEngine
+
+    captured: dict[str, object] = {}
+    real_engine = ManagedFuturesEngine
+
+    def capturing_engine(*args, **kwargs):
+        captured.update(kwargs)
+        return real_engine(*args, **kwargs)
+
+    monkeypatch.setattr(supervisor_main, "ManagedFuturesEngine", capturing_engine)
+
+    args = _parse_args([
+        "--db-path", str(tmp_path / "data" / "state.db"),
+        "--config-dir", str(tmp_path / "config"),
+        "--scid-dir", str(tmp_path),
+        "--symbols", "GBPUSD",
+        "--broker", "ig",
+        "--strategy", "fx-london-breakout",
+        "--trade-mode", "demo",
+        "--dry-run",
+        "--log-level", "WARNING",
+    ])
+    rc = asyncio.run(_run(args))
+    assert rc == 0
+    assert captured.get("use_native_brackets") is True, (
+        f"--broker ig MUST set use_native_brackets=True; got {captured}"
+    )
+    assert captured.get("use_broker_market_data") is True, (
+        f"--broker ig MUST set use_broker_market_data=True; got {captured}"
+    )
+
+
+def test_broker_ig_rejects_unverified_symbol_loudly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per Codex: 'must be verified with real IG demo search/markets calls
+    before smoke. Do not deploy with guessed epics.' Supervisor must
+    SystemExit when a symbol has no verified IGSymbolSpec rather than
+    fabricating one."""
+    _write_risk_json(tmp_path / "config")
+    _write_ig_secrets(tmp_path / "secrets" / "secrets.json")
+    monkeypatch.setenv("KATE_SECRETS_PATH", str(tmp_path / "secrets" / "secrets.json"))
+
+    # MESM26 is in KNOWN_INSTRUMENTS but NOT in the supervisor's verified
+    # ig_specs — exactly the failure class Codex blocked.
+    args = _parse_args([
+        "--db-path", str(tmp_path / "data" / "state.db"),
+        "--config-dir", str(tmp_path / "config"),
+        "--scid-dir", str(tmp_path),
+        "--symbols", "MESM26",
+        "--broker", "ig",
+        "--strategy", "fx-london-breakout",
+        "--trade-mode", "demo",
+        "--dry-run",
+        "--log-level", "WARNING",
+    ])
+    with pytest.raises(SystemExit, match="no verified IGSymbolSpec"):
+        asyncio.run(_run(args))

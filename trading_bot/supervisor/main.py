@@ -34,6 +34,9 @@ from pathlib import Path
 
 from trading_bot.core.data import CandleManager
 from trading_bot.core.execution import (
+    IGBrokerAdapter,
+    IGConfig,
+    IGSymbolSpec,
     MT5BrokerAdapter,
     MT5Config,
     NinjaBrokerAdapter,
@@ -81,12 +84,15 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     # engine is broker-agnostic; this flag picks which adapter the
     # supervisor constructs.
     p.add_argument(
-        "--broker", choices=["dtc", "mt5", "ninja"], default="dtc",
+        "--broker", choices=["dtc", "mt5", "ninja", "ig"], default="dtc",
         help="Broker adapter selector. NOTE: 'ninja' is order-routing-only "
              "scaffold as of 2026-05-18 — engine.start() will fail at "
              "market-data subscribe + account-state seed until the Option A "
-             "data path lands. See handoffs/2026-05-18-claude-to-team-"
-             "NT-data-architecture-Option-A-brainstorm.md",
+             "data path lands. 'ig' is Front 7 UK spread-bet (CGT-free), "
+             "REST-only adapter — uses native bracket orders and broker "
+             "market data, not DTC. See handoffs/2026-05-18-claude-to-team-"
+             "NT-data-architecture-Option-A-brainstorm.md and "
+             "handoffs/2026-05-21-claude-to-codex-REVIEW-REQUEST-ig-broker-adapter-front7.md",
     )
     p.add_argument("--ninja-host", default="127.0.0.1",
                    help="NinjaTrader bridge listen host (Python is the server).")
@@ -339,6 +345,58 @@ def _build_broker_adapter(*, args, instruments):
             )
         return NinjaBrokerAdapter(
             config=_build_ninja_config(args),
+            symbol_map=symbol_map,
+        )
+    if args.broker == "ig":
+        # Verified 2026-05-22 via diag against demo-api.ig.com /markets/{epic}.
+        # All four are spread-bet FX mini contracts; lotSize=1.0 per IG API,
+        # quantity_per_lot=10.0 is the standard FX-mini conversion (Kate's
+        # 1.0 lot -> 10 GBP/point IG size). Per Codex 2026-05-21 review,
+        # the 10.0 default is only safe inside verified FX MINI epics —
+        # do NOT extend this map to other instruments without re-running
+        # the /markets/{epic} verification.
+        ig_specs = {
+            "GBPUSD": IGSymbolSpec(
+                logical_symbol="GBPUSD",
+                epic="CS.D.GBPUSD.MINI.IP",
+                quantity_per_lot=10.0,
+                pip_decimal_position=4,
+            ),
+            "EURUSD": IGSymbolSpec(
+                logical_symbol="EURUSD",
+                epic="CS.D.EURUSD.MINI.IP",
+                quantity_per_lot=10.0,
+                pip_decimal_position=4,
+            ),
+            "AUDUSD": IGSymbolSpec(
+                logical_symbol="AUDUSD",
+                epic="CS.D.AUDUSD.MINI.IP",
+                quantity_per_lot=10.0,
+                pip_decimal_position=4,
+            ),
+            "EURGBP": IGSymbolSpec(
+                logical_symbol="EURGBP",
+                epic="CS.D.EURGBP.MINI.IP",
+                quantity_per_lot=10.0,
+                pip_decimal_position=4,
+            ),
+        }
+        # Filter to symbols actually requested at runtime. Reject unknowns
+        # loudly — guessing an epic is the exact failure class Codex blocked.
+        symbol_map: dict[str, IGSymbolSpec] = {}
+        for inst_key in instruments:
+            if inst_key not in ig_specs:
+                raise SystemExit(
+                    f"--broker ig: no verified IGSymbolSpec for {inst_key!r}. "
+                    f"Verified epics: {list(ig_specs)}. Add via "
+                    f"/markets/{{epic}} verification + supervisor patch."
+                )
+            symbol_map[inst_key] = ig_specs[inst_key]
+        ig_config = IGConfig.from_secrets(
+            environment="live" if args.trade_mode == "live" else "demo",
+        )
+        return IGBrokerAdapter(
+            config=ig_config,
             symbol_map=symbol_map,
         )
     raise SystemExit(f"unsupported --broker value: {args.broker!r}")
@@ -761,8 +819,11 @@ async def _run(args: argparse.Namespace) -> int:
             no_trade_windows_utc=no_trade_windows,
             client_name=args.client_name,
             trade_mode=TRADE_MODE_LOOKUP[args.trade_mode],
-            use_broker_market_data=args.broker in ("mt5", "ninja"),
-            use_native_brackets=args.broker in ("mt5", "ninja"),
+            # ig is REST-only with native /positions/otc brackets, identical
+            # market-data + native-bracket semantics to mt5. See Codex
+            # REVIEW-RESPONSE 2026-05-21 on IGBrokerAdapter Front 7 v0.
+            use_broker_market_data=args.broker in ("mt5", "ninja", "ig"),
+            use_native_brackets=args.broker in ("mt5", "ninja", "ig"),
             tick_interval_seconds=args.tick_interval,
             reconciliation_interval_seconds=args.reconciliation_interval,
             on_drift=_on_drift,
@@ -810,6 +871,12 @@ async def _run(args: argparse.Namespace) -> int:
                 "supervisor: --broker ninja is order-routing scaffold only "
                 "(2026-05-18). subscribe_market_data + request_account_state "
                 "will fail. Use --broker dtc until Option A data path lands."
+            )
+        elif args.broker == "ig":
+            LOGGER.info(
+                "supervisor: IG selected (Front 7 UK spread-bet); "
+                "skipping Sierra DTC preflights. account_id=%s env=%s",
+                broker.config.active_account_id, broker.config.environment,
             )
         else:
             LOGGER.info("supervisor: MT5 selected; skipping Sierra DTC preflights")
