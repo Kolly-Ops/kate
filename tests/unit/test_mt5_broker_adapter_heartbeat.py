@@ -8,6 +8,7 @@ catastrophic risk; keep them green.
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 
 import pytest
@@ -34,6 +35,20 @@ class _AccountInfo:
     currency: str = "USD"
 
 
+@dataclass
+class _StubTick:
+    """Minimal tick stub for the heartbeat fake — only the fields the
+    adapter's _detect_server_offset reads. Constructed fresh per call
+    so staleness check sees a current timestamp."""
+    time: int
+    time_msc: int
+    bid: float = 1.2500
+    ask: float = 1.2502
+    last: float = 1.2501
+    volume: float = 1.0
+    volume_real: float = 1.0
+
+
 class _FakeMT5Heartbeat:
     """Minimal MT5 fake — just enough surface for the heartbeat code path."""
 
@@ -53,7 +68,16 @@ class _FakeMT5Heartbeat:
         return True
 
     def symbol_info_tick(self, symbol):
-        return None
+        # Return a synthetic "live broker on +3h offset" tick so the
+        # adapter's task #37 hardened _detect_server_offset passes its
+        # freshness + sanity guards. This fake's purpose is to exercise
+        # the heartbeat path, not the offset detection — keep the tick
+        # fresh and bounded to let connect() succeed.
+        now = int(time.time())
+        return _StubTick(
+            time=now + 3 * 3600,
+            time_msc=(now + 3 * 3600) * 1000,
+        )
 
     def account_info(self):
         return _AccountInfo()

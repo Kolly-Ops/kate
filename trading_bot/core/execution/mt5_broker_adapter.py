@@ -45,6 +45,21 @@ logger = logging.getLogger(__name__)
 # install ever moves.
 _DEFAULT_MT5_PATH = r"C:\Program Files\MetaTrader 5"
 
+# Server timezone offset detection guards (task #37 — Codex 2026-05-25
+# PRECONDITION). Real retail brokers operate in the ±6h timezone band
+# (Cyprus EEST +3, US EDT -4, NZ NZST +12 is the outer edge but rare
+# for FX retail). Detections outside this band are silent broker
+# misconfigurations or stale data — loud-fail rather than apply.
+ACCEPTABLE_OFFSET_HOURS: frozenset[int] = frozenset(range(-6, 7))
+
+# Maximum tolerated gap between sampled tick.time and the rounded
+# hourly offset value. A fresh live tick has staleness < 5s typically;
+# the Friday 2026-05-22 23:42 incident sampled a tick with staleness
+# ~14.6 minutes (877s) from a post-market-close stale source.
+# 60s gives plenty of headroom for network jitter while catching
+# staleness measured in minutes.
+MAX_TICK_STALENESS_SECONDS: float = 60.0
+
 
 @dataclass(frozen=True)
 class MT5Config:
@@ -1031,13 +1046,31 @@ class MT5BrokerAdapter(BrokerAdapter):
         London Breakout strategy's 07:00-10:00 UK window for 10 days
         before detection.
 
-        Strategy: sample any subscribed symbol's tick, compare its
-        epoch to real wall clock, round to nearest hour to absorb
-        network jitter. Returns offset in seconds (positive = server is
-        ahead of real UTC).
+        Per task #37 hardening (Codex 2026-05-25 PRECONDITION; RCA at
+        handoffs/2026-05-25-claude-to-team-tz-bug-rca-and-restart-fix.md):
+        Friday 2026-05-22 23:42 supervisor restart sampled a stale
+        post-market-close tick whose `time` field was from earlier in
+        the day. The raw delta of 4477s rounded to +1h (wrong) instead
+        of the broker's true +3h, causing ~60h of mis-timestamped
+        market data. Three guards now prevent silent recurrence:
+
+        1. **Stale-tick guard**: the pre-rounding delta must be within
+           MAX_TICK_STALENESS_SECONDS of the rounded hourly value. A
+           fresh broker tick has staleness < 60s; a stale post-close
+           tick has staleness in minutes-to-hours.
+        2. **Sanity bound**: the rounded hours_off must be within
+           ACCEPTABLE_OFFSET_HOURS ({0, ±1..±6}). Real retail brokers
+           live in this range; anything else is detection failure.
+        3. **Loud failure**: on guard violation, emits CRITICAL log
+           and raises BrokerError. Supervisor refuses to start with
+           an unverified offset rather than silently mis-trade.
+
+        Returns offset in seconds (positive = server is ahead of real
+        UTC). Raises BrokerError on any guard failure.
         """
         mt5 = self._ensure_runtime()
         sample_seconds: Optional[float] = None
+        sample_symbol: Optional[str] = None
         for spec in self.symbol_map.values():
             tick = await asyncio.to_thread(mt5.symbol_info_tick, spec.broker_symbol)
             if tick is None:
@@ -1046,25 +1079,64 @@ class MT5BrokerAdapter(BrokerAdapter):
             if raw is None:
                 continue
             try:
-                sample_seconds = float(raw)
+                candidate = float(raw)
             except (TypeError, ValueError):
                 continue
-            if sample_seconds > 0:
+            if candidate > 0:
+                sample_seconds = candidate
+                sample_symbol = spec.broker_symbol
                 break
-        if sample_seconds is None or sample_seconds <= 0:
-            logger.warning(
-                "MT5 server offset detection failed (no tick sample); assuming offset=0"
+
+        if sample_seconds is None:
+            msg = (
+                "MT5 server timezone offset detection FAILED: no tick sample "
+                f"available across {len(self.symbol_map)} symbols. Restart "
+                "during market hours (Sun 22:00 UTC -> Fri 22:00 UTC) to "
+                "re-attempt detection."
             )
-            return 0.0
+            logger.critical(msg)
+            raise BrokerError(msg)
+
         real_utc = time.time()
         delta = sample_seconds - real_utc
         hours_off = round(delta / 3600.0)
+
+        if hours_off not in ACCEPTABLE_OFFSET_HOURS:
+            msg = (
+                f"MT5 server timezone offset detection FAILED: detected "
+                f"{hours_off:+d}h is outside acceptable range "
+                f"{sorted(ACCEPTABLE_OFFSET_HOURS)}. "
+                f"raw_delta={delta:.1f}s, server_epoch={sample_seconds:.0f}, "
+                f"real_utc={real_utc:.0f}, sample_symbol={sample_symbol}. "
+                "Supervisor refusing to start with an absurd offset."
+            )
+            logger.critical(msg)
+            raise BrokerError(msg)
+
+        expected_hour_delta = hours_off * 3600.0
+        staleness_seconds = abs(delta - expected_hour_delta)
+        if staleness_seconds > MAX_TICK_STALENESS_SECONDS:
+            msg = (
+                f"MT5 server timezone offset detection FAILED: tick staleness "
+                f"{staleness_seconds:.1f}s exceeds threshold "
+                f"{MAX_TICK_STALENESS_SECONDS}s. raw_delta={delta:.1f}s rounded "
+                f"to {hours_off:+d}h, expected_hourly={expected_hour_delta:.0f}s, "
+                f"sample_symbol={sample_symbol}. Last tick predates the current "
+                "moment beyond live-broker network jitter -- market may be "
+                "closed or feed has dropped. Restart during active market "
+                "hours (Sun 22:00 UTC -> Fri 22:00 UTC) to re-attempt."
+            )
+            logger.critical(msg)
+            raise BrokerError(msg)
+
         offset_seconds = hours_off * 3600.0
         logger.info(
             "MT5 server timezone offset detected: %+d hour(s) "
-            "(raw delta %.1fs, server epoch %.0f, real UTC %.0f). "
+            "(raw delta %.1fs, server epoch %.0f, real UTC %.0f, "
+            "sample symbol %s, tick staleness %.1fs). "
             "All emitted tick timestamps will be normalized to real UTC.",
             hours_off, delta, sample_seconds, real_utc,
+            sample_symbol, staleness_seconds,
         )
         return offset_seconds
 

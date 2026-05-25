@@ -134,7 +134,15 @@ class _FakeMT5:
         self.account = _AccountInfo()
         self.positions = [_Position("GBPUSD", 1.0, self.POSITION_TYPE_BUY, 1.2400)]
         self.orders = [_Order(999, "GBPUSD", self.ORDER_TYPE_BUY_LIMIT, 1.0, 1.0, 1.2300, "pending-1")]
-        self.tick = _Tick()
+        # Default to a "live broker at +3h offset" tick so the adapter's
+        # _detect_server_offset (task #37 hardened) passes its freshness +
+        # sanity-bound guards. Tests that need a specific tick value
+        # override `self.tick = _Tick(...)` AFTER constructing the fake.
+        now = int(time.time())
+        self.tick = _Tick(
+            time=now + 3 * 3600,
+            time_msc=(now + 3 * 3600) * 1000,
+        )
         self.error = (0, "ok")
         # Bars returned by copy_rates_from_pos — tests override this to
         # exercise the history backfill path. Each entry must be a dict
@@ -373,7 +381,9 @@ def test_subscribe_market_data_enqueues_normalized_tick():
         assert event.tick is not None
         assert event.tick.symbol == "GBPUSD"
         assert event.tick.last_price == pytest.approx(1.2501)
-        expected_ts = dt.datetime.utcfromtimestamp(1_715_601_600.123)
+        # Derive expected_ts from the fake's actual tick state rather than
+        # hardcoded epoch (fake now uses live-broker dynamic timestamps).
+        expected_ts = dt.datetime.utcfromtimestamp(runtime.tick.time_msc / 1000.0)
         expected_ts -= dt.timedelta(seconds=adapter._mt5_server_offset_seconds)
         assert event.tick.timestamp == expected_ts
 
@@ -637,5 +647,132 @@ def test_get_recent_candles_rejects_unsupported_timeframe():
             raise AssertionError("expected BrokerError for timeframe_minutes=7")
 
         await adapter.disconnect()
+
+    _run(_impl())
+
+
+# ── Task #37 hardening — TZ offset detection guards ──────────────────────
+#
+# Codex 2026-05-25 ACK promoted this to PRECONDITION before Day-21
+# evaluation can be trusted. RCA: handoffs/2026-05-25-claude-to-team-
+# tz-bug-rca-and-restart-fix.md. Friday 23:42 restart sampled a stale
+# post-market-close tick whose raw delta (4477s) rounded to +1h instead
+# of the broker's true +3h, causing ~60h of mis-timestamped data.
+
+def test_detect_server_offset_rejects_stale_tick_with_critical_log():
+    """Stale-tick guard: pre-rounding delta beyond MAX_TICK_STALENESS_SECONDS
+    of the rounded hourly value must raise BrokerError with CRITICAL log.
+    Reproduces the Friday 2026-05-22 23:42 stale-tick scenario."""
+    async def _impl() -> None:
+        runtime = _FakeMT5()
+        # Friday-night-restart shape: tick.time reports ~1h ahead of real_utc
+        # but should be +3h ahead if broker were live. Staleness ≈ 14.6 min.
+        now = int(time.time())
+        runtime.tick = _Tick(
+            time=now + 4478,  # rounds to +1h, but expected_hourly=3600 -> staleness 878s
+            time_msc=(now + 4478) * 1000,
+        )
+
+        adapter = _adapter(runtime)
+        try:
+            await adapter.connect()
+        except BrokerError as e:
+            assert "staleness" in str(e).lower(), f"expected staleness msg, got: {e}"
+            assert "GBPUSD" in str(e), f"expected sample_symbol in error: {e}"
+        else:
+            raise AssertionError(
+                "expected BrokerError on stale tick; supervisor should refuse "
+                "to start with an unverified offset"
+            )
+
+    _run(_impl())
+
+
+def test_detect_server_offset_rejects_absurd_offset_with_critical_log():
+    """Sanity bound: offset outside ACCEPTABLE_OFFSET_HOURS must
+    raise BrokerError. A +12h or -10h offset is a broker-side bug
+    or stale-data symptom — never silently apply."""
+    async def _impl() -> None:
+        runtime = _FakeMT5()
+        # Tick reports +12h offset — outside the {-6..+6} sanity bound.
+        now = int(time.time())
+        runtime.tick = _Tick(
+            time=now + 12 * 3600,
+            time_msc=(now + 12 * 3600) * 1000,
+        )
+
+        adapter = _adapter(runtime)
+        try:
+            await adapter.connect()
+        except BrokerError as e:
+            assert "outside acceptable range" in str(e), f"expected sanity-bound msg, got: {e}"
+            assert "+12h" in str(e), f"expected detected offset in error: {e}"
+        else:
+            raise AssertionError(
+                "expected BrokerError on absurd +12h offset; supervisor should "
+                "refuse to start with an offset outside the retail broker band"
+            )
+
+    _run(_impl())
+
+
+def test_detect_server_offset_raises_when_no_tick_available():
+    """Detection requires at least one valid tick. If symbol_info_tick
+    returns None for all symbols (broker connection issue, market truly
+    offline, etc), raise BrokerError loudly rather than silently
+    returning offset=0."""
+    async def _impl() -> None:
+        runtime = _FakeMT5()
+        runtime.tick = None  # broker returns nothing for any symbol
+
+        adapter = _adapter(runtime)
+        try:
+            await adapter.connect()
+        except BrokerError as e:
+            assert "no tick sample" in str(e).lower(), f"expected no-tick msg, got: {e}"
+            assert "market hours" in str(e).lower(), f"expected operator hint, got: {e}"
+        else:
+            raise AssertionError(
+                "expected BrokerError when no tick is available; supervisor "
+                "should not silently start with offset=0"
+            )
+
+    _run(_impl())
+
+
+def test_detect_server_offset_audit_log_includes_offset_and_staleness():
+    """Successful detection must emit an audit log line containing the
+    detected offset (in hours) AND the tick staleness (in seconds).
+    These are the visible-audit fields Codex required for operator
+    review per his 2026-05-25 ACK point #4."""
+    async def _impl() -> None:
+        import logging
+        from io import StringIO
+
+        runtime = _FakeMT5()
+        # Default fake tick is +3h fresh; clean detection should succeed.
+
+        log_buffer = StringIO()
+        handler = logging.StreamHandler(log_buffer)
+        handler.setLevel(logging.INFO)
+        target_logger = logging.getLogger("trading_bot.core.execution.mt5_broker_adapter")
+        target_logger.addHandler(handler)
+        target_logger.setLevel(logging.INFO)
+        try:
+            adapter = _adapter(runtime)
+            await adapter.connect()
+            log_output = log_buffer.getvalue()
+        finally:
+            target_logger.removeHandler(handler)
+
+        assert "MT5 server timezone offset detected: +3 hour(s)" in log_output, (
+            f"missing offset audit line in: {log_output!r}"
+        )
+        assert "tick staleness" in log_output, (
+            f"missing staleness audit field in: {log_output!r}"
+        )
+        assert "sample symbol GBPUSD" in log_output, (
+            f"missing sample symbol audit field in: {log_output!r}"
+        )
 
     _run(_impl())
