@@ -93,13 +93,80 @@ def test_news_event_blocks_two_minutes_each_side() -> None:
 
 
 def test_one_trade_per_symbol_session_day() -> None:
+    """Once a position has been observed open for a symbol+date, the
+    strategy refuses to re-enter for the rest of that session.
+
+    Note: this test exercises the 2026-05-26 observation-driven session
+    cache. Pre-2026-05-26 the cache was populated on intent generation;
+    now it's populated only when has_open_position=True is observed,
+    which models the actual broker fill. The second call here mirrors
+    the engine's post-fill state by passing has_open_position=True.
+    """
+    day = dt.date(2026, 5, 13)
+    first = candle(dt.datetime(2026, 5, 13, 7, 5, tzinfo=UK), 1.2530)
+    second = candle(dt.datetime(2026, 5, 13, 7, 10, tzinfo=UK), 1.2535)
+    third = candle(dt.datetime(2026, 5, 13, 7, 15, tzinfo=UK), 1.2540)
+    strategy = FXLondonBreakoutStrategy()
+
+    # First candle: fresh signal, strategy emits intent.
+    assert strategy.on_candle_close(
+        ctx(tuple(warmup_before(day) + asian_range(day) + [first]))
+    ) is not None
+
+    # Second candle: position now observed open (mirrors engine state
+    # after broker fill). Strategy skips with "open position" and
+    # marks the session as traded.
+    assert strategy.on_candle_close(
+        ctx(tuple(warmup_before(day) + asian_range(day) + [first, second]),
+            has_open_position=True)
+    ) is None
+
+    # Third candle: position has since closed (TP/SL fired), but the
+    # session is now in the strategy's cache because we observed an
+    # open position earlier. Strategy must NOT re-enter same-day.
+    assert strategy.on_candle_close(
+        ctx(tuple(warmup_before(day) + asian_range(day) + [first, second, third]),
+            has_open_position=False)
+    ) is None
+
+
+def test_rejected_intent_does_not_consume_session_slot() -> None:
+    """2026-05-26 CEO directive: session slots should only be consumed
+    by trades that ACTUALLY filled. A strategy signal that gets rejected
+    downstream by the risk manager (e.g. max_open_positions cap) must
+    leave the session slot available for the same symbol to re-attempt
+    later in the trade window.
+
+    This test models the pattern observed today: EURGBP filled at 07:02,
+    GBPUSD/EURUSD/AUDUSD signals fired but were rejected by max_positions
+    cap. Under the old (pre-2026-05-26) cache semantics, those rejected
+    symbols would never re-fire that day. Under the new semantics, they
+    can attempt again on subsequent candles.
+    """
     day = dt.date(2026, 5, 13)
     first = candle(dt.datetime(2026, 5, 13, 7, 5, tzinfo=UK), 1.2530)
     second = candle(dt.datetime(2026, 5, 13, 7, 10, tzinfo=UK), 1.2535)
     strategy = FXLondonBreakoutStrategy()
 
-    assert strategy.on_candle_close(ctx(tuple(warmup_before(day) + asian_range(day) + [first]))) is not None
-    assert strategy.on_candle_close(ctx(tuple(warmup_before(day) + asian_range(day) + [first, second]))) is None
+    # First candle: strategy emits intent. We're modelling the case
+    # where downstream risk REJECTS this intent (no fill).
+    intent1 = strategy.on_candle_close(
+        ctx(tuple(warmup_before(day) + asian_range(day) + [first]))
+    )
+    assert intent1 is not None
+
+    # Second candle: NO position was ever observed open
+    # (because the prior intent was rejected by risk, not filled).
+    # Strategy must be willing to emit ANOTHER intent for the same
+    # symbol+date — the session is NOT yet consumed.
+    intent2 = strategy.on_candle_close(
+        ctx(tuple(warmup_before(day) + asian_range(day) + [first, second]),
+            has_open_position=False)
+    )
+    assert intent2 is not None, (
+        "rejected intent must not consume the session slot; strategy "
+        "should be willing to re-attempt on the next candle close"
+    )
 
 
 def test_requires_asian_range_history() -> None:

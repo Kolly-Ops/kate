@@ -212,8 +212,12 @@ def test_multiple_gates_fire_simultaneously(manager: RiskManager) -> None:
 def test_policy_loads_from_json() -> None:
     """Asserts the canonical risk.json matches the CEO-ratified policy.
 
-    Last update: 2026-05-21 per omni/proposals/2026-05-21-claude-risk-policy-1pct-and-demo-top-up.md
-    (demo topped up to $4998 + per-trade risk tightened to 1.0%).
+    Last update: 2026-05-26 per CEO directive after EURGBP TP-hit +
+    3 risk-rejected breakouts (raise max_open_positions 1->4 for
+    concurrent FX pair operation; daily-loss bound 4x1%=4% remains
+    within Apex prop-firm 5% daily limit).
+    Prior update: 2026-05-21 (demo topped up to $4998 + per-trade
+    risk tightened to 1.0%).
     """
     config_path = (
         pathlib.Path(__file__).resolve().parents[2] / "config" / "risk.json"
@@ -225,6 +229,7 @@ def test_policy_loads_from_json() -> None:
     assert policy.kill_switch_drawdown_pct == 0.30
     assert policy.max_risk_per_trade_pct_nlv == 0.01
     assert policy.max_margin_utilization_pct == 0.40
+    assert policy.max_open_positions == 4
 
 
 def test_policy_ignores_unknown_keys(tmp_path: pathlib.Path) -> None:
