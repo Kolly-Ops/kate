@@ -114,24 +114,11 @@ class FXLondonBreakoutStrategy(Strategy):
         return max(480, self.atr_period + 1)
 
     def on_candle_close(self, ctx: StrategyContext) -> Optional[TradeIntent]:
-        ts_uk = self._to_local(ctx.candle.timestamp)
-        session_key = (ctx.symbol, ts_uk.date())
-
-        # Observation-driven session consumption (2026-05-26 CEO directive
-        # post-EURGBP-TP). Pre-2026-05-26 the cache was populated on intent
-        # generation, which silently consumed session slots for symbols
-        # whose intents were rejected downstream by the risk manager
-        # (e.g. max_open_positions cap on a multi-pair-breakout day).
-        # Net effect: only the first-to-break pair could ever trade per
-        # day. Now we only mark a session "traded" once we've observed
-        # has_open_position=True for the symbol on this date -- i.e. the
-        # broker actually filled. Rejected intents leave the session slot
-        # available for the symbol to re-attempt later in the window.
         if ctx.has_open_position:
-            self._traded_sessions.add(session_key)
             logger.debug("fxlon %s: skip — open position", ctx.symbol)
             return None
 
+        ts_uk = self._to_local(ctx.candle.timestamp)
         if not self._in_trade_window(ts_uk):
             logger.debug(
                 "fxlon %s @ %s UK: outside trade window 07:00-10:00",
@@ -146,6 +133,7 @@ class FXLondonBreakoutStrategy(Strategy):
             ctx.symbol, ts_uk.strftime("%H:%M"), len(ctx.history),
         )
 
+        session_key = (ctx.symbol, ts_uk.date())
         if session_key in self._traded_sessions:
             logger.info("fxlon %s: skip — already traded this session", ctx.symbol)
             return None
@@ -231,12 +219,18 @@ class FXLondonBreakoutStrategy(Strategy):
             logger.info("fxlon %s: skip — risk computed <= 0", ctx.symbol)
             return None
 
-        # Session consumption is now observation-driven (see top of
-        # on_candle_close). The strategy emits the intent without
-        # marking the session; the cache is populated only when
-        # has_open_position=True is observed on a subsequent candle,
-        # meaning the broker actually filled. Rejected intents leave
-        # the session slot available for retry.
+        # Session consumed at intent-generation time. Per Codex 2026-05-26
+        # HARD-OBJECTION on observation-driven semantics: fast-fill-fast-close
+        # (e.g. AUDUSD 2026-05-22: filled 07:18:17 / stopped 07:18:41 = 24s)
+        # would never let the strategy observe has_open_position=True on a
+        # subsequent 1-min candle, allowing same-symbol repeat entries and
+        # breaking the 4%-NLV daily-loss bound. Known limitation: this also
+        # means risk-rejected intents consume the slot. Sprint 2 task is to
+        # implement an engine→strategy mark_session_traded(symbol, date)
+        # callback driven by broker ORDER_FILLED events, which preserves
+        # one-trade-per-symbol/day correctly across both fast-close and
+        # risk-reject paths.
+        self._traded_sessions.add(session_key)
         ymdhm = ts_uk.strftime("%y%m%d%H%M")
         effective_stop_pips = abs(ctx.candle.close - stop_loss) / self.pip_size
         return TradeIntent(
