@@ -224,6 +224,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                    help="FX London breakout minimum Asian range")
     p.add_argument("--fx-max-range-pips", type=float, default=120.0,
                    help="FX London breakout maximum Asian range")
+    p.add_argument("--fx-min-breakout-pips", type=float, default=0.0,
+                   help="FX London breakout minimum depth beyond range "
+                        "boundary before firing. Default 0.0 = off. Set to "
+                        "2.0 to reject shallow false-breakouts (documented "
+                        "AUDUSD 2026-05-29 failure mode).")
     p.add_argument("--log-file", default=None,
                    help="optional log file path (in addition to stderr)")
     p.add_argument("--log-level", default="INFO",
@@ -756,6 +761,7 @@ async def _run(args: argparse.Namespace) -> int:
                 atr_stop_multiplier=args.atr_stop_mult,
                 min_range_pips=args.fx_min_range_pips,
                 max_range_pips=args.fx_max_range_pips,
+                min_breakout_pips=args.fx_min_breakout_pips,
                 fail_on_unknown_symbol=(args.trade_mode == "live"),
             )
         elif args.strategy == "orb":

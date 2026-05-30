@@ -174,28 +174,16 @@ class FXLondonBreakoutStrategy(Strategy):
             )
             return None
 
-        current_atr = atr(ctx.history, self.atr_period)
-        if current_atr <= 0:
-            logger.info("fxlon %s: skip — ATR%d <= 0", ctx.symbol, self.atr_period)
-            return None
-
-        atr_stop_distance = current_atr * self.atr_stop_multiplier
-        atr_stop_pips = atr_stop_distance / self.pip_size
-        min_stop_pips = self._min_stop_pips_for(ctx.symbol)
-        min_stop_distance = min_stop_pips * self.pip_size
-        stop_distance = max(atr_stop_distance, min_stop_distance)
-        floor_binding = min_stop_distance > atr_stop_distance
-        if floor_binding:
-            logger.info(
-                "fxlon %s: min-stop floor binding — atr_stop=%.2f pips < min=%.2f pips; "
-                "stop_distance=%.2f pips",
-                ctx.symbol, atr_stop_pips, min_stop_pips, stop_distance / self.pip_size,
-            )
-
-        # Sprint 2 (2026-05-30): min_breakout_pips guard — reject shallow
-        # breakouts that almost certainly snap back into range. Live
-        # evidence Fri 2026-05-29: AUDUSD fired on 0.5-pip break of a
-        # 13.8-pip range, stopped out in 49 seconds when price retraced
+        # Sprint 2 (2026-05-30): min_breakout_pips guard — runs BEFORE
+        # ATR/min-stop-floor calculation per Codex REVIEW-RESPONSE
+        # 2026-05-30 (item 1 concern #3). Reasons:
+        #   - skipped trades don't need stop sizing computed
+        #   - avoids fail_on_unknown_symbol floor-lookup for trades that
+        #     would be skipped anyway
+        #   - shallow-breakout log isn't preceded by an irrelevant
+        #     min-stop-floor line
+        # Live evidence Fri 2026-05-29: AUDUSD fired on 0.5-pip break of
+        # a 13.8-pip range, stopped out in 49 seconds when price retraced
         # to range-mid. False-breakout / liquidity-hunt pattern is the
         # documented failure mode; widening the floor doesn't help
         # because the stop still falls inside the prior range. See
@@ -216,6 +204,24 @@ class FXLondonBreakoutStrategy(Strategy):
                 ctx.symbol, breakout_pips, self.min_breakout_pips,
             )
             return None
+
+        current_atr = atr(ctx.history, self.atr_period)
+        if current_atr <= 0:
+            logger.info("fxlon %s: skip — ATR%d <= 0", ctx.symbol, self.atr_period)
+            return None
+
+        atr_stop_distance = current_atr * self.atr_stop_multiplier
+        atr_stop_pips = atr_stop_distance / self.pip_size
+        min_stop_pips = self._min_stop_pips_for(ctx.symbol)
+        min_stop_distance = min_stop_pips * self.pip_size
+        stop_distance = max(atr_stop_distance, min_stop_distance)
+        floor_binding = min_stop_distance > atr_stop_distance
+        if floor_binding:
+            logger.info(
+                "fxlon %s: min-stop floor binding — atr_stop=%.2f pips < min=%.2f pips; "
+                "stop_distance=%.2f pips",
+                ctx.symbol, atr_stop_pips, min_stop_pips, stop_distance / self.pip_size,
+            )
 
         side: int
         stop_loss: float
@@ -280,6 +286,8 @@ class FXLondonBreakoutStrategy(Strategy):
                 "asian_range_low": f"{range_low:.5f}",
                 "asian_range_high": f"{range_high:.5f}",
                 "asian_range_pips": f"{range_pips:.1f}",
+                "breakout_pips": f"{breakout_pips:.2f}",
+                "min_breakout_pips": f"{self.min_breakout_pips:.2f}",
                 "atr": f"{current_atr:.5f}",
                 "atr_stop_pips": f"{atr_stop_pips:.2f}",
                 "min_stop_pips": f"{min_stop_pips:.2f}",

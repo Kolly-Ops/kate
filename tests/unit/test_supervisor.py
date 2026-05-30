@@ -54,6 +54,32 @@ def test_parse_args_defaults() -> None:
     assert args.trade_mode == "demo"
     assert args.timeframe_minutes == 1
     assert args.dry_run is False
+    # Sprint 2 (2026-05-30) — min_breakout_pips opt-in default
+    assert args.fx_min_breakout_pips == 0.0
+
+
+def test_parse_args_fx_min_breakout_pips_wiring() -> None:
+    """Sprint 2 (2026-05-30): production CLI must accept --fx-min-breakout-pips
+    and the value must reach the FXLondonBreakoutStrategy constructor. Per
+    Codex REVIEW-RESPONSE 2026-05-30 item 1: deploying the strategy code
+    alone is insufficient — the wiring must demonstrably plumb the value
+    through, or the AUDUSD guard does nothing at runtime."""
+    args = _parse_args(["--fx-min-breakout-pips", "2.0"])
+    assert args.fx_min_breakout_pips == 2.0
+
+    # Production smoke: instantiate the strategy with the parsed value
+    # and confirm the constructor stored it.
+    from trading_bot.core.strategy import FXLondonBreakoutStrategy
+    strategy = FXLondonBreakoutStrategy(
+        quantity=args.fx_quantity,
+        reward_risk=args.fx_reward_risk,
+        atr_period=args.atr_period,
+        atr_stop_multiplier=args.atr_stop_mult,
+        min_range_pips=args.fx_min_range_pips,
+        max_range_pips=args.fx_max_range_pips,
+        min_breakout_pips=args.fx_min_breakout_pips,
+    )
+    assert strategy.min_breakout_pips == 2.0
 
 
 def test_parse_args_overrides_full() -> None:
