@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime as dt
 import time
 from dataclasses import dataclass
@@ -645,6 +646,84 @@ def test_get_recent_candles_rejects_unsupported_timeframe():
             assert "timeframe_minutes=7" in str(e)
         else:
             raise AssertionError("expected BrokerError for timeframe_minutes=7")
+
+        await adapter.disconnect()
+
+    _run(_impl())
+
+
+def test_position_close_emits_zero_quantity_update():
+    """Sprint 2 #45 — phantom-state root-cause fix (2026-05-30).
+
+    When MT5 reports a previously-known ticket has disappeared (broker
+    filled SL/TP and the position is gone), the adapter must emit a
+    POSITION_UPDATE event with quantity=0 so the engine clears the
+    in-memory _broker_positions entry. Without this, the engine's
+    `_has_open_position()` keeps returning True forever and the
+    strategy loops on "skip - open position" until supervisor restart.
+
+    Live evidence:
+      - Wed 2026-05-27: 4 trades, 1 phantom carryover overnight
+      - Thu 2026-05-28: 1 trade SL'd 07:54, phantom blocked rest of day
+      - Fri 2026-05-29: 4 trades, all 4 left phantoms; Sat morning Gemini
+        ops-check found 4 position drifts + 3 order drifts even with
+        markets closed
+
+    Telegram alert + log alone were not enough — engine needs a structured
+    event to mutate state.
+    """
+    async def _impl() -> None:
+        runtime = _FakeMT5()
+        adapter = _adapter(runtime)
+        await adapter.connect()
+        # Cancel background poll loop so our explicit _poll_once calls
+        # don't race with it. We also have to reset the cached hashes so
+        # the next poll sees a state-changed transition.
+        if adapter._poll_task is not None:
+            adapter._poll_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await adapter._poll_task
+        # Drain any events the background poll already produced
+        while not adapter._events_q.empty():
+            adapter._events_q.get_nowait()
+        adapter._last_positions_hash = None
+        adapter._known_position_tickets = {}
+
+        # First poll: GBPUSD position is OPEN (fake default in _FakeMT5)
+        await adapter._poll_once()
+
+        open_events = [
+            adapter._events_q.get_nowait() for _ in range(adapter._events_q.qsize())
+        ]
+        open_pos = [e for e in open_events if e.kind == BrokerEventKind.POSITION_UPDATE]
+        assert len(open_pos) == 1, (
+            f"expected 1 POSITION_UPDATE on open, got {len(open_pos)}"
+        )
+        assert open_pos[0].position.quantity != 0.0, (
+            "open position event should carry non-zero quantity"
+        )
+        assert open_pos[0].position.symbol == "GBPUSD"
+
+        # Simulate broker closing the position (SL/TP hit)
+        runtime.positions = []
+        await adapter._poll_once()
+
+        close_events = [
+            adapter._events_q.get_nowait() for _ in range(adapter._events_q.qsize())
+        ]
+        close_pos = [e for e in close_events if e.kind == BrokerEventKind.POSITION_UPDATE]
+
+        assert len(close_pos) == 1, (
+            f"expected 1 POSITION_UPDATE on close, got {len(close_pos)}; "
+            f"this is the Sprint 2 #45 phantom-state bug — engine never "
+            f"clears _broker_positions if this event is missing"
+        )
+        assert close_pos[0].position.quantity == 0.0, (
+            "close event must carry quantity=0.0 to trigger engine clear"
+        )
+        assert close_pos[0].position.symbol == "GBPUSD", (
+            "close event symbol must match the closed position"
+        )
 
         await adapter.disconnect()
 

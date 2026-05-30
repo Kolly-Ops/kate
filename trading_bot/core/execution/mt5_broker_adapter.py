@@ -690,6 +690,25 @@ class MT5BrokerAdapter(BrokerAdapter):
             for closed_ticket in closed_tickets:
                 prev = self._known_position_tickets[closed_ticket]
                 await self._alert_position_closed(closed_ticket, prev)
+                # Sprint 2 #45 (2026-05-30): emit POSITION_UPDATE with
+                # quantity=0 so the engine clears the in-memory broker-position
+                # state. Without this, _broker_positions retains the closed
+                # ticket's entry, _has_open_position() keeps returning True for
+                # that symbol, and the strategy loops on "skip - open position"
+                # until supervisor restart. Telegram + log alone were not
+                # enough — engine needs a structured event to mutate state.
+                broker_sym = str(prev.get("symbol", ""))
+                if broker_sym:
+                    await self._events_q.put(BrokerEvent(
+                        kind=BrokerEventKind.POSITION_UPDATE,
+                        received_at=time.time(),
+                        position=PositionEvent(
+                            symbol=self._broker_to_logical.get(broker_sym, broker_sym),
+                            quantity=0.0,
+                            avg_price=float(prev.get("price_open", 0.0) or 0.0),
+                            side=None,
+                        ),
+                    ))
             self._known_position_tickets = current_tickets
 
         orders = await asyncio.to_thread(mt5.orders_get)
