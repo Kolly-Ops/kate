@@ -248,18 +248,16 @@ class FXLondonBreakoutStrategy(Strategy):
             logger.info("fxlon %s: skip — risk computed <= 0", ctx.symbol)
             return None
 
-        # Session consumed at intent-generation time. Per Codex 2026-05-26
-        # HARD-OBJECTION on observation-driven semantics: fast-fill-fast-close
-        # (e.g. AUDUSD 2026-05-22: filled 07:18:17 / stopped 07:18:41 = 24s)
-        # would never let the strategy observe has_open_position=True on a
-        # subsequent 1-min candle, allowing same-symbol repeat entries and
-        # breaking the 4%-NLV daily-loss bound. Known limitation: this also
-        # means risk-rejected intents consume the slot. Sprint 2 task is to
-        # implement an engine→strategy mark_session_traded(symbol, date)
-        # callback driven by broker ORDER_FILLED events, which preserves
-        # one-trade-per-symbol/day correctly across both fast-close and
-        # risk-reject paths.
-        self._traded_sessions.add(session_key)
+        # Sprint 2 #44 (2026-05-30): session-marking moved from intent-
+        # emission to engine callback via mark_session_traded(). The
+        # engine populates _entry_intents on broker submission and calls
+        # mark_session_traded() on FILL/PARTIAL_FILL. This fixes the
+        # risk-reject-burns-the-slot issue while keeping fast-fill-fast-
+        # close protection (the FILL event arrives before the next
+        # strategy evaluation, marking the session before re-fire is
+        # possible).
+        # NOTE: do NOT add self._traded_sessions.add(session_key) here —
+        # that's the pre-#44 intent-emission marking. Engine owns it now.
         ymdhm = ts_uk.strftime("%y%m%d%H%M")
         effective_stop_pips = abs(ctx.candle.close - stop_loss) / self.pip_size
         return TradeIntent(
@@ -296,6 +294,25 @@ class FXLondonBreakoutStrategy(Strategy):
                 "timezone": str(self.timezone),
             },
         )
+
+    def mark_session_traded(self, symbol: str, timestamp_utc: dt.datetime) -> None:
+        """Sprint 2 #44 (2026-05-30): engine-driven session marking.
+
+        Called by the engine when an entry order for this strategy is
+        accepted at the broker (ORDER_FILLED or ORDER_PARTIAL_FILL).
+        Converts the UTC timestamp to UK local date (matching the
+        on_candle_close session-key convention at line 137).
+
+        Idempotent — set membership prevents double-marking. Risk-rejected
+        intents never reach this callback (they're filtered before broker
+        submission), so the session stays un-marked and the strategy can
+        re-attempt on the next candle within the trade window.
+        """
+        # Ensure timestamp is UTC-aware before converting; defensive only
+        if timestamp_utc.tzinfo is None:
+            timestamp_utc = timestamp_utc.replace(tzinfo=dt.timezone.utc)
+        session_date = self._to_local(timestamp_utc).date()
+        self._traded_sessions.add((symbol, session_date))
 
     def _min_stop_pips_for(self, symbol: str) -> float:
         if symbol in self.min_stop_pips_by_symbol:

@@ -90,6 +90,32 @@ class _BracketSpec:
 
 
 @dataclass(frozen=True)
+class _EntryMarker:
+    """Sprint 2 #44 (2026-05-30): per-entry record used by the engine to
+    notify a session-aware strategy when its entry is accepted by the
+    broker (ORDER_FILLED or ORDER_PARTIAL_FILL).
+
+    Populated unconditionally on successful broker submission of an entry
+    intent — works for both native-bracket and synthetic-bracket flows
+    (per Codex REVIEW-RESPONSE 2026-05-30 HARD-OBJECTION on the v1 design
+    that used _pending_brackets as discriminator: native-bracket brokers
+    NEVER populate _pending_brackets, so that discriminator would silently
+    miss every MT5/Ninja/IG entry fill).
+
+    Consumed (popped) on first ORDER_FILLED or ORDER_PARTIAL_FILL — calls
+    strategy.mark_session_traded(symbol, "now" UTC). Removed (without
+    marking) on ORDER_REJECTED or ORDER_CANCELED.
+
+    `strategy_name` is stored for future multi-strategy routing + log
+    clarity. Current engine is single-strategy; routing logic lives in
+    a future PR.
+    """
+    symbol: str              # logical
+    exchange: str
+    strategy_name: str       # for future multi-strategy routing
+
+
+@dataclass(frozen=True)
 class InstrumentMeta:
     """Per-instrument calibration. Sourced from config/instruments.json.
 
@@ -209,6 +235,17 @@ class ManagedFuturesEngine:
         # with a tight timeout (same shape as the prior raw-DTC drain).
         self._event_queue: asyncio.Queue[BrokerEvent] = asyncio.Queue()
         self._event_pump_task: Optional[asyncio.Task[None]] = None
+
+        # ── Sprint 2 #44 — entry-intent registry for session marking ──
+        # `_entry_intents[coid]` tracks every entry order submitted to the
+        # broker, regardless of native-vs-synthetic bracket flow. Consumed
+        # on first ORDER_FILLED/PARTIAL_FILL → calls strategy.
+        # mark_session_traded() so the session is consumed only when a
+        # broker accepts the entry (not on intent emission). Removed
+        # without marking on ORDER_REJECTED/CANCELED. See _EntryMarker
+        # dataclass for the design rationale (Codex HARD-OBJECTION
+        # 2026-05-30 on the v1 _pending_brackets-based discriminator).
+        self._entry_intents: dict[str, _EntryMarker] = {}
 
         # ── Bracket-order tracking (synthetic OCO) ────────────────────
         # `_pending_brackets[entry_coid]` holds the stop/target params we'll
@@ -571,6 +608,49 @@ class ManagedFuturesEngine:
             rejected_reason=rejected_reason,
         )
 
+        # ── Sprint 2 #44 — session marking on broker-accepted entry ──
+        # Pop the entry marker (if any) and notify the strategy. Pop is
+        # idempotent — duplicate FILL events for the same coid will only
+        # notify once. PARTIAL_FILL also consumes the session (any
+        # non-zero broker-accepted exposure = real position; same
+        # session-bound semantics as a full fill). ORDER_ACK does NOT
+        # consume — alive at broker but not filled, could still cancel.
+        # ORDER_REJECTED and ORDER_CANCELED just remove the marker
+        # without calling mark_session_traded (strategy can re-attempt).
+        if kind in (
+            BrokerEventKind.ORDER_FILLED,
+            BrokerEventKind.ORDER_PARTIAL_FILL,
+        ):
+            marker = self._entry_intents.pop(order.client_order_id, None)
+            if marker is not None:
+                try:
+                    self.strategy.mark_session_traded(
+                        marker.symbol,
+                        dt.datetime.now(dt.timezone.utc),
+                    )
+                    logger.info(
+                        "engine: session marked traded for %s via %s "
+                        "(strategy=%s, coid=%s)",
+                        marker.symbol, kind.value,
+                        marker.strategy_name, order.client_order_id,
+                    )
+                except Exception:
+                    logger.exception(
+                        "engine: strategy.mark_session_traded raised for "
+                        "%s coid=%s — engine continues",
+                        marker.symbol, order.client_order_id,
+                    )
+        elif kind in (
+            BrokerEventKind.ORDER_REJECTED,
+            BrokerEventKind.ORDER_CANCELED,
+        ):
+            # Broker-side rejection or cancellation — remove entry marker
+            # without marking session. Local risk-gate rejections never
+            # reach here (they short-circuit in _process_intent before
+            # _submit_order is called), so _entry_intents only contains
+            # broker-accepted submissions.
+            self._entry_intents.pop(order.client_order_id, None)
+
         # ── Bracket-order side effects on FILL ────────────────────────
         if store_status == "FILLED":
             # 1. ENTRY for which we cached a bracket spec → submit exits
@@ -831,6 +911,17 @@ class ManagedFuturesEngine:
                 rejected_reason="submit failed (transport error)",
             )
             raise
+
+        # Sprint 2 #44 (2026-05-30): register entry intent for session-
+        # marking on FILL. Unconditional — works for native-bracket
+        # (MT5/Ninja/IG) AND synthetic-bracket (Sierra/Rithmic) flows.
+        # Per Codex HARD-OBJECTION on v1: cannot use _pending_brackets
+        # as discriminator because native-bracket flow doesn't populate it.
+        self._entry_intents[intent.intent_id] = _EntryMarker(
+            symbol=intent.symbol,
+            exchange=intent.exchange,
+            strategy_name=intent.strategy_name,
+        )
 
         # Cache bracket params keyed by entry coid. Submitted only after
         # the entry's FILLED event arrives (see _handle_order_event).

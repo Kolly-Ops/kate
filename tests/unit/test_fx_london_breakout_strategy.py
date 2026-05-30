@@ -93,23 +93,114 @@ def test_news_event_blocks_two_minutes_each_side() -> None:
 
 
 def test_one_trade_per_symbol_session_day() -> None:
-    """Strategy fires one intent per symbol+date. Session is consumed
-    at intent generation (intent-driven cache).
+    """Sprint 2 #44 (2026-05-30, design v2): session-marking moved from
+    intent-emission to engine-driven mark_session_traded() callback.
 
-    Note: a prior 2026-05-26 attempt at observation-driven cache was
-    rolled back per Codex HARD-OBJECTION (fast-fill-fast-close edge
-    breaks the 4% daily-loss bound). Sprint 2 will replace this
-    intent-driven cache with engine.mark_session_traded() callback
-    driven by broker ORDER_FILLED, which correctly handles both
-    fast-close and risk-reject paths.
+    New contract:
+      - Strategy emits intent on bar 1 (session NOT marked yet)
+      - Engine submits to broker, FILL arrives, engine calls
+        strategy.mark_session_traded(symbol, fill_time_utc)
+      - Strategy emits no further intents this symbol/session-date
+
+    This fixes:
+      - Risk-rejected intents NO LONGER consume the session slot
+      - Fast-fill-fast-close STILL protected: FILL event arrives before
+        the next strategy evaluation, marking before re-fire is possible
+
+    Historical note: a prior 2026-05-26 attempt at observation-driven
+    cache was rolled back per Codex HARD-OBJECTION (broke 4% daily-loss
+    bound). Then intent-emission marking was used as the safer-but-
+    imperfect interim. #44 replaces both with engine-driven marking.
     """
     day = dt.date(2026, 5, 13)
     first = candle(dt.datetime(2026, 5, 13, 7, 5, tzinfo=UK), 1.2530)
     second = candle(dt.datetime(2026, 5, 13, 7, 10, tzinfo=UK), 1.2535)
     strategy = FXLondonBreakoutStrategy()
 
-    assert strategy.on_candle_close(ctx(tuple(warmup_before(day) + asian_range(day) + [first]))) is not None
-    assert strategy.on_candle_close(ctx(tuple(warmup_before(day) + asian_range(day) + [first, second]))) is None
+    # First intent fires — session NOT marked yet (engine hasn't been told)
+    first_intent = strategy.on_candle_close(
+        ctx(tuple(warmup_before(day) + asian_range(day) + [first]))
+    )
+    assert first_intent is not None
+
+    # Without the engine callback, second intent ALSO fires — this is the
+    # behavior change vs the pre-#44 intent-emission marking
+    second_intent_no_callback = strategy.on_candle_close(
+        ctx(tuple(warmup_before(day) + asian_range(day) + [first, second]))
+    )
+    assert second_intent_no_callback is not None, (
+        "without mark_session_traded callback, strategy CAN re-fire (this is "
+        "the risk-reject-doesn't-burn-the-slot behavior we wanted)"
+    )
+
+    # Reset strategy, simulate full flow with the engine callback
+    strategy = FXLondonBreakoutStrategy()
+    first_intent = strategy.on_candle_close(
+        ctx(tuple(warmup_before(day) + asian_range(day) + [first]))
+    )
+    assert first_intent is not None
+
+    # Simulate engine ORDER_FILLED handler calling the callback
+    fill_time_utc = dt.datetime(2026, 5, 13, 6, 5, tzinfo=dt.timezone.utc)
+    strategy.mark_session_traded("GBPUSD", fill_time_utc)
+
+    # Now second bar within same UK session is blocked
+    second_intent_with_callback = strategy.on_candle_close(
+        ctx(tuple(warmup_before(day) + asian_range(day) + [first, second]))
+    )
+    assert second_intent_with_callback is None, (
+        "after engine callback marks session, strategy must skip same-symbol "
+        "same-date intents"
+    )
+
+
+def test_mark_session_traded_idempotent() -> None:
+    """Calling twice with same args is safe (set semantics)."""
+    strategy = FXLondonBreakoutStrategy()
+    fill_time_utc = dt.datetime(2026, 5, 13, 6, 5, tzinfo=dt.timezone.utc)
+    strategy.mark_session_traded("GBPUSD", fill_time_utc)
+    strategy.mark_session_traded("GBPUSD", fill_time_utc)
+    strategy.mark_session_traded("GBPUSD", fill_time_utc + dt.timedelta(minutes=1))
+    # All three calls land in the same (symbol, UK-date) key
+    assert ("GBPUSD", dt.date(2026, 5, 13)) in strategy._traded_sessions
+
+
+def test_mark_session_traded_converts_utc_to_uk_date() -> None:
+    """Engine passes UTC, strategy converts to local (UK) for session-key."""
+    strategy = FXLondonBreakoutStrategy()
+    # 23:30 UTC on 2026-05-13 = 00:30 UK on 2026-05-14 (during BST in May)
+    # Pin to a known-correct timezone-aware boundary
+    fill_time_utc = dt.datetime(2026, 5, 14, 6, 5, tzinfo=dt.timezone.utc)
+    strategy.mark_session_traded("EURUSD", fill_time_utc)
+    # 06:05 UTC + 1h BST = 07:05 BST/UK → date is still 2026-05-14
+    assert ("EURUSD", dt.date(2026, 5, 14)) in strategy._traded_sessions
+
+
+def test_mark_session_traded_handles_naive_timestamp_defensively() -> None:
+    """Engine SHOULD pass tz-aware UTC, but if it slips a naive one
+    through the callback should treat it as UTC rather than crash."""
+    strategy = FXLondonBreakoutStrategy()
+    naive_ts = dt.datetime(2026, 5, 13, 6, 5)  # no tzinfo
+    strategy.mark_session_traded("AUDUSD", naive_ts)
+    assert ("AUDUSD", dt.date(2026, 5, 13)) in strategy._traded_sessions
+
+
+def test_strategy_intent_emission_does_not_mark_session_directly() -> None:
+    """Sprint 2 #44 specifically removes the intent-emission marking.
+    After on_candle_close fires an intent, _traded_sessions stays EMPTY
+    until the engine calls mark_session_traded()."""
+    day = dt.date(2026, 5, 13)
+    breakout = candle(dt.datetime(2026, 5, 13, 7, 5, tzinfo=UK), 1.2530)
+    history = tuple(warmup_before(day) + asian_range(day) + [breakout])
+    strategy = FXLondonBreakoutStrategy()
+
+    intent = strategy.on_candle_close(ctx(history))
+    assert intent is not None
+    # KEY assertion: session NOT marked from intent emission alone
+    assert len(strategy._traded_sessions) == 0, (
+        "intent emission must NOT mark session — engine callback owns this "
+        "(removed per Sprint 2 #44 2026-05-30)"
+    )
 
 
 def test_requires_asian_range_history() -> None:
