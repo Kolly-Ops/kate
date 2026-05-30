@@ -103,16 +103,24 @@ class _EntryMarker:
     miss every MT5/Ninja/IG entry fill).
 
     Consumed (popped) on first ORDER_FILLED or ORDER_PARTIAL_FILL — calls
-    strategy.mark_session_traded(symbol, "now" UTC). Removed (without
-    marking) on ORDER_REJECTED or ORDER_CANCELED.
+    strategy.mark_session_traded(symbol, signal_timestamp_utc). Removed
+    (without marking) on ORDER_REJECTED or ORDER_CANCELED.
+
+    `signal_timestamp_utc` is the timestamp of the signal candle that
+    produced this entry. Carried on the marker so session-marking uses
+    the correct UK session date even if the fill event is delayed,
+    replayed, or processed across a UTC/UK boundary (Codex REVIEW-
+    RESPONSE 2026-05-30 P0 on v2 implementation that used wall-clock-
+    at-fill-time).
 
     `strategy_name` is stored for future multi-strategy routing + log
     clarity. Current engine is single-strategy; routing logic lives in
     a future PR.
     """
-    symbol: str              # logical
+    symbol: str                          # logical
     exchange: str
-    strategy_name: str       # for future multi-strategy routing
+    strategy_name: str                   # for future multi-strategy routing
+    signal_timestamp_utc: dt.datetime    # candle timestamp UTC tz-aware
 
 
 @dataclass(frozen=True)
@@ -624,15 +632,21 @@ class ManagedFuturesEngine:
             marker = self._entry_intents.pop(order.client_order_id, None)
             if marker is not None:
                 try:
+                    # Per Codex P0 on v2: pass the SIGNAL candle's
+                    # timestamp (carried on the marker), NOT wall-clock
+                    # at fill time. This preserves correct UK-session
+                    # marking across fill-event delays, replays, and
+                    # UTC/UK date-boundary processing.
                     self.strategy.mark_session_traded(
                         marker.symbol,
-                        dt.datetime.now(dt.timezone.utc),
+                        marker.signal_timestamp_utc,
                     )
                     logger.info(
                         "engine: session marked traded for %s via %s "
-                        "(strategy=%s, coid=%s)",
+                        "(strategy=%s, coid=%s, signal_ts=%s)",
                         marker.symbol, kind.value,
                         marker.strategy_name, order.client_order_id,
+                        marker.signal_timestamp_utc.isoformat(),
                     )
                 except Exception:
                     logger.exception(
@@ -917,10 +931,25 @@ class ManagedFuturesEngine:
         # (MT5/Ninja/IG) AND synthetic-bracket (Sierra/Rithmic) flows.
         # Per Codex HARD-OBJECTION on v1: cannot use _pending_brackets
         # as discriminator because native-bracket flow doesn't populate it.
+        # Per Codex P0 on v2: signal_timestamp_utc must come from the
+        # signal candle, NOT wall-clock at fill time. Fall back to now()
+        # only if a non-session-aware strategy submits without setting
+        # the field (logged so the gap is visible).
+        sig_ts = intent.signal_timestamp_utc
+        if sig_ts is None:
+            sig_ts = dt.datetime.now(dt.timezone.utc)
+            logger.warning(
+                "engine: TradeIntent %s has no signal_timestamp_utc; "
+                "falling back to wall-clock for session marking. "
+                "Session-aware strategies should populate this from "
+                "StrategyContext.candle.timestamp.",
+                intent.intent_id,
+            )
         self._entry_intents[intent.intent_id] = _EntryMarker(
             symbol=intent.symbol,
             exchange=intent.exchange,
             strategy_name=intent.strategy_name,
+            signal_timestamp_utc=sig_ts,
         )
 
         # Cache bracket params keyed by entry coid. Submitted only after

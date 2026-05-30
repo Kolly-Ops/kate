@@ -260,6 +260,15 @@ class FXLondonBreakoutStrategy(Strategy):
         # that's the pre-#44 intent-emission marking. Engine owns it now.
         ymdhm = ts_uk.strftime("%y%m%d%H%M")
         effective_stop_pips = abs(ctx.candle.close - stop_loss) / self.pip_size
+        # Sprint 2 #44 (2026-05-30): carry the signal candle's UTC timestamp
+        # on the intent so the engine can mark the correct session even if
+        # the fill event is delayed/replayed/processed across a UK boundary.
+        # ctx.candle.timestamp is normally tz-aware; convert to UTC.
+        signal_ts = ctx.candle.timestamp
+        if signal_ts.tzinfo is None:
+            signal_ts_utc = signal_ts.replace(tzinfo=dt.timezone.utc)
+        else:
+            signal_ts_utc = signal_ts.astimezone(dt.timezone.utc)
         return TradeIntent(
             intent_id=f"fxlon-{ctx.symbol}-{ymdhm}"[:32],
             strategy_name=self.name,
@@ -273,6 +282,7 @@ class FXLondonBreakoutStrategy(Strategy):
             price=round(ctx.candle.close, 5),
             stop_loss=round(stop_loss, 5),
             take_profit=round(take_profit, 5),
+            signal_timestamp_utc=signal_ts_utc,
             per_contract_margin=ctx.per_contract_margin,
             round_trip_commission=ctx.round_trip_commission,
             reason=(

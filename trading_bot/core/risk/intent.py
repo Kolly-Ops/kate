@@ -9,6 +9,7 @@ positions" pattern.
 """
 from __future__ import annotations
 
+import datetime as dt
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -52,6 +53,19 @@ class TradeIntent:
     # ask. See handoffs/2026-05-18-codex-to-team-REVIEW-RESPONSE-
     # claude-ninja-skeleton-and-bar-publisher.md §3.
     signal_close_price: Optional[float] = None
+
+    # Sprint 2 #44 (2026-05-30): timestamp (UTC, tz-aware) of the signal
+    # candle that triggered this intent. Engine uses this to derive the
+    # session date when calling strategy.mark_session_traded() — using
+    # wall-clock-at-fill-time can mark the wrong UK session if the fill
+    # event is delayed, replayed, or processed around a UTC/UK boundary
+    # (Codex REVIEW-RESPONSE 2026-05-30 P0 finding on #44 v2).
+    # Strategies that emit session-bound intents (e.g. FXLondonBreakout)
+    # populate from StrategyContext.candle.timestamp (converted to UTC if
+    # not already). Default None for backward compat — engine logs a
+    # warning and falls back to wall-clock if a session-aware strategy
+    # forgot to set it.
+    signal_timestamp_utc: Optional[dt.datetime] = None
 
     # Margin the broker will hold for this position (per-contract). Caller
     # supplies it because broker margin tables are external to this module.

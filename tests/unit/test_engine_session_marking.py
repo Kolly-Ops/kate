@@ -97,9 +97,21 @@ def engine_setup(tmp_path: pathlib.Path):
         state.close()
 
 
-def _seed_entry_marker(engine: ManagedFuturesEngine, coid: str = "test-entry-1") -> None:
+def _seed_entry_marker(
+    engine: ManagedFuturesEngine,
+    coid: str = "test-entry-1",
+    signal_timestamp_utc: Optional[dt.datetime] = None,
+) -> dt.datetime:
     """Mimics what _submit_order does after successful broker submit:
-    records the entry order in StateStore and adds an _EntryMarker."""
+    records the entry order in StateStore and adds an _EntryMarker.
+
+    Returns the signal_timestamp_utc used so tests can assert it was
+    propagated to the strategy callback.
+    """
+    if signal_timestamp_utc is None:
+        # Use a fixed, distinct-from-now timestamp by default so tests
+        # detect any wall-clock fallback regression.
+        signal_timestamp_utc = dt.datetime(2026, 5, 13, 6, 5, tzinfo=dt.timezone.utc)
     engine.state.record_order(
         client_order_id=coid,
         symbol="MESM26", exchange="CME",
@@ -110,7 +122,9 @@ def _seed_entry_marker(engine: ManagedFuturesEngine, coid: str = "test-entry-1")
         symbol="MESM26",
         exchange="CME",
         strategy_name="test_strategy",
+        signal_timestamp_utc=signal_timestamp_utc,
     )
+    return signal_timestamp_utc
 
 
 def _make_event(
@@ -140,8 +154,23 @@ def _make_event(
     )
 
 
+def _get_or_create_loop() -> asyncio.AbstractEventLoop:
+    """Python 3.13 deprecates implicit event-loop creation. Workaround
+    matching test_mt5_broker_adapter.py — required when this test suite
+    runs alongside others that close the loop."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError("loop closed")
+        return loop
+    except (RuntimeError, DeprecationWarning):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop
+
+
 def _drive(engine: ManagedFuturesEngine, event: BrokerEvent) -> None:
-    asyncio.get_event_loop().run_until_complete(engine._handle_broker_event(event))
+    _get_or_create_loop().run_until_complete(engine._handle_broker_event(event))
 
 
 # ── Tests ──────────────────────────────────────────────────────────────
@@ -149,7 +178,7 @@ def _drive(engine: ManagedFuturesEngine, event: BrokerEvent) -> None:
 
 def test_order_filled_consumes_marker_and_calls_strategy(engine_setup) -> None:
     engine, _fake, _state, strategy = engine_setup
-    _seed_entry_marker(engine)
+    seeded_ts = _seed_entry_marker(engine)
     assert "test-entry-1" in engine._entry_intents
 
     _drive(engine, _make_event(BrokerEventKind.ORDER_FILLED))
@@ -160,6 +189,47 @@ def test_order_filled_consumes_marker_and_calls_strategy(engine_setup) -> None:
     assert symbol == "MESM26"
     assert ts.tzinfo is not None, "engine must pass tz-aware UTC timestamp"
     assert ts.tzinfo == dt.timezone.utc
+    # Per Codex P0 on v2: engine must pass SIGNAL timestamp from marker,
+    # NOT wall-clock at fill time. Verify the seeded timestamp arrived.
+    assert ts == seeded_ts, (
+        f"engine must pass marker.signal_timestamp_utc ({seeded_ts}), "
+        f"NOT wall-clock fill time ({ts})"
+    )
+
+
+def test_session_marking_uses_signal_timestamp_not_wallclock() -> None:
+    """Sprint 2 #44 P0 regression (Codex 2026-05-30): fill events may
+    arrive HOURS after the signal candle (delayed processing, replay,
+    recovery). The engine must mark the session using the signal
+    candle's timestamp, not wall-clock at fill-handling time. Otherwise
+    a late-Friday fill replayed Monday would mark Monday's session as
+    traded, suppressing a legitimate Monday entry.
+
+    Test: signal candle at 2026-05-13 06:05 UTC (= UK 07:05 BST, session
+    date 2026-05-13). Fill event processed at "much later" — strategy
+    callback must still see the original signal timestamp."""
+    import pathlib, tempfile
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    engine, _fake, state, strategy = _build_engine(tmp)
+    try:
+        signal_ts = dt.datetime(2026, 5, 13, 6, 5, tzinfo=dt.timezone.utc)
+        _seed_entry_marker(engine, signal_timestamp_utc=signal_ts)
+
+        # Sleep briefly so wall-clock visibly differs from the signal ts
+        import time as _time
+        _time.sleep(0.05)
+        _drive(engine, _make_event(BrokerEventKind.ORDER_FILLED))
+
+        assert len(strategy.calls) == 1
+        _symbol, ts_received = strategy.calls[0]
+        # Hard regression: the timestamp passed to the strategy MUST be
+        # the signal timestamp, not wall-clock now.
+        assert ts_received == signal_ts, (
+            f"v2 P0 regression: engine passed wall-clock {ts_received} "
+            f"instead of marker.signal_timestamp_utc {signal_ts}"
+        )
+    finally:
+        state.close()
 
 
 def test_order_partial_fill_consumes_marker_and_calls_strategy(engine_setup) -> None:
