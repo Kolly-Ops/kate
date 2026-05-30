@@ -56,6 +56,7 @@ class FXLondonBreakoutStrategy(Strategy):
         pip_size: float = 0.0001,
         min_range_pips: float = 5.0,
         max_range_pips: float = 120.0,
+        min_breakout_pips: float = 0.0,
         min_stop_pips_by_symbol: Optional[dict[str, float]] = None,
         min_stop_pips_fallback: float = DEFAULT_MIN_STOP_PIPS_FALLBACK,
         fail_on_unknown_symbol: bool = False,
@@ -79,6 +80,8 @@ class FXLondonBreakoutStrategy(Strategy):
             raise ValueError("max_range_pips must be > 0")
         if min_range_pips > max_range_pips:
             raise ValueError("min_range_pips must be <= max_range_pips")
+        if min_breakout_pips < 0:
+            raise ValueError("min_breakout_pips must be >= 0")
         if min_stop_pips_fallback < 0:
             raise ValueError("min_stop_pips_fallback must be >= 0")
 
@@ -89,6 +92,7 @@ class FXLondonBreakoutStrategy(Strategy):
         self.pip_size = pip_size
         self.min_range_pips = min_range_pips
         self.max_range_pips = max_range_pips
+        self.min_breakout_pips = min_breakout_pips
         self.min_stop_pips_by_symbol = (
             dict(min_stop_pips_by_symbol)
             if min_stop_pips_by_symbol is not None
@@ -188,6 +192,31 @@ class FXLondonBreakoutStrategy(Strategy):
                 ctx.symbol, atr_stop_pips, min_stop_pips, stop_distance / self.pip_size,
             )
 
+        # Sprint 2 (2026-05-30): min_breakout_pips guard — reject shallow
+        # breakouts that almost certainly snap back into range. Live
+        # evidence Fri 2026-05-29: AUDUSD fired on 0.5-pip break of a
+        # 13.8-pip range, stopped out in 49 seconds when price retraced
+        # to range-mid. False-breakout / liquidity-hunt pattern is the
+        # documented failure mode; widening the floor doesn't help
+        # because the stop still falls inside the prior range. See
+        # proposals/2026-05-29-claude-audusd-breakout-confirmation-not-floor-tuning.md
+        if ctx.candle.close > range_high:
+            breakout_pips = (ctx.candle.close - range_high) / self.pip_size
+        elif ctx.candle.close < range_low:
+            breakout_pips = (range_low - ctx.candle.close) / self.pip_size
+        else:
+            logger.info(
+                "fxlon %s: skip — no breakout (close %.5f inside range %.5f-%.5f)",
+                ctx.symbol, ctx.candle.close, range_low, range_high,
+            )
+            return None
+        if breakout_pips < self.min_breakout_pips:
+            logger.info(
+                "fxlon %s: skip — shallow breakout (%.2f pips < %.2f min)",
+                ctx.symbol, breakout_pips, self.min_breakout_pips,
+            )
+            return None
+
         side: int
         stop_loss: float
         if ctx.candle.close > range_high:
@@ -196,24 +225,18 @@ class FXLondonBreakoutStrategy(Strategy):
             risk = ctx.candle.close - stop_loss
             take_profit = ctx.candle.close + (risk * self.reward_risk)
             logger.info(
-                "fxlon %s: BREAKOUT HIGH — BUY @ %.5f stop=%.5f tp=%.5f (range %.5f-%.5f)",
-                ctx.symbol, ctx.candle.close, stop_loss, take_profit, range_low, range_high,
+                "fxlon %s: BREAKOUT HIGH — BUY @ %.5f stop=%.5f tp=%.5f (range %.5f-%.5f, breakout=%.2f pips)",
+                ctx.symbol, ctx.candle.close, stop_loss, take_profit, range_low, range_high, breakout_pips,
             )
-        elif ctx.candle.close < range_low:
+        else:
             side = proto.SELL
             stop_loss = min(range_high, ctx.candle.close + stop_distance)
             risk = stop_loss - ctx.candle.close
             take_profit = ctx.candle.close - (risk * self.reward_risk)
             logger.info(
-                "fxlon %s: BREAKOUT LOW — SELL @ %.5f stop=%.5f tp=%.5f (range %.5f-%.5f)",
-                ctx.symbol, ctx.candle.close, stop_loss, take_profit, range_low, range_high,
+                "fxlon %s: BREAKOUT LOW — SELL @ %.5f stop=%.5f tp=%.5f (range %.5f-%.5f, breakout=%.2f pips)",
+                ctx.symbol, ctx.candle.close, stop_loss, take_profit, range_low, range_high, breakout_pips,
             )
-        else:
-            logger.info(
-                "fxlon %s: skip — no breakout (close %.5f inside range %.5f-%.5f)",
-                ctx.symbol, ctx.candle.close, range_low, range_high,
-            )
-            return None
 
         if risk <= 0:
             logger.info("fxlon %s: skip — risk computed <= 0", ctx.symbol)

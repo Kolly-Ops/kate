@@ -689,14 +689,15 @@ class MT5BrokerAdapter(BrokerAdapter):
             closed_tickets = set(self._known_position_tickets.keys()) - set(current_tickets.keys())
             for closed_ticket in closed_tickets:
                 prev = self._known_position_tickets[closed_ticket]
-                await self._alert_position_closed(closed_ticket, prev)
-                # Sprint 2 #45 (2026-05-30): emit POSITION_UPDATE with
-                # quantity=0 so the engine clears the in-memory broker-position
-                # state. Without this, _broker_positions retains the closed
-                # ticket's entry, _has_open_position() keeps returning True for
-                # that symbol, and the strategy loops on "skip - open position"
-                # until supervisor restart. Telegram + log alone were not
-                # enough — engine needs a structured event to mutate state.
+                # Sprint 2 #45 (2026-05-30) + Sprint 3 hardening per Codex
+                # REVIEW-RESPONSE 2026-05-30 (event-ordering): emit
+                # POSITION_UPDATE(quantity=0) FIRST so engine state mutates
+                # before the observability side-effect (Telegram + log) fires.
+                # Without this event, _broker_positions retains the closed
+                # ticket's entry, _has_open_position() returns True forever,
+                # and the strategy loops on "skip - open position" until
+                # supervisor restart. State-event-first ensures any consumer
+                # downstream of the alert sees consistent state.
                 broker_sym = str(prev.get("symbol", ""))
                 if broker_sym:
                     await self._events_q.put(BrokerEvent(
@@ -709,6 +710,7 @@ class MT5BrokerAdapter(BrokerAdapter):
                             side=None,
                         ),
                     ))
+                await self._alert_position_closed(closed_ticket, prev)
             self._known_position_tickets = current_tickets
 
         orders = await asyncio.to_thread(mt5.orders_get)

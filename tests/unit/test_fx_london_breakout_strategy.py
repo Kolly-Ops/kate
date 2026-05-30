@@ -360,3 +360,72 @@ def test_gbpusd_range_clamp_pulls_effective_stop_strictly_below_floor() -> None:
     # The KEY assertion: effective_stop_pips is STRICTLY LESS than the configured floor.
     assert float(intent.metadata["effective_stop_pips"]) < 6.0
     assert float(intent.metadata["effective_stop_pips"]) == pytest.approx(5.9, abs=0.1)
+
+
+# Sprint 2 (2026-05-30) — min_breakout_pips guard
+# Live evidence Fri 2026-05-29: AUDUSD fired on a 0.5-pip break of a 13.8-pip
+# Asian range; stopped out 49 seconds later when price snapped back into range.
+# The fix is breakout-depth confirmation, not floor-widening (widening doesn't
+# help because the stop falls inside the prior range either way).
+
+def test_min_breakout_pips_skips_shallow_long_breakout() -> None:
+    """Default is 0.0 (off). With explicit threshold of 2.0, a 0.5-pip
+    break above range high should be SKIPPED, not turned into an intent."""
+    day = dt.date(2026, 5, 13)
+    # Range high in asian_range() is 1.2520. A close of 1.25205 = 0.5-pip break.
+    shallow = candle(dt.datetime(2026, 5, 13, 7, 5, tzinfo=UK), 1.25205, high=1.25210, low=1.25198)
+    history = tuple(warmup_before(day) + asian_range(day) + [shallow])
+    strategy = FXLondonBreakoutStrategy(min_breakout_pips=2.0)
+
+    intent = strategy.on_candle_close(ctx(history))
+
+    assert intent is None, (
+        "0.5-pip break of a 20-pip range should be skipped under "
+        "min_breakout_pips=2.0 guard (false-breakout / liquidity-hunt protection)"
+    )
+
+
+def test_min_breakout_pips_skips_shallow_short_breakout() -> None:
+    """Symmetric: 0.5-pip break BELOW range low should also be skipped."""
+    day = dt.date(2026, 5, 13)
+    # Range low in asian_range() is 1.2480. A close of 1.24795 = 0.5-pip break.
+    shallow = candle(dt.datetime(2026, 5, 13, 7, 5, tzinfo=UK), 1.24795, high=1.24803, low=1.24790)
+    history = tuple(warmup_before(day) + asian_range(day) + [shallow])
+    strategy = FXLondonBreakoutStrategy(min_breakout_pips=2.0)
+
+    assert strategy.on_candle_close(ctx(history)) is None
+
+
+def test_min_breakout_pips_allows_deep_break() -> None:
+    """Adequate breakout (>= threshold) must still fire. Default test
+    breakout in test_long_breakout uses 1.2530 vs range_high 1.2520 =
+    10-pip break — well above 2.0 threshold."""
+    day = dt.date(2026, 5, 13)
+    deep = candle(dt.datetime(2026, 5, 13, 7, 5, tzinfo=UK), 1.2530, high=1.2532, low=1.2527)
+    history = tuple(warmup_before(day) + asian_range(day) + [deep])
+    strategy = FXLondonBreakoutStrategy(min_breakout_pips=2.0)
+
+    intent = strategy.on_candle_close(ctx(history))
+
+    assert intent is not None, "10-pip break must pass 2.0-pip threshold"
+    assert intent.side == proto.BUY
+
+
+def test_min_breakout_pips_default_is_zero_preserves_legacy_behavior() -> None:
+    """Without explicit min_breakout_pips, the guard is disabled. This
+    preserves backward compatibility with existing Front 4 production
+    config; the guard is opt-in via explicit parameter."""
+    day = dt.date(2026, 5, 13)
+    shallow = candle(dt.datetime(2026, 5, 13, 7, 5, tzinfo=UK), 1.25205, high=1.25210, low=1.25198)
+    history = tuple(warmup_before(day) + asian_range(day) + [shallow])
+    strategy = FXLondonBreakoutStrategy()  # default min_breakout_pips=0.0
+
+    intent = strategy.on_candle_close(ctx(history))
+
+    assert intent is not None, "with default 0.0 guard, even a 0.5-pip break fires"
+
+
+def test_min_breakout_pips_validates_negative() -> None:
+    """Defensive: reject negative threshold."""
+    with pytest.raises(ValueError, match="min_breakout_pips"):
+        FXLondonBreakoutStrategy(min_breakout_pips=-0.1)
