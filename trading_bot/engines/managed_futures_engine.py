@@ -124,6 +124,26 @@ class _EntryMarker:
 
 
 @dataclass(frozen=True)
+class PreflightReport:
+    """Sprint 3 (2026-05-31) State Hygiene Preflight result, per Codex
+    HANDOFF 2026-05-30 (permanent fix for the DB-rotation pattern).
+
+    block_trading=True means the supervisor MUST halt — there's real
+    broker exposure or active broker orders that have no local record,
+    requiring human review before any strategy can submit new orders.
+    Auto-correcting in that direction could destroy real money.
+
+    block_trading=False means hygiene-safe drifts were repaired and
+    trading can proceed normally.
+    """
+    block_trading: bool
+    block_reason: str
+    cleared_positions: tuple[tuple[str, str], ...]   # (symbol, exchange) pairs
+    marked_stale_orders: tuple[str, ...]              # client_order_ids
+    healthy: bool                                     # True iff zero drift detected
+
+
+@dataclass(frozen=True)
 class InstrumentMeta:
     """Per-instrument calibration. Sourced from config/instruments.json.
 
@@ -447,16 +467,23 @@ class ManagedFuturesEngine:
 
         # Positions — seed broker_positions snapshot from whatever the
         # broker reports. Empty tuple means flat.
+        # 2026-05-31 (Sprint 3, Codex REVIEW-RESPONSE HARD-OBJECTION):
+        # MUST raise on BrokerError. State Hygiene Preflight downstream
+        # compares local state against this snapshot — silently falling
+        # back to () would let preflight misread "broker unreachable" as
+        # "broker flat" and auto-clear real local positions. If broker
+        # truth can't be fetched, the only safe state is "do not trade."
         try:
             positions = await self.broker.request_positions(
                 trade_account=self.trade_account,
             )
         except BrokerError:
             logger.exception(
-                "engine: broker.request_positions failed; proceeding with "
-                "empty broker_positions (reconciler will catch any gap)"
+                "engine: broker.request_positions failed; engine cannot "
+                "start without an authoritative broker position snapshot "
+                "(preflight depends on it)"
             )
-            positions = ()
+            raise
         for pos in positions:
             meta = self.instruments.get(pos.symbol)
             exchange = meta.exchange if meta is not None else ""
@@ -467,16 +494,22 @@ class ManagedFuturesEngine:
         # Open orders — seed broker_orders snapshot. Returned OrderEvents
         # are by definition WORKING (otherwise they wouldn't be in the
         # broker's open-order list).
+        # 2026-05-31 (Sprint 3, Codex REVIEW-RESPONSE HARD-OBJECTION):
+        # MUST raise on BrokerError, same rationale as request_positions
+        # above — preflight reads this snapshot to decide whether to mark
+        # local active orders stale; a swallowed failure would cancel
+        # real working orders.
         try:
             open_orders = await self.broker.request_open_orders(
                 trade_account=self.trade_account,
             )
         except BrokerError:
             logger.exception(
-                "engine: broker.request_open_orders failed; proceeding with "
-                "empty broker_orders (reconciler will catch any gap)"
+                "engine: broker.request_open_orders failed; engine cannot "
+                "start without an authoritative broker working-orders "
+                "snapshot (preflight depends on it)"
             )
-            open_orders = ()
+            raise
         for order in open_orders:
             self._broker_orders[order.client_order_id] = RemoteOrder(
                 client_order_id=order.client_order_id, status="WORKING",
@@ -1095,6 +1128,141 @@ class ManagedFuturesEngine:
                 if t >= start or t < end:
                     return True
         return False
+
+    # ── State Hygiene Preflight (Sprint 3, 2026-05-31) ────────────────────
+    def run_state_hygiene_preflight(self) -> PreflightReport:
+        """Compare local StateStore against in-memory broker truth and
+        repair safe drifts. Trip on unsafe drifts.
+
+        Per Codex HANDOFF 2026-05-30 — permanent fix for the recurring
+        DB-rotation pattern. MUST be called after _seed_broker_state()
+        (so _broker_positions/_broker_orders reflect broker reality) and
+        BEFORE any strategy candle dispatch.
+
+        Four-quadrant policy:
+
+        1. Local-only position, broker flat → AUTO-CLEAR local row.
+           This is the documented Wed/Thu/Fri phantom pattern post-#45
+           shipping. Safe to repair: broker is authoritative, broker says
+           we're flat, local stale row must go.
+
+        2. Broker-only position, local missing → BLOCK TRADING.
+           There is real broker-side exposure we have no record of.
+           Auto-clearing would destroy real money; auto-recording would
+           guess at entry price/side/quantity. Human must review.
+
+        3. Local-pending/working order, broker absent → MARK STALE
+           (set status=CANCELLED with reason='stale: broker absent').
+           Safe to repair: broker would have rejected/cancelled the order;
+           our local row leaked through. Strategy can re-attempt.
+
+        4. Broker-working order, local missing → BLOCK TRADING.
+           The broker is holding an active order we have no record of.
+           Could be a leftover from a previous run; could be a real
+           working order we lost track of. Human must review.
+
+        Returns a PreflightReport. Caller (supervisor) MUST honor
+        report.block_trading=True by halting startup. Per the design,
+        this lets NSSM/schtasks restart loop until the operator
+        intervenes — that's the right signal that human review is
+        needed (rather than silently auto-correcting toward broker
+        truth and possibly losing real exposure).
+        """
+        local_positions = self.state.get_open_positions()
+        local_orders = self.state.get_active_orders()
+        broker_positions = self._broker_positions  # in-memory snapshot
+        broker_orders = self._broker_orders
+
+        # Build lookup sets for fast membership checks
+        local_position_keys = {(p.symbol, p.exchange) for p in local_positions}
+        broker_position_keys = set(broker_positions.keys())
+        local_order_coids = {o.client_order_id for o in local_orders}
+        broker_order_coids = set(broker_orders.keys())
+
+        cleared_positions: list[tuple[str, str]] = []
+        marked_stale_orders: list[str] = []
+        block_reasons: list[str] = []
+
+        # Quadrant 1: local-only positions → auto-clear
+        local_only_positions = local_position_keys - broker_position_keys
+        for symbol, exchange in local_only_positions:
+            self.state.close_stale_position(
+                symbol=symbol,
+                exchange=exchange,
+                reason="preflight: broker reports flat, local row was stale",
+            )
+            cleared_positions.append((symbol, exchange))
+            logger.warning(
+                "preflight: cleared stale local position %s/%s (broker reports flat)",
+                symbol, exchange,
+            )
+
+        # Quadrant 2: broker-only positions → block startup
+        broker_only_positions = broker_position_keys - local_position_keys
+        for symbol, exchange in broker_only_positions:
+            pos = broker_positions[(symbol, exchange)]
+            block_reasons.append(
+                f"broker holds {symbol}/{exchange} (qty={pos.quantity}) "
+                f"with no local record"
+            )
+            logger.critical(
+                "preflight: BROKER-ONLY POSITION — %s/%s qty=%s, no local row. "
+                "Refusing to proceed. Human review required.",
+                symbol, exchange, pos.quantity,
+            )
+
+        # Quadrant 3: local-only active orders → mark stale
+        local_only_orders = local_order_coids - broker_order_coids
+        for coid in local_only_orders:
+            self.state.mark_stale_order(
+                client_order_id=coid,
+                reason="preflight: broker has no record of this order",
+            )
+            marked_stale_orders.append(coid)
+            logger.warning(
+                "preflight: marked stale local order %s (broker absent)",
+                coid,
+            )
+
+        # Quadrant 4: broker-working orders without local record → block startup
+        broker_only_orders = broker_order_coids - local_order_coids
+        for coid in broker_only_orders:
+            block_reasons.append(
+                f"broker has order {coid} working with no local record"
+            )
+            logger.critical(
+                "preflight: BROKER-ORPHAN ORDER — coid=%s working at broker, "
+                "no local row. Refusing to proceed. Human review required.",
+                coid,
+            )
+
+        block_trading = bool(block_reasons)
+        healthy = (
+            not block_trading
+            and not cleared_positions
+            and not marked_stale_orders
+        )
+
+        if healthy:
+            logger.info("preflight: clean — no drift detected, proceeding")
+        elif block_trading:
+            logger.critical(
+                "preflight: BLOCKING TRADING — %d unsafe drift(s): %s",
+                len(block_reasons), "; ".join(block_reasons),
+            )
+        else:
+            logger.warning(
+                "preflight: repaired %d position(s), %d order(s); proceeding",
+                len(cleared_positions), len(marked_stale_orders),
+            )
+
+        return PreflightReport(
+            block_trading=block_trading,
+            block_reason="; ".join(block_reasons) if block_reasons else "",
+            cleared_positions=tuple(cleared_positions),
+            marked_stale_orders=tuple(marked_stale_orders),
+            healthy=healthy,
+        )
 
     # ── Reconciliation ────────────────────────────────────────────────────
     def _run_reconciliation(self) -> ReconciliationReport:

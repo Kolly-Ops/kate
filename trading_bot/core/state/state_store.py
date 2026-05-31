@@ -262,6 +262,24 @@ class StateStore:
             )
             return cur.rowcount > 0
 
+    def close_stale_position(self, *, symbol: str, exchange: str, reason: str) -> bool:
+        """Sprint 3 (2026-05-31) state-hygiene helper. Delete a local position
+        row that the broker no longer reports.
+
+        Behavior is identical to close_position(); the distinct entry point
+        exists so callers can signal "this is hygiene cleanup, not normal
+        close" — auditors / log readers can grep for close_stale_position
+        calls when reconstructing why a position disappeared from local
+        state without a corresponding ORDER_FILLED exit.
+
+        Returns True iff a row was actually deleted (i.e. there was a stale
+        row to clean). Caller is responsible for activity-chain logging.
+        Per Codex HANDOFF 2026-05-30: this MUST only be called for positions
+        where the broker reports flat — never use this on positions the
+        broker still confirms (that would mask real exposure).
+        """
+        return self.close_position(symbol=symbol, exchange=exchange)
+
     def get_position(self, *, symbol: str, exchange: str) -> Optional[Position]:
         row = self.conn.execute(
             "SELECT * FROM positions WHERE symbol = ? AND exchange = ?",
@@ -350,6 +368,33 @@ class StateStore:
             (ORDER_STATUS_PENDING, ORDER_STATUS_WORKING),
         ).fetchall()
         return [_row_to_order(r) for r in rows]
+
+    def mark_stale_order(self, *, client_order_id: str, reason: str) -> Optional[Order]:
+        """Sprint 3 (2026-05-31) state-hygiene helper. Mark a locally-PENDING
+        or WORKING order as CANCELLED with a stale-state reason, when the
+        broker has no record of it.
+
+        Reason is stored in rejected_reason (the existing column) with a
+        'stale: ' prefix so audits can tell hygiene-cancels from broker-side
+        rejects. Per Codex HANDOFF 2026-05-30: only call when the broker
+        confirms the order is absent — never use this for orders still
+        WORKING at the broker (that would mask a real fill we missed).
+
+        Returns the updated Order, or None if the client_order_id doesn't
+        exist locally.
+
+        NOT independently idempotent: calling this directly on an already-
+        CANCELLED row will overwrite its rejected_reason. The preflight
+        path is safe because get_active_orders() excludes terminal-status
+        rows, so a second preflight run does not re-call this helper on
+        the same coid. Callers outside preflight should status-check
+        first if they need idempotency.
+        """
+        return self.update_order_status(
+            client_order_id=client_order_id,
+            status=ORDER_STATUS_CANCELLED,
+            rejected_reason=f"stale: {reason}",
+        )
 
     # ── Kill switch ───────────────────────────────────────────────────────
     def trip_kill_switch(self, *, reason: str) -> KillSwitch:

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import datetime as dt
 import json
 import logging
@@ -43,7 +44,7 @@ from trading_bot.core.execution import (
     NinjaConfig,
     dtc_protocol as proto,
 )
-from trading_bot.core.execution.broker_adapter import BrokerSymbolSpec
+from trading_bot.core.execution.broker_adapter import BrokerError, BrokerSymbolSpec
 from trading_bot.core.execution.dtc_broker_adapter import DTCBrokerAdapter
 from trading_bot.core.risk import RiskManager, RiskPolicy
 from trading_bot.core.state import Reconciler, StateStore
@@ -922,6 +923,64 @@ async def _run(args: argparse.Namespace) -> int:
                 "IP not in Sierra's allow-list.", e,
             )
             return 2
+        except BrokerError as e:
+            # 2026-05-31 (Sprint 3 P0 fix per Codex REVIEW-RESPONSE):
+            # broker position/open-orders seed failures are now fatal so
+            # the State Hygiene Preflight never runs against an empty
+            # snapshot that was empty-because-failed. Without this branch
+            # the BrokerError would propagate to asyncio.run and produce
+            # an opaque traceback; here we log a clear operator message
+            # and return a dedicated exit code.
+            LOGGER.error(
+                "supervisor: broker state seed failed — %s. Cannot start "
+                "without an authoritative broker position/orders snapshot "
+                "(State Hygiene Preflight depends on it). Restart will "
+                "keep failing until broker connectivity is restored.", e,
+            )
+            # Codex REVIEW-RESPONSE 2 (P1): best-effort cleanup. If
+            # broker.connect() succeeded before request_positions/orders
+            # raised, sockets + adapter pump tasks may still be live.
+            # Process exit closes them implicitly but explicit stop()
+            # reduces stale-client risk on the broker side (e.g., Sierra
+            # holding our DTC slot through next restart).
+            with contextlib.suppress(Exception):
+                await engine.stop()
+            return 4
+
+        # State Hygiene Preflight (Sprint 3, 2026-05-31) — runs AFTER
+        # engine.start() seeds broker positions/orders, BEFORE strategy
+        # dispatch begins. Auto-clears stale local rows; trips startup
+        # on any broker-only exposure that requires human review.
+        # Permanent fix for the DB-rotation pattern (Codex HANDOFF
+        # 2026-05-30).
+        preflight = engine.run_state_hygiene_preflight()
+        if preflight.block_trading:
+            # Per Codex P1: if any safe repairs ran BEFORE the blocking
+            # drift was detected, surface them in the same operator log
+            # so the post-restart DB state isn't a surprise.
+            if preflight.cleared_positions or preflight.marked_stale_orders:
+                LOGGER.error(
+                    "supervisor: state-hygiene preflight blocked startup — %s. "
+                    "NOTE: %d local position(s) and %d local order(s) WERE "
+                    "already repaired before the block; cleared_positions=%s, "
+                    "marked_stale_orders=%s. Human review required. Restart "
+                    "will keep failing until the broker-side drift is "
+                    "reconciled.",
+                    preflight.block_reason,
+                    len(preflight.cleared_positions),
+                    len(preflight.marked_stale_orders),
+                    list(preflight.cleared_positions),
+                    list(preflight.marked_stale_orders),
+                )
+            else:
+                LOGGER.error(
+                    "supervisor: state-hygiene preflight blocked startup — %s. "
+                    "Human review required. Restart will keep failing until "
+                    "the broker-side drift is reconciled.",
+                    preflight.block_reason,
+                )
+            await engine.stop()
+            return 3
 
         run_task = asyncio.create_task(engine.run(), name="engine.run")
         stop_task = asyncio.create_task(stop_event.wait(), name="stop_signal")
