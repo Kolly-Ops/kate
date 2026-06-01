@@ -319,7 +319,7 @@ class IGBrokerAdapter(BrokerAdapter):
         # Z6BHQ1 spread-bet) regardless of the user's preferred-account
         # setting in My IG. This is load-bearing for the CGT-free path.
         if current != self.config.active_account_id:
-            await self._request(
+            _, put_headers = await self._request(
                 "PUT",
                 "/session",
                 version=1,
@@ -328,7 +328,12 @@ class IGBrokerAdapter(BrokerAdapter):
                     "accountId": self.config.active_account_id,
                     "defaultAccountId": self.config.active_account_id,
                 },
+                return_headers=True,
             )
+            if put_headers.get("CST"):
+                self._cst = put_headers.get("CST")
+            if put_headers.get("X-SECURITY-TOKEN"):
+                self._security_token = put_headers.get("X-SECURITY-TOKEN")
             logger.info(
                 "IG account switched to %s (was %s)",
                 self.config.active_account_id, current,
