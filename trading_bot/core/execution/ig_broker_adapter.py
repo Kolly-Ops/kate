@@ -7,14 +7,12 @@ exists alongside the CFD-based MT5 Front 4 lane.
 
 Design choices
 --------------
-1. **REST-only v0.** IG offers a Lightstreamer streaming feed for
-   real-time prices, but the streaming client requires the
-   `lightstreamer-client-lib` package and a different connection
-   model. For v0 we poll the REST `/markets/{epic}` endpoint on a
-   per-minute cadence (FX London Breakout strategy only acts on
-   candle-close anyway, so sub-minute ticks aren't load-bearing).
-   Polling 4 pairs × 1/min = 240 reqs/hour, well inside IG's
-   60-per-minute default rate cap. Lightstreamer is a v1 follow-up.
+1. **Lightstreamer-first prices.** IG's REST `/markets/{epic}`
+   endpoint is metadata/session sanity only, not the live tick source.
+   Live prices arrive through Lightstreamer PRICE subscriptions and
+   are aggregated locally into closed minute bars. If the optional
+   `lightstreamer-client-lib` package is unavailable, the adapter
+   falls back to low-cadence REST polling for continuity.
 
 2. **Auth model.** POST `/session` returns CST + X-SECURITY-TOKEN
    headers. Every subsequent request includes those plus the API key.
@@ -54,7 +52,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Callable, Optional, Protocol
 
 import requests
 
@@ -62,6 +60,7 @@ from . import dtc_protocol as proto
 from ..data import Candle
 from .broker_adapter import (
     AccountBalanceEvent,
+    BarEvent,
     BrokerAdapter,
     BrokerError,
     BrokerEvent,
@@ -171,6 +170,158 @@ class IGConfig:
         )
 
 
+IGStreamUpdateCallback = Callable[[IGSymbolSpec, dict[str, Any]], None]
+
+
+class IGStreamingClient(Protocol):
+    async def connect(
+        self, *, endpoint: str, account_id: str, cst: str, security_token: str,
+    ) -> None:
+        ...
+
+    async def subscribe_price(
+        self, *, spec: IGSymbolSpec, account_id: str,
+        callback: IGStreamUpdateCallback,
+    ) -> None:
+        ...
+
+    async def disconnect(self) -> None:
+        ...
+
+
+@dataclass
+class _MinuteBarBuilder:
+    minute_start: dt.datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: int = 1
+
+    @classmethod
+    def from_tick(cls, tick: MarketDataTick) -> "_MinuteBarBuilder":
+        minute = _floor_utc_minute(tick.timestamp)
+        price = float(tick.last_price)
+        return cls(
+            minute_start=minute,
+            open=price,
+            high=price,
+            low=price,
+            close=price,
+            volume=max(1, int(tick.last_size or 0)),
+        )
+
+    def update(self, tick: MarketDataTick) -> None:
+        price = float(tick.last_price)
+        self.high = max(self.high, price)
+        self.low = min(self.low, price)
+        self.close = price
+        self.volume += max(1, int(tick.last_size or 0))
+
+    def to_bar_event(self, symbol: str) -> BarEvent:
+        return BarEvent(
+            symbol=symbol,
+            timestamp=self.minute_start,
+            timeframe_minutes=1,
+            open=self.open,
+            high=self.high,
+            low=self.low,
+            close=self.close,
+            volume=self.volume,
+        )
+
+
+class _LightstreamerSDKPriceClient:
+    """Thin wrapper around lightstreamer-client-lib.
+
+    IG's current price stream is PRICE:{account}:{epic} through the
+    Pricing adapter. MARKET:{epic} is deprecated/decommissioned, so keep
+    that older item shape out of the production path.
+    """
+
+    _FIELDS = ["BIDPRICE1", "ASKPRICE1", "TIMESTAMP", "DELAY"]
+
+    def __init__(self) -> None:
+        self._client: Any = None
+        self._subscriptions: list[Any] = []
+
+    async def connect(
+        self, *, endpoint: str, account_id: str, cst: str, security_token: str,
+    ) -> None:
+        try:
+            from lightstreamer.client import LightstreamerClient
+        except ImportError as exc:
+            raise BrokerError(
+                "IG Lightstreamer support requires package "
+                "'lightstreamer-client-lib'. Install it before enabling "
+                "Front 7 streaming."
+            ) from exc
+
+        def _connect() -> None:
+            client = LightstreamerClient(endpoint, "DEFAULT")
+            client.connectionDetails.setUser(account_id)
+            client.connectionDetails.setPassword(f"CST-{cst}|XST-{security_token}")
+            client.connect()
+            self._client = client
+
+        await asyncio.to_thread(_connect)
+
+    async def subscribe_price(
+        self, *, spec: IGSymbolSpec, account_id: str,
+        callback: IGStreamUpdateCallback,
+    ) -> None:
+        if self._client is None:
+            raise BrokerError("IG Lightstreamer client is not connected")
+        try:
+            from lightstreamer.client import Subscription, SubscriptionListener
+        except ImportError as exc:
+            raise BrokerError(
+                "IG Lightstreamer support requires package "
+                "'lightstreamer-client-lib'."
+            ) from exc
+
+        fields = ["BID", "OFFER", "UPDATE_TIME"]
+        item = f"MARKET:{spec.epic}"
+
+        class _Listener(SubscriptionListener):
+            def onItemUpdate(self, update: Any) -> None:
+                callback(spec, {field: update.getValue(field) for field in fields})
+
+            def onSubscriptionError(self, code: Any, message: Any) -> None:
+                logger.error(
+                    "IG Lightstreamer subscription error item=%s code=%s message=%s",
+                    item, code, message,
+                )
+
+        def _subscribe() -> None:
+            sub = Subscription("MERGE", [item], fields)
+            sub.setDataAdapter("Pricing")
+            sub.setRequestedSnapshot("yes")
+            sub.addListener(_Listener())
+            self._client.subscribe(sub)
+            self._subscriptions.append(sub)
+
+        await asyncio.to_thread(_subscribe)
+
+    async def disconnect(self) -> None:
+        client = self._client
+        if client is None:
+            return
+
+        def _disconnect() -> None:
+            for sub in list(self._subscriptions):
+                with contextlib.suppress(Exception):
+                    client.unsubscribe(sub)
+            self._subscriptions.clear()
+            with contextlib.suppress(Exception):
+                client.disconnect()
+            with contextlib.suppress(Exception):
+                client.closeConnection()
+            self._client = None
+
+        await asyncio.to_thread(_disconnect)
+
+
 class IGBrokerAdapter(BrokerAdapter):
     """BrokerAdapter implementation for IG Markets REST API.
 
@@ -188,10 +339,19 @@ class IGBrokerAdapter(BrokerAdapter):
         config: IGConfig,
         symbol_map: dict[str, IGSymbolSpec],
         http_session: Optional[Any] = None,
+        streaming_client_factory: Optional[Callable[[], IGStreamingClient]] = None,
+        emit_stream_ticks: bool = False,
     ) -> None:
         self.config = config
         self.symbol_map = dict(symbol_map)
         self._http = http_session if http_session is not None else requests.Session()
+        self._streaming_client_factory = (
+            streaming_client_factory or _LightstreamerSDKPriceClient
+        )
+        self._stream_client: Optional[IGStreamingClient] = None
+        self._stream_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._stream_subscribed_symbols: set[str] = set()
+        self._emit_stream_ticks = emit_stream_ticks
         self._connected = False
         self._cst: Optional[str] = None
         self._security_token: Optional[str] = None
@@ -200,6 +360,7 @@ class IGBrokerAdapter(BrokerAdapter):
         self._subscribed_symbols: set[str] = set()
         self._events_q: asyncio.Queue[BrokerEvent] = asyncio.Queue()
         self._poll_task: Optional[asyncio.Task[None]] = None
+        self._bar_builders: dict[str, _MinuteBarBuilder] = {}
         self._last_account_hash: Optional[tuple[Any, ...]] = None
         self._last_positions_hash: Optional[tuple[Any, ...]] = None
         self._last_orders_hash: Optional[tuple[Any, ...]] = None
@@ -340,6 +501,8 @@ class IGBrokerAdapter(BrokerAdapter):
             )
 
         self._connected = True
+        self._stream_loop = asyncio.get_running_loop()
+        await self._start_streaming_client()
         await self._events_q.put(BrokerEvent(
             kind=BrokerEventKind.CONNECTED,
             received_at=time.time(),
@@ -354,6 +517,12 @@ class IGBrokerAdapter(BrokerAdapter):
         self._poll_task = asyncio.create_task(self._poll_loop(), name="ig-adapter-poll")
 
     async def disconnect(self) -> None:
+        if self._stream_client is not None:
+            with contextlib.suppress(Exception):
+                await self._stream_client.disconnect()
+            self._stream_client = None
+        self._stream_subscribed_symbols.clear()
+        self._stream_loop = None
         if self._poll_task is not None:
             self._poll_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -485,6 +654,7 @@ class IGBrokerAdapter(BrokerAdapter):
             received_at=time.time(),
             tick=tick,
         ))
+        await self._subscribe_streaming_price(spec)
 
     async def get_recent_candles(
         self, *, symbol: str, count: int, timeframe_minutes: int = 1,
@@ -511,11 +681,11 @@ class IGBrokerAdapter(BrokerAdapter):
                 f"{timeframe_minutes}; supported={list(resolution_map)}"
             )
         spec = self._spec(symbol)
-        # IG's /prices endpoint with the count-style URL is at v3
-        # (legacy v1/v2 used pageSize+pageNumber and could rate-limit
-        # us harder). v3 returns numPoints bars ending at "now".
+        # IG's count-style /prices URL is exposed on v1/v2. v3 is the
+        # bare /prices/{epic} shape and returns 404 for
+        # /prices/{epic}/{resolution}/{numPoints} on demo.
         path = f"/prices/{spec.epic}/{resolution}/{count}"
-        body = await self._request("GET", path, version=3)
+        body = await self._request("GET", path, version=2)
         prices = body.get("prices") or []
         if not prices:
             logger.warning(
@@ -593,6 +763,138 @@ class IGBrokerAdapter(BrokerAdapter):
         )
 
     # ── Order management ─────────────────────────────────────────────────
+
+    async def _start_streaming_client(self) -> None:
+        if not self._lightstreamer_endpoint:
+            logger.warning(
+                "IG /session did not return lightstreamerEndpoint; "
+                "falling back to REST market polling"
+            )
+            return
+        if not self._cst or not self._security_token:
+            logger.warning(
+                "IG Lightstreamer not started because session tokens are missing"
+            )
+            return
+        try:
+            client = self._streaming_client_factory()
+            await client.connect(
+                endpoint=self._lightstreamer_endpoint,
+                account_id=self.config.active_account_id,
+                cst=self._cst,
+                security_token=self._security_token,
+            )
+        except Exception as exc:
+            logger.warning(
+                "IG Lightstreamer start failed; falling back to REST polling: %s",
+                exc,
+            )
+            self._stream_client = None
+            return
+        self._stream_client = client
+        logger.info(
+            "IG Lightstreamer connected endpoint=%s account=%s",
+            self._lightstreamer_endpoint,
+            self.config.active_account_id,
+        )
+
+    async def _subscribe_streaming_price(self, spec: IGSymbolSpec) -> None:
+        if self._stream_client is None:
+            return
+        if spec.logical_symbol in self._stream_subscribed_symbols:
+            return
+        await self._stream_client.subscribe_price(
+            spec=spec,
+            account_id=self.config.active_account_id,
+            callback=self._on_stream_price_update,
+        )
+        self._stream_subscribed_symbols.add(spec.logical_symbol)
+        logger.info(
+            "IG Lightstreamer subscribed PRICE:%s:%s",
+            self.config.active_account_id,
+            spec.epic,
+        )
+
+    def _on_stream_price_update(
+        self, spec: IGSymbolSpec, fields: dict[str, Any],
+    ) -> None:
+        loop = self._stream_loop
+        if loop is None or loop.is_closed():
+            logger.warning(
+                "IG Lightstreamer update dropped for %s; event loop unavailable",
+                spec.logical_symbol,
+            )
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._handle_stream_price_update(spec, fields),
+            loop,
+        )
+
+    async def _handle_stream_price_update(
+        self, spec: IGSymbolSpec, fields: dict[str, Any],
+    ) -> None:
+        bid_raw = fields.get("BIDPRICE1") or fields.get("BID")
+        ask_raw = fields.get("ASKPRICE1") or fields.get("OFFER")
+        try:
+            bid = float(bid_raw) if bid_raw not in (None, "") else None
+            ask = float(ask_raw) if ask_raw not in (None, "") else None
+        except (TypeError, ValueError):
+            logger.warning(
+                "IG Lightstreamer bad price update for %s: %s",
+                spec.logical_symbol,
+                fields,
+            )
+            return
+        if bid is None and ask is None:
+            return
+        last_price = (
+            (bid + ask) / 2.0 if bid is not None and ask is not None
+            else float(bid if bid is not None else ask)
+        )
+        tick = MarketDataTick(
+            symbol=spec.logical_symbol,
+            timestamp=_parse_ig_stream_timestamp(fields.get("UPDATE_TIME") or fields.get("TIMESTAMP")),
+            last_price=last_price,
+            last_size=1.0,
+            bid=bid,
+            ask=ask,
+        )
+        if self._emit_stream_ticks:
+            await self._events_q.put(BrokerEvent(
+                kind=BrokerEventKind.MARKET_DATA_TICK,
+                received_at=time.time(),
+                tick=tick,
+            ))
+        await self._update_bar_builder_and_maybe_emit(tick)
+
+    async def _update_bar_builder_and_maybe_emit(
+        self, tick: MarketDataTick,
+    ) -> None:
+        minute = _floor_utc_minute(tick.timestamp)
+        builder = self._bar_builders.get(tick.symbol)
+        if builder is None:
+            self._bar_builders[tick.symbol] = _MinuteBarBuilder.from_tick(tick)
+            return
+        if minute == builder.minute_start:
+            builder.update(tick)
+            return
+        closed = builder.to_bar_event(tick.symbol)
+        self._bar_builders[tick.symbol] = _MinuteBarBuilder.from_tick(tick)
+        logger.info(
+            "IG CLOSED BAR %s ts=%s o=%.5f h=%.5f l=%.5f c=%.5f v=%d",
+            closed.symbol,
+            closed.timestamp.isoformat(),
+            closed.open,
+            closed.high,
+            closed.low,
+            closed.close,
+            closed.volume,
+        )
+        await self._events_q.put(BrokerEvent(
+            kind=BrokerEventKind.MARKET_DATA_BAR,
+            received_at=time.time(),
+            bar=closed,
+        ))
 
     async def submit_order(
         self,
@@ -826,22 +1128,24 @@ class IGBrokerAdapter(BrokerAdapter):
         except BrokerError as exc:
             logger.warning("IG poll positions failed: %s", exc)
 
-        # Ticks — fetch one mid-price snapshot per subscribed symbol
-        for logical in tuple(self._subscribed_symbols):
-            try:
-                spec = self._spec(logical)
-                tick = await self._fetch_market_tick(spec)
-                tick_hash = (tick.bid, tick.ask, tick.timestamp.isoformat())
-                if tick_hash == self._last_tick_hashes.get(logical):
-                    continue
-                self._last_tick_hashes[logical] = tick_hash
-                await self._events_q.put(BrokerEvent(
-                    kind=BrokerEventKind.MARKET_DATA_TICK,
-                    received_at=time.time(),
-                    tick=tick,
-                ))
-            except BrokerError as exc:
-                logger.warning("IG poll tick for %s failed: %s", logical, exc)
+        # Ticks - REST fallback only. When Lightstreamer is connected it
+        # is the live price source; /markets is not fresh enough for bars.
+        if self._stream_client is None:
+            for logical in tuple(self._subscribed_symbols):
+                try:
+                    spec = self._spec(logical)
+                    tick = await self._fetch_market_tick(spec)
+                    tick_hash = (tick.bid, tick.ask, tick.timestamp.isoformat())
+                    if tick_hash == self._last_tick_hashes.get(logical):
+                        continue
+                    self._last_tick_hashes[logical] = tick_hash
+                    await self._events_q.put(BrokerEvent(
+                        kind=BrokerEventKind.MARKET_DATA_TICK,
+                        received_at=time.time(),
+                        tick=tick,
+                    ))
+                except BrokerError as exc:
+                    logger.warning("IG poll tick for %s failed: %s", logical, exc)
 
     async def _fetch_raw_positions(self) -> list[dict[str, Any]]:
         body = await self._request("GET", "/positions", version=2)
@@ -914,6 +1218,26 @@ def _mid_price(price_block: Any) -> float:
     if bid is not None and ask is not None:
         return (float(bid) + float(ask)) / 2.0
     return float(bid or ask or 0.0)
+
+
+def _floor_utc_minute(value: dt.datetime) -> dt.datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=dt.timezone.utc)
+    else:
+        value = value.astimezone(dt.timezone.utc)
+    return value.replace(second=0, microsecond=0)
+
+
+def _parse_ig_stream_timestamp(value: Any) -> dt.datetime:
+    if value not in (None, ""):
+        with contextlib.suppress(TypeError, ValueError):
+            millis = int(float(value))
+            if millis > 0:
+                return dt.datetime.fromtimestamp(
+                    millis / 1000.0,
+                    tz=dt.timezone.utc,
+                )
+    return dt.datetime.now(dt.timezone.utc)
 
 
 __all__ = [
