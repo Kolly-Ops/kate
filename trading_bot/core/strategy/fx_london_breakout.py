@@ -63,6 +63,7 @@ class FXLondonBreakoutStrategy(Strategy):
         timezone: str = "Europe/London",
         news_events: Sequence[NewsEvent | dt.datetime] = (),
         news_buffer_minutes: int = 2,
+        intent_cooldown_minutes: int = 60,
     ) -> None:
         if quantity <= 0:
             raise ValueError("quantity must be > 0")
@@ -84,6 +85,8 @@ class FXLondonBreakoutStrategy(Strategy):
             raise ValueError("min_breakout_pips must be >= 0")
         if min_stop_pips_fallback < 0:
             raise ValueError("min_stop_pips_fallback must be >= 0")
+        if intent_cooldown_minutes < 0:
+            raise ValueError("intent_cooldown_minutes must be >= 0")
 
         self.quantity = quantity
         self.reward_risk = reward_risk
@@ -104,6 +107,12 @@ class FXLondonBreakoutStrategy(Strategy):
         self.news_events = tuple(news_events)
         self.news_buffer = dt.timedelta(minutes=news_buffer_minutes)
         self._traded_sessions: set[tuple[str, dt.date]] = set()
+        # 2026-06-02 INTENT COOLDOWN (CEO directive): per-symbol last-intent
+        # timestamp. Belt-and-braces gate that doesn't rely on FILL event
+        # propagation to mark_session_traded — the canonical session marker
+        # is failing silently (see retrospective 2026-06-02).
+        self.intent_cooldown_minutes = int(intent_cooldown_minutes)
+        self._last_intent_at_utc: dict[str, dt.datetime] = {}
 
     @property
     def name(self) -> str:
@@ -121,6 +130,24 @@ class FXLondonBreakoutStrategy(Strategy):
         if ctx.has_open_position:
             logger.debug("fxlon %s: skip — open position", ctx.symbol)
             return None
+        # 2026-06-02 INTENT COOLDOWN: skip if we emitted an intent on this
+        # symbol within the configured cooldown window. Uses candle.timestamp
+        # (UTC) so backtests and live runs share a clock.
+        if self.intent_cooldown_minutes > 0:
+            last_at = self._last_intent_at_utc.get(ctx.symbol)
+            if last_at is not None:
+                candle_ts = ctx.candle.timestamp
+                if candle_ts.tzinfo is None:
+                    candle_ts = candle_ts.replace(tzinfo=dt.timezone.utc)
+                if last_at.tzinfo is None:
+                    last_at = last_at.replace(tzinfo=dt.timezone.utc)
+                elapsed_min = (candle_ts - last_at).total_seconds() / 60.0
+                if elapsed_min < self.intent_cooldown_minutes:
+                    logger.info(
+                        "fxlon %s: skip - cooldown (%.1f min elapsed < %d min window)",
+                        ctx.symbol, elapsed_min, self.intent_cooldown_minutes,
+                    )
+                    return None
 
         ts_uk = self._to_local(ctx.candle.timestamp)
         if not self._in_trade_window(ts_uk):
@@ -269,6 +296,15 @@ class FXLondonBreakoutStrategy(Strategy):
             signal_ts_utc = signal_ts.replace(tzinfo=dt.timezone.utc)
         else:
             signal_ts_utc = signal_ts.astimezone(dt.timezone.utc)
+        # 2026-06-02 INTENT COOLDOWN: stamp the symbol BEFORE returning so the
+        # next candle close in the cooldown window is gated. Even if the
+        # intent is risk-rejected, the cooldown still applies (deliberate
+        # - don't churn on a symbol that risk just rejected).
+        self._last_intent_at_utc[ctx.symbol] = (
+            ctx.candle.timestamp
+            if ctx.candle.timestamp.tzinfo is not None
+            else ctx.candle.timestamp.replace(tzinfo=dt.timezone.utc)
+        )
         return TradeIntent(
             intent_id=f"fxlon-{ctx.symbol}-{ymdhm}"[:32],
             strategy_name=self.name,

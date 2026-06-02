@@ -115,7 +115,11 @@ def test_one_trade_per_symbol_session_day() -> None:
     day = dt.date(2026, 5, 13)
     first = candle(dt.datetime(2026, 5, 13, 7, 5, tzinfo=UK), 1.2530)
     second = candle(dt.datetime(2026, 5, 13, 7, 10, tzinfo=UK), 1.2535)
-    strategy = FXLondonBreakoutStrategy()
+    # 2026-06-02: default cooldown is 60 min; pass 0 here to test the
+    # original #44 v2 risk-reject-doesn't-burn-slot behavior without the
+    # cooldown gate. See test_intent_cooldown_blocks_re_fire below for
+    # the new default-cooldown coverage.
+    strategy = FXLondonBreakoutStrategy(intent_cooldown_minutes=0)
 
     # First intent fires — session NOT marked yet (engine hasn't been told)
     first_intent = strategy.on_candle_close(
@@ -123,18 +127,19 @@ def test_one_trade_per_symbol_session_day() -> None:
     )
     assert first_intent is not None
 
-    # Without the engine callback, second intent ALSO fires — this is the
-    # behavior change vs the pre-#44 intent-emission marking
+    # Without the engine callback AND with cooldown disabled, second intent
+    # ALSO fires — this is the #44 v2 behavior (risk-reject doesn't burn slot)
     second_intent_no_callback = strategy.on_candle_close(
         ctx(tuple(warmup_before(day) + asian_range(day) + [first, second]))
     )
     assert second_intent_no_callback is not None, (
-        "without mark_session_traded callback, strategy CAN re-fire (this is "
-        "the risk-reject-doesn't-burn-the-slot behavior we wanted)"
+        "without mark_session_traded callback AND cooldown disabled, "
+        "strategy CAN re-fire (this is the risk-reject-doesn't-burn-the-slot "
+        "behavior #44 v2 wanted)"
     )
 
     # Reset strategy, simulate full flow with the engine callback
-    strategy = FXLondonBreakoutStrategy()
+    strategy = FXLondonBreakoutStrategy(intent_cooldown_minutes=0)
     first_intent = strategy.on_candle_close(
         ctx(tuple(warmup_before(day) + asian_range(day) + [first]))
     )
@@ -520,3 +525,62 @@ def test_min_breakout_pips_validates_negative() -> None:
     """Defensive: reject negative threshold."""
     with pytest.raises(ValueError, match="min_breakout_pips"):
         FXLondonBreakoutStrategy(min_breakout_pips=-0.1)
+
+
+def test_intent_cooldown_blocks_re_fire() -> None:
+    """2026-06-02 CEO directive: after a TP/SL hits, Kate immediately
+    re-entered the same pair (today's GBPUSD 07:25 TP -> 08:06 SL re-entry).
+    The intended Sprint 2 #44 v2 session marker silently failed to fire.
+    The cooldown is the belt-and-braces gate: once an intent is emitted for
+    a symbol, that symbol is cooled for intent_cooldown_minutes regardless
+    of fill outcome.
+    """
+    day = dt.date(2026, 5, 13)
+    first = candle(dt.datetime(2026, 5, 13, 7, 5, tzinfo=UK), 1.2530)
+    # second is 30 min later — within default 60-min cooldown
+    second = candle(dt.datetime(2026, 5, 13, 7, 35, tzinfo=UK), 1.2540)
+    # third is 70 min later — past the cooldown
+    third = candle(dt.datetime(2026, 5, 13, 8, 15, tzinfo=UK), 1.2545)
+
+    strategy = FXLondonBreakoutStrategy()  # default 60-min cooldown
+
+    # First intent fires
+    first_intent = strategy.on_candle_close(
+        ctx(tuple(warmup_before(day) + asian_range(day) + [first]))
+    )
+    assert first_intent is not None
+
+    # 30 min later — within cooldown — must skip
+    blocked_intent = strategy.on_candle_close(
+        ctx(tuple(warmup_before(day) + asian_range(day) + [first, second]))
+    )
+    assert blocked_intent is None, (
+        "intent within cooldown window must be blocked even though the "
+        "session marker hasn't been called (defense in depth)"
+    )
+
+
+def test_intent_cooldown_validates_negative() -> None:
+    """Defensive: reject negative cooldown."""
+    with pytest.raises(ValueError, match="intent_cooldown_minutes"):
+        FXLondonBreakoutStrategy(intent_cooldown_minutes=-1)
+
+
+def test_intent_cooldown_zero_preserves_old_behavior() -> None:
+    """When cooldown is 0, the strategy reverts to #44 v2 behavior:
+    re-fire allowed until session marker is set via engine callback."""
+    day = dt.date(2026, 5, 13)
+    first = candle(dt.datetime(2026, 5, 13, 7, 5, tzinfo=UK), 1.2530)
+    second = candle(dt.datetime(2026, 5, 13, 7, 10, tzinfo=UK), 1.2535)
+    strategy = FXLondonBreakoutStrategy(intent_cooldown_minutes=0)
+
+    first_intent = strategy.on_candle_close(
+        ctx(tuple(warmup_before(day) + asian_range(day) + [first]))
+    )
+    assert first_intent is not None
+
+    second_intent = strategy.on_candle_close(
+        ctx(tuple(warmup_before(day) + asian_range(day) + [first, second]))
+    )
+    # Without cooldown and without engine callback, second intent fires
+    assert second_intent is not None
