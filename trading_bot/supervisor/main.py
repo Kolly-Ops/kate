@@ -9,7 +9,7 @@ SIGINT/SIGTERM (POSIX) or Ctrl+C / KeyboardInterrupt (Windows).
 
 Usage:
     python -m trading_bot.supervisor.main \\
-        --symbols MESM26 \\
+        --symbols MESU26 \\
         --scid-dir "C:/SierraChart/Data" \\
         --dtc-host 127.0.0.1 \\
         --dtc-port 11099 \\
@@ -51,6 +51,7 @@ from trading_bot.core.state import Reconciler, StateStore
 from trading_bot.core.strategy import (
     AtrBreakoutStrategy,
     FXLondonBreakoutStrategy,
+    FXNYBreakoutStrategy,
     ORBStrategy,
     SessionWindow,
 )
@@ -72,7 +73,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         prog="trading_bot.supervisor",
         description="Top-level runner for the deterministic trading bot",
     )
-    p.add_argument("--symbols", nargs="+", default=["MESM26"],
+    p.add_argument("--symbols", nargs="+", default=["MESU26"],
                    help="logical symbols to trade (must be in KNOWN_INSTRUMENTS)")
     p.add_argument("--scid-dir", default=r"C:\SierraChart\Data",
                    help="Sierra Chart .scid file directory")
@@ -185,11 +186,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--tick-interval", type=float, default=1.0)
     p.add_argument("--reconciliation-interval", type=float, default=30.0)
     p.add_argument("--seed-timeout", type=float, default=2.0)
-    p.add_argument("--strategy", choices=["orb", "breakout", "fx-london-breakout"], default="orb",
+    p.add_argument("--strategy", choices=["orb", "breakout", "fx-london-breakout", "fx-ny-breakout"], default="orb",
                    help="signal strategy: orb=multi-session Opening Range Breakout "
                         "(validated 2026-05-09, default); breakout=legacy ATR breakout "
                         "(retained for rollback / regression testing only); "
-                        "fx-london-breakout=GBPUSD MT5 Front 4 strategy.")
+                        "fx-london-breakout=GBPUSD MT5 Front 4 strategy; "
+                        "fx-ny-breakout=NY session FX breakout demo strategy.")
     p.add_argument("--breakout-lookback", type=int, default=20,
                    help="legacy AtrBreakoutStrategy: prior-N-bar high lookback")
     p.add_argument("--ma-period", type=int, default=50,
@@ -230,6 +232,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                         "boundary before firing. Default 0.0 = off. Set to "
                         "2.0 to reject shallow false-breakouts (documented "
                         "AUDUSD 2026-05-29 failure mode).")
+    p.add_argument("--enable-step-ratchet-stops", action="store_true",
+                   help="MT5-only experimental V2 step-ratchet stop movement. "
+                        "Default off; applies only to new native-bracket trades.")
     p.add_argument("--log-file", default=None,
                    help="optional log file path (in addition to stderr)")
     p.add_argument("--log-level", default="INFO",
@@ -251,7 +256,7 @@ def _setup_logging(level: str, log_file: str | None) -> None:
 
 def _resolve_scid_basename(scid_dir: Path, rt) -> str:
     """Sierra installs vary in their .scid naming convention. VPS uses
-    e.g. 'MESM26_FUT_CME.scid'; Wiltshire's local lab uses 'MESM26-CME.scid'.
+    e.g. 'MESU26_FUT_CME.scid'; Wiltshire's local lab may use 'MESU26-CME.scid'.
     Try the configured basename first, then known alternates, return the
     first that actually exists on disk. Raise SystemExit with a clear
     message if none exist — a silent miss here means the engine polls a
@@ -330,8 +335,8 @@ def _build_broker_adapter(*, args, instruments):
             symbol_map=symbol_map,
         )
     if args.broker == "ninja":
-        # Ninja branch wants the NT display form (e.g. "MES 06-26"), not
-        # the DTC wire form ("MESM26-CME"). KateBridgeStrategy.cs maps
+        # Ninja branch wants the NT display form (e.g. "MES 09-26"), not
+        # the DTC wire form ("MESU26-CME"). KateBridgeStrategy.cs maps
         # NT-display → MasterInstrument internally; passing DTC form would
         # fail to resolve on the NT side.
         symbol_map: dict[str, BrokerSymbolSpec] = {}
@@ -750,12 +755,17 @@ async def _run(args: argparse.Namespace) -> int:
             require_scid=not args.dry_run,
         )
         candle_mgr = CandleManager(scid_dir=scid_dir, timeframe_minutes=args.timeframe_minutes)
-        if args.strategy == "fx-london-breakout":
+        if args.strategy in ("fx-london-breakout", "fx-ny-breakout"):
             # fail_on_unknown_symbol=True under --trade-mode live per Codex
             # 2026-05-22 A-prime cross-check: a guessed min-stop floor on
             # an unknown symbol is acceptable for demo/paper but not for
             # live capital. Demo/simulated route to the fallback + warning.
-            strategy = FXLondonBreakoutStrategy(
+            strategy_cls = (
+                FXLondonBreakoutStrategy
+                if args.strategy == "fx-london-breakout"
+                else FXNYBreakoutStrategy
+            )
+            strategy = strategy_cls(
                 quantity=args.fx_quantity,
                 reward_risk=args.fx_reward_risk,
                 atr_period=args.atr_period,
@@ -833,6 +843,7 @@ async def _run(args: argparse.Namespace) -> int:
             use_native_brackets=args.broker in ("mt5", "ninja", "ig"),
             tick_interval_seconds=args.tick_interval,
             reconciliation_interval_seconds=args.reconciliation_interval,
+            enable_step_ratchet_stops=args.enable_step_ratchet_stops,
             on_drift=_on_drift,
             on_intent_rejected=_on_intent_rejected,
         )
@@ -874,10 +885,10 @@ async def _run(args: argparse.Namespace) -> int:
             await _verify_dtc_reachable(args.dtc_host, args.dtc_port)
             LOGGER.info("supervisor: DTC port reachable — proceeding with logon")
         elif args.broker == "ninja":
-            LOGGER.warning(
-                "supervisor: --broker ninja is order-routing scaffold only "
-                "(2026-05-18). subscribe_market_data + request_account_state "
-                "will fail. Use --broker dtc until Option A data path lands."
+            LOGGER.info(
+                "supervisor: NT8/Tradovate selected (Front 5); "
+                "skipping Sierra DTC preflights. account_id=%s env=%s",
+                broker.config.active_account_id, broker.config.environment,
             )
         elif args.broker == "ig":
             LOGGER.info(
@@ -984,12 +995,35 @@ async def _run(args: argparse.Namespace) -> int:
 
         run_task = asyncio.create_task(engine.run(), name="engine.run")
         stop_task = asyncio.create_task(stop_event.wait(), name="stop_signal")
+        runtime_exit_code = 0
 
         try:
             done, pending = await asyncio.wait(
                 {run_task, stop_task},
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            if run_task in done:
+                try:
+                    run_task.result()
+                except asyncio.CancelledError:
+                    LOGGER.error(
+                        "supervisor: engine.run was cancelled unexpectedly; "
+                        "treating as runtime failure"
+                    )
+                    runtime_exit_code = 5
+                except Exception:
+                    LOGGER.exception(
+                        "supervisor: engine.run failed unexpectedly; "
+                        "stopping supervisor with runtime-failure exit code"
+                    )
+                    runtime_exit_code = 5
+                else:
+                    LOGGER.error(
+                        "supervisor: engine.run returned unexpectedly without "
+                        "a stop signal; stopping supervisor with runtime-failure "
+                        "exit code"
+                    )
+                    runtime_exit_code = 5
         finally:
             await engine.stop()
             for t in (run_task, stop_task):
@@ -1000,6 +1034,8 @@ async def _run(args: argparse.Namespace) -> int:
                     except asyncio.CancelledError:
                         pass
 
+        if runtime_exit_code:
+            return runtime_exit_code
         LOGGER.info("supervisor: clean shutdown")
         return 0
     finally:
