@@ -1,0 +1,126 @@
+// KATE / IG ProOrder experimental lane
+// Strategy: AUDUSD London Open Breakout v0
+// Chart: AUDUSD, 5-minute timeframe, timezone set to Europe/London / UK time.
+// Status: DEMO / experimental. MT5 remains the trusted primary lane.
+
+DEFPARAM CumulateOrders = False
+DEFPARAM PreLoadBars = 20000
+DEFPARAM FlatBefore = 070000
+DEFPARAM FlatAfter = 100000
+
+PositionSize = 1
+RewardRisk = 2.0
+AtrMultiplier = 1.0
+PipUnit = 1.0  // IG spread-bet quotes in points (13450 = 1.3450), 1 point = 1 pip-equivalent
+MinRangePips = 5
+MaxRangePips = 120
+MinBreakoutPips = 0
+MinStopPips = 5
+CooldownBars = 24
+
+IF BarIndex = 0 OR Date <> Date[1] THEN
+   AsianHigh = 0
+   AsianLow = 0
+   RangeReady = 0
+   TradedToday = 0
+   LastExitBar = -999999
+   WasOnMarket = 0
+   ActiveStopDistance = 0
+   ActiveTargetDistance = 0
+ENDIF
+
+IF Time > 000000 AND Time <= 070000 THEN
+   IF AsianHigh = 0 OR High > AsianHigh THEN
+      AsianHigh = High
+   ENDIF
+   IF AsianLow = 0 OR Low < AsianLow THEN
+      AsianLow = Low
+   ENDIF
+   IF AsianHigh > 0 AND AsianLow > 0 THEN
+      RangeReady = 1
+   ENDIF
+ENDIF
+
+RangePips = 0
+IF RangeReady = 1 THEN
+   RangePips = (AsianHigh - AsianLow) / PipUnit
+ENDIF
+
+AtrValue = AverageTrueRange[14](Close)
+AtrStopDistance = AtrValue * AtrMultiplier
+MinStopDistance = MinStopPips * PipUnit
+StopDistance = AtrStopDistance
+IF StopDistance < MinStopDistance THEN
+   StopDistance = MinStopDistance
+ENDIF
+
+CanTrade = 0
+IF Time > 070000 AND Time < 100000 THEN
+   IF RangeReady = 1 THEN
+      IF RangePips >= MinRangePips AND RangePips <= MaxRangePips THEN
+         IF TradedToday = 0 THEN
+            IF NOT LongOnMarket AND NOT ShortOnMarket THEN
+               IF BarIndex - LastExitBar >= CooldownBars THEN
+                  CanTrade = 1
+               ENDIF
+            ENDIF
+         ENDIF
+      ENDIF
+   ENDIF
+ENDIF
+
+IF CanTrade = 1 AND Close > AsianHigh + (MinBreakoutPips * PipUnit) THEN
+   StopPrice = Close - StopDistance
+   IF StopPrice < AsianLow THEN
+      StopPrice = AsianLow
+   ENDIF
+   RiskDistance = Close - StopPrice
+   IF RiskDistance > 0 THEN
+      ActiveStopDistance = RiskDistance
+      ActiveTargetDistance = RiskDistance * RewardRisk
+      BUY PositionSize CONTRACTS AT MARKET
+      TradedToday = 1
+   ENDIF
+ENDIF
+
+IF CanTrade = 1 AND Close < AsianLow - (MinBreakoutPips * PipUnit) THEN
+   StopPrice = Close + StopDistance
+   IF StopPrice > AsianHigh THEN
+      StopPrice = AsianHigh
+   ENDIF
+   RiskDistance = StopPrice - Close
+   IF RiskDistance > 0 THEN
+      ActiveStopDistance = RiskDistance
+      ActiveTargetDistance = RiskDistance * RewardRisk
+      SELLSHORT PositionSize CONTRACTS AT MARKET
+      TradedToday = 1
+   ENDIF
+ENDIF
+
+IF LongOnMarket OR ShortOnMarket THEN
+   SET STOP LOSS ActiveStopDistance
+   SET TARGET PROFIT ActiveTargetDistance
+ENDIF
+
+IF Time >= 095500 AND Time < 100000 THEN
+   IF LongOnMarket THEN
+      SELL AT MARKET
+   ENDIF
+   IF ShortOnMarket THEN
+      EXITSHORT AT MARKET
+   ENDIF
+ENDIF
+
+CurrentOnMarket = 0
+IF LongOnMarket OR ShortOnMarket THEN
+   CurrentOnMarket = 1
+ENDIF
+IF WasOnMarket = 1 AND CurrentOnMarket = 0 THEN
+   LastExitBar = BarIndex
+ENDIF
+WasOnMarket = CurrentOnMarket
+
+GRAPH AsianHigh AS "AsianHigh"
+GRAPH AsianLow AS "AsianLow"
+GRAPH RangePips AS "RangePips"
+GRAPH CanTrade AS "CanTrade"

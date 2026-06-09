@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -34,11 +36,12 @@ def test_known_instruments_have_three_distinct_identifier_types() -> None:
         assert rt.tick_value > 0, key
 
 
-def test_mesm26_known_instrument_identifiers() -> None:
-    rt = KNOWN_INSTRUMENTS["MESM26"]
-    assert rt.strategy_symbol == "MESM26"
-    assert rt.dtc_symbol == "MESM26-CME"
-    assert rt.scid_basename == "MESM26_FUT_CME"
+def test_mesu26_known_instrument_identifiers() -> None:
+    rt = KNOWN_INSTRUMENTS["MESU26"]
+    assert rt.strategy_symbol == "MESU26"
+    assert rt.dtc_symbol == "MESU26-CME"
+    assert rt.nt_symbol == "MES 09-26"
+    assert rt.scid_basename == "MESU26_FUT_CME"
     assert rt.exchange == "CME"
     assert rt.tick_size == 0.25
     assert rt.tick_value == 1.25
@@ -47,7 +50,7 @@ def test_mesm26_known_instrument_identifiers() -> None:
 # ── CLI parsing ───────────────────────────────────────────────────────────
 def test_parse_args_defaults() -> None:
     args = _parse_args([])
-    assert args.symbols == ["MESM26"]
+    assert args.symbols == ["MESU26"]
     assert args.dtc_host == "127.0.0.1"
     assert args.dtc_port == 11099
     assert args.trade_account == ""  # empty default — Sierra sim mode rejects live accounts
@@ -84,7 +87,7 @@ def test_parse_args_fx_min_breakout_pips_wiring() -> None:
 
 def test_parse_args_overrides_full() -> None:
     args = _parse_args([
-        "--symbols", "MESM26", "MGCM26",
+        "--symbols", "MESU26", "MGCM26",
         "--dtc-host", "10.0.0.5",
         "--dtc-port", "12345",
         "--trade-account", "ACCT-X",
@@ -94,7 +97,7 @@ def test_parse_args_overrides_full() -> None:
         "--atr-stop-mult", "1.5",
         "--dry-run",
     ])
-    assert args.symbols == ["MESM26", "MGCM26"]
+    assert args.symbols == ["MESU26", "MGCM26"]
     assert args.dtc_host == "10.0.0.5"
     assert args.dtc_port == 12345
     assert args.trade_account == "ACCT-X"
@@ -117,20 +120,20 @@ def test_parse_args_rejects_invalid_log_level() -> None:
 
 # ── Instrument builder ────────────────────────────────────────────────────
 def test_build_instruments_known() -> None:
-    instruments = _build_instruments(["MESM26"])
-    assert "MESM26" in instruments
-    meta = instruments["MESM26"]
-    assert meta.symbol == "MESM26"
-    assert meta.scid_filename == "MESM26_FUT_CME"
-    assert meta.dtc_symbol == "MESM26-CME"
+    instruments = _build_instruments(["MESU26"])
+    assert "MESU26" in instruments
+    meta = instruments["MESU26"]
+    assert meta.symbol == "MESU26"
+    assert meta.scid_filename == "MESU26_FUT_CME"
+    assert meta.dtc_symbol == "MESU26-CME"
     assert meta.tick_size == 0.25
     assert meta.tick_value == 1.25
     assert meta.per_contract_margin == 100.0
 
 
 def test_build_instruments_multiple() -> None:
-    instruments = _build_instruments(["MESM26", "MGCM26"])
-    assert set(instruments) == {"MESM26", "MGCM26"}
+    instruments = _build_instruments(["MESU26", "MGCM26"])
+    assert set(instruments) == {"MESU26", "MGCM26"}
 
 
 def test_build_instruments_unknown_raises_clearly() -> None:
@@ -187,7 +190,7 @@ def test_dry_run_composes_components_and_exits_clean(tmp_path: Path) -> None:
         "--db-path", str(tmp_path / "data" / "state.db"),
         "--config-dir", str(cfg_dir),
         "--scid-dir", str(tmp_path),
-        "--symbols", "MESM26",
+        "--symbols", "MESU26",
         "--dry-run",
         "--log-level", "WARNING",   # quiet during test
     ])
@@ -302,6 +305,39 @@ def test_fx_london_breakout_demo_mode_does_not_fail_loud(
     )
 
 
+def test_fx_ny_breakout_demo_mode_wires_strategy_and_usdcad(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NY demo path should construct FXNYBreakoutStrategy and accept USDCAD."""
+    _write_risk_json(tmp_path / "config")
+
+    captured: dict[str, object] = {}
+    from trading_bot.supervisor import main as supervisor_main
+
+    real_cls = supervisor_main.FXNYBreakoutStrategy
+
+    def capturing_ctor(**kwargs):
+        captured.update(kwargs)
+        return real_cls(**kwargs)
+
+    monkeypatch.setattr(supervisor_main, "FXNYBreakoutStrategy", capturing_ctor)
+
+    args = _parse_args([
+        "--db-path", str(tmp_path / "data" / "state.db"),
+        "--config-dir", str(tmp_path / "config"),
+        "--scid-dir", str(tmp_path),
+        "--symbols", "GBPUSD", "EURUSD", "AUDUSD", "USDCAD",
+        "--broker", "mt5",
+        "--strategy", "fx-ny-breakout",
+        "--trade-mode", "demo",
+        "--dry-run",
+        "--log-level", "WARNING",
+    ])
+    rc = asyncio.run(_run(args))
+    assert rc == 0
+    assert captured.get("fail_on_unknown_symbol") is False
+
+
 # ── --broker ig wiring (Front 7 UK spread-bet) ───────────────────────────
 def _write_ig_secrets(secrets_path: Path) -> None:
     """Minimal IG secrets stub for dry-run tests — never hits the wire."""
@@ -404,13 +440,13 @@ def test_broker_ig_rejects_unverified_symbol_loudly(
     _write_ig_secrets(tmp_path / "secrets" / "secrets.json")
     monkeypatch.setenv("KATE_SECRETS_PATH", str(tmp_path / "secrets" / "secrets.json"))
 
-    # MESM26 is in KNOWN_INSTRUMENTS but NOT in the supervisor's verified
+    # MESU26 is in KNOWN_INSTRUMENTS but NOT in the supervisor's verified
     # ig_specs — exactly the failure class Codex blocked.
     args = _parse_args([
         "--db-path", str(tmp_path / "data" / "state.db"),
         "--config-dir", str(tmp_path / "config"),
         "--scid-dir", str(tmp_path),
-        "--symbols", "MESM26",
+        "--symbols", "MESU26",
         "--broker", "ig",
         "--strategy", "fx-london-breakout",
         "--trade-mode", "demo",
@@ -419,3 +455,60 @@ def test_broker_ig_rejects_unverified_symbol_loudly(
     ])
     with pytest.raises(SystemExit, match="no verified IGSymbolSpec"):
         asyncio.run(_run(args))
+
+
+def test_runtime_engine_run_exception_is_not_silent_clean_shutdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """If engine.run() dies, supervisor must surface a non-zero runtime
+    failure instead of logging a clean shutdown. This catches the 2026-06-01
+    MT5 silent-exit class where logs stopped after startup with no traceback.
+    """
+    _write_risk_json(tmp_path / "config")
+
+    from trading_bot.supervisor import main as supervisor_main
+
+    class CrashingEngine:
+        stopped = False
+
+        async def start(self) -> None:
+            return None
+
+        def run_state_hygiene_preflight(self):
+            return SimpleNamespace(
+                block_trading=False,
+                block_reason=None,
+                cleared_positions=(),
+                marked_stale_orders=(),
+            )
+
+        async def run(self) -> None:
+            raise RuntimeError("simulated engine loop crash")
+
+        async def stop(self) -> None:
+            self.stopped = True
+
+    engine = CrashingEngine()
+    monkeypatch.setattr(supervisor_main, "_build_broker_adapter", lambda **_: object())
+    monkeypatch.setattr(supervisor_main, "ManagedFuturesEngine", lambda *_, **__: engine)
+
+    args = _parse_args([
+        "--db-path", str(tmp_path / "data" / "state.db"),
+        "--config-dir", str(tmp_path / "config"),
+        "--scid-dir", str(tmp_path),
+        "--symbols", "GBPUSD",
+        "--broker", "mt5",
+        "--strategy", "fx-london-breakout",
+        "--trade-mode", "demo",
+        "--log-level", "WARNING",
+    ])
+
+    with caplog.at_level(logging.ERROR, logger="trading_bot.supervisor"):
+        rc = asyncio.run(_run(args))
+
+    assert rc == 5
+    assert engine.stopped is True
+    assert "engine.run failed unexpectedly" in caplog.text
+    assert "clean shutdown" not in caplog.text

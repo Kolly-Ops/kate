@@ -95,3 +95,13 @@ class Strategy(ABC):
         re-attempt on the next candle.
         """
         # Default: no-op. Stateful strategies override.
+
+    def on_position_closed(self, symbol: str, timestamp_utc: dt.datetime) -> None:
+        """Engine callback fired when broker exposure for `symbol` goes flat.
+
+        Strategies that implement post-exit cooldowns can override this hook.
+        The engine calls it from POSITION_UPDATE transitions where a symbol
+        changes from non-flat to flat, so it covers TP, SL, manual close, and
+        native broker brackets without adapter-specific order ID parsing.
+        """
+        # Default: no-op. Stateful strategies override.

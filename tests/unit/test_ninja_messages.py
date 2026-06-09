@@ -10,6 +10,7 @@ import pytest
 
 from trading_bot.core.execution.ninja_messages import (
     AckPayload,
+    BracketUpdatePayload,
     FillEventType,
     FillPayload,
     HeartbeatPayload,
@@ -58,7 +59,7 @@ def test_canonical_json_handles_dataclass():
 
 def test_canonical_json_preserves_unicode():
     # ensure_ascii=False means Unicode passes through literally
-    out = canonical_json({"label": "MES 06-26 ✓"})
+    out = canonical_json({"label": "MES 09-26 ✓"})
     assert "✓".encode("utf-8") in out
 
 
@@ -108,8 +109,8 @@ def test_envelope_roundtrip_signal_payload():
     payload = SignalPayload(
         intent_id="fxlon-GBPUSD-260515",
         timestamp="2026-05-15T07:55:00+00:00",
-        symbol="MESM26",
-        nt_symbol="MES 06-26",
+        symbol="MESU26",
+        nt_symbol="MES 09-26",
         side=Side.BUY.value,
         quantity=1,
         atm_template="KATE_MES_ORB_BASE",
@@ -129,6 +130,31 @@ def test_envelope_roundtrip_signal_payload():
     assert decoded.payload["intent_id"] == "fxlon-GBPUSD-260515"
     assert decoded.payload["atm_template"] == "KATE_MES_ORB_BASE"
     assert decoded.signature == envelope.signature
+
+
+def test_envelope_roundtrip_bracket_update_payload():
+    payload = BracketUpdatePayload(
+        intent_id="front5-mesu26-001",
+        timestamp="2026-06-09T05:06:02+00:00",
+        symbol="MESU26",
+        nt_symbol="MES 09-26",
+        atm_strategy_id="nt-atm-123",
+        stop_name="Stop1",
+        stop_price=7490.8214,
+        target_name="Target1",
+        target_price=7494.9464,
+    )
+    envelope = build_envelope(
+        msg_type=MsgType.BRACKET_UPDATE,
+        sequence=9,
+        payload=payload,
+        secret=SECRET,
+    )
+    decoded = decode_envelope(encode_envelope(envelope).rstrip(b"\n"), secret=SECRET)
+    assert decoded.msg_type == MsgType.BRACKET_UPDATE.value
+    assert decoded.payload["intent_id"] == "front5-mesu26-001"
+    assert decoded.payload["stop_price"] == 7490.8214
+    assert decoded.payload["target_price"] == 7494.9464
 
 
 def test_envelope_roundtrip_fill_payload():
@@ -173,8 +199,8 @@ def test_envelope_roundtrip_reconcile_request_and_response():
         timestamp="2026-05-15T22:00:01+00:00",
         open_positions=[
             OpenPositionSnapshot(
-                symbol="MESM26",
-                nt_symbol="MES 06-26",
+                symbol="MESU26",
+                nt_symbol="MES 09-26",
                 quantity=1,
                 side="BUY",
                 avg_price=5236.25,
@@ -192,7 +218,7 @@ def test_envelope_roundtrip_reconcile_request_and_response():
         msg_type=MsgType.RECONCILE_RESP, sequence=2, payload=resp, secret=SECRET
     )
     decoded_resp = decode_envelope(encode_envelope(resp_env).rstrip(b"\n"), secret=SECRET)
-    assert decoded_resp.payload["open_positions"][0]["symbol"] == "MESM26"
+    assert decoded_resp.payload["open_positions"][0]["symbol"] == "MESU26"
     assert decoded_resp.payload["pending_brackets"][0]["status"] == "ACTIVE"
 
 
@@ -234,8 +260,8 @@ def test_decode_rejects_tampered_payload_via_hmac():
     payload = SignalPayload(
         intent_id="abc",
         timestamp="2026-05-15T22:00:00+00:00",
-        symbol="MESM26",
-        nt_symbol="MES 06-26",
+        symbol="MESU26",
+        nt_symbol="MES 09-26",
         side="BUY",
         quantity=1,
         atm_template="KATE_MES_ORB_BASE",

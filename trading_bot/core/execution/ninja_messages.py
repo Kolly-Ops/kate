@@ -29,6 +29,7 @@ from typing import Any
 class MsgType(str, Enum):
     SIGNAL = "signal"               # Python → NT: strategy fired an entry
     FILL = "fill"                   # NT → Python: order/bracket state change
+    BRACKET_UPDATE = "bracket_update"  # NT -> Python: ATM Stop1/Target1 update evidence
     HEARTBEAT = "heartbeat"         # bidirectional liveness ping
     RECONCILE_REQ = "reconcile_req"  # Python → NT on reconnect
     RECONCILE_RESP = "reconcile_resp"  # NT → Python with current state
@@ -62,8 +63,8 @@ class SignalPayload:
     """
     intent_id: str
     timestamp: str       # ISO 8601 UTC, e.g. "2026-05-15T22:30:00+00:00"
-    symbol: str          # logical symbol, e.g. "MESM26"
-    nt_symbol: str       # NT broker symbol, e.g. "MES 06-26"
+    symbol: str          # logical symbol, e.g. "MESU26"
+    nt_symbol: str       # NT broker symbol, e.g. "MES 09-26"
     side: str            # "BUY" | "SELL"  (use Side enum values)
     quantity: int        # contracts
     atm_template: str    # base template name, e.g. "KATE_MES_ORB_BASE"
@@ -85,6 +86,20 @@ class FillPayload:
 
 
 @dataclass(frozen=True)
+class BracketUpdatePayload:
+    """NT -> Python: smoke/audit evidence for dynamic ATM bracket prices."""
+    intent_id: str
+    timestamp: str
+    symbol: str
+    nt_symbol: str
+    atm_strategy_id: str
+    stop_name: str
+    stop_price: float
+    target_name: str
+    target_price: float
+
+
+@dataclass(frozen=True)
 class HeartbeatPayload:
     timestamp: str
     from_party: str      # "python" | "nt"
@@ -102,6 +117,7 @@ class OpenPositionSnapshot:
     quantity: int
     side: str
     avg_price: float
+    server_position_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -109,11 +125,22 @@ class PendingBracketSnapshot:
     intent_id: str
     atm_strategy_id: str
     status: str
+    symbol: str = ""
+    side: str = ""
+    quantity: int = 0
 
 
 @dataclass(frozen=True)
 class ReconcileResponsePayload:
     timestamp: str
+    cash_balance: float = 0.0
+    equity: float = 0.0
+    unrealized_pnl: float = 0.0
+    realized_pnl: float = 0.0
+    margin_used: float = 0.0
+    buying_power: float = 0.0
+    currency: str = "USD"
+    account_name: str = ""
     open_positions: list[OpenPositionSnapshot] = field(default_factory=list)
     pending_brackets: list[PendingBracketSnapshot] = field(default_factory=list)
 
@@ -150,8 +177,8 @@ class BarPayload:
     (NinjaTrader's `BarsArray[0].Volumes[CurrentBar]`).
     """
     timestamp: str       # bar-start UTC ISO 8601
-    symbol: str          # logical symbol, e.g. "MESM26"
-    nt_symbol: str       # NT instrument FullName, e.g. "MES 06-26"
+    symbol: str          # logical symbol, e.g. "MESU26"
+    nt_symbol: str       # NT instrument FullName, e.g. "MES 09-26"
     timeframe_minutes: int  # 1, 5, etc.
     bar_index: int       # NT's CurrentBar at close
     open: float

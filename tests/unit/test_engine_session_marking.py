@@ -24,6 +24,7 @@ from trading_bot.core.execution.broker_adapter import (
     BrokerEvent,
     BrokerEventKind,
     OrderEvent,
+    PositionEvent,
 )
 from trading_bot.core.risk import RiskManager, RiskPolicy
 from trading_bot.core.state import Reconciler, StateStore
@@ -41,6 +42,7 @@ class _RecordingStrategy(Strategy):
     def __init__(self, name: str = "test_strategy") -> None:
         self._name = name
         self.calls: list[tuple[str, dt.datetime]] = []
+        self.closed_calls: list[tuple[str, dt.datetime]] = []
         self.raise_on_call = False
 
     @property
@@ -58,6 +60,9 @@ class _RecordingStrategy(Strategy):
         if self.raise_on_call:
             raise RuntimeError("simulated strategy failure")
         self.calls.append((symbol, timestamp_utc))
+
+    def on_position_closed(self, symbol: str, timestamp_utc: dt.datetime) -> None:
+        self.closed_calls.append((symbol, timestamp_utc))
 
 
 def _meta() -> InstrumentMeta:
@@ -342,6 +347,66 @@ def test_fill_for_unknown_coid_is_safe(engine_setup) -> None:
     _drive(engine, _make_event(BrokerEventKind.ORDER_FILLED, client_order_id="unknown-coid"))
 
     assert len(strategy.calls) == 0, "no marker = no callback"
+
+
+def test_fill_with_entry_marker_marks_even_if_order_row_missing(engine_setup) -> None:
+    """Broker-accepted entry markers must survive StateStore order gaps."""
+    engine, _fake, state, strategy = engine_setup
+    signal_ts = dt.datetime(2026, 6, 2, 6, 5, tzinfo=dt.timezone.utc)
+    engine._entry_intents["missing-local-order"] = _EntryMarker(
+        symbol="MESM26",
+        exchange="CME",
+        strategy_name="test_strategy",
+        signal_timestamp_utc=signal_ts,
+    )
+    assert state.get_order(client_order_id="missing-local-order") is None
+
+    _drive(
+        engine,
+        _make_event(
+            BrokerEventKind.ORDER_FILLED,
+            client_order_id="missing-local-order",
+        ),
+    )
+
+    assert strategy.calls == [("MESM26", signal_ts)]
+    assert "missing-local-order" not in engine._entry_intents
+
+
+def test_position_update_persists_and_flatten_closes_state_row(engine_setup) -> None:
+    """Live POSITION_UPDATE mirrors broker exposure into StateStore."""
+    engine, _fake, state, _strategy = engine_setup
+
+    engine._handle_position_event(
+        PositionEvent(symbol="MESM26", quantity=1.0, avg_price=6125.25)
+    )
+
+    row = state.get_position(symbol="MESM26", exchange="CME")
+    assert row is not None
+    assert row.side == proto.BUY
+    assert row.quantity == 1.0
+    assert row.avg_price == 6125.25
+
+    engine._handle_position_event(
+        PositionEvent(symbol="MESM26", quantity=0.0, avg_price=0.0)
+    )
+
+    assert state.get_position(symbol="MESM26", exchange="CME") is None
+
+
+def test_position_flat_transition_calls_strategy_on_position_closed(engine_setup) -> None:
+    engine, _fake, _state, strategy = engine_setup
+    closed_at = dt.datetime(2026, 6, 3, 10, 11, tzinfo=dt.timezone.utc)
+
+    engine._handle_position_event(
+        PositionEvent(symbol="MESM26", quantity=1.0, avg_price=6125.25)
+    )
+    engine._handle_position_event(
+        PositionEvent(symbol="MESM26", quantity=0.0, avg_price=0.0),
+        received_at=closed_at.timestamp(),
+    )
+
+    assert strategy.closed_calls == [("MESM26", closed_at)]
 
 
 # ── Codex design-audit constraint list — final 2 regression tests ─────

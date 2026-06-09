@@ -27,7 +27,7 @@ echo [%date% %time%] watchdog: launching Kate (restart #%RESTART_COUNT%) >> logs
 echo [%date% %time%] watchdog: launching Kate (restart #%RESTART_COUNT%)
 
 python -u -m trading_bot.supervisor.main ^
-  --symbols MESM26 ^
+  --symbols MESU26 ^
   --scid-dir "C:\SierraChart\Data" ^
   --dtc-host 127.0.0.1 ^
   --dtc-port 11099 ^

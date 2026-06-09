@@ -29,6 +29,7 @@ from trading_bot.core.execution.ig_broker_adapter import (
     IGBrokerAdapter,
     IGConfig,
     IGSymbolSpec,
+    _lightstreamer_endpoint_candidates,
 )
 
 
@@ -103,6 +104,42 @@ class _FakeHttpSession:
     def delete(self, url, **kw):  return self._dispatch("DELETE", url, **kw)
 
 
+class _FakeStreamingClient:
+    def __init__(self) -> None:
+        self.connected: Optional[dict[str, Any]] = None
+        self.subscriptions: list[dict[str, Any]] = []
+        self.disconnected = False
+
+    async def connect(
+        self, *, endpoint: str, account_id: str, cst: str, security_token: str,
+    ) -> None:
+        self.connected = {
+            "endpoint": endpoint,
+            "account_id": account_id,
+            "cst": cst,
+            "security_token": security_token,
+        }
+
+    async def subscribe_price(
+        self, *, spec: IGSymbolSpec, account_id: str, callback,
+    ) -> None:
+        self.subscriptions.append({
+            "spec": spec,
+            "account_id": account_id,
+            "callback": callback,
+        })
+
+    async def disconnect(self) -> None:
+        self.disconnected = True
+
+    def emit(self, spec: IGSymbolSpec, fields: dict[str, Any]) -> None:
+        callback = next(
+            sub["callback"] for sub in self.subscriptions
+            if sub["spec"] == spec
+        )
+        callback(spec, fields)
+
+
 def _config() -> IGConfig:
     return IGConfig(
         api_key="test-key",
@@ -130,6 +167,19 @@ def _adapter(http: _FakeHttpSession) -> IGBrokerAdapter:
         config=_config(),
         symbol_map=_SYMBOL_MAP,
         http_session=http,
+    )
+
+
+def _adapter_with_stream(
+    http: _FakeHttpSession, stream: _FakeStreamingClient,
+    *, require_streaming: bool = False,
+) -> IGBrokerAdapter:
+    return IGBrokerAdapter(
+        config=_config(),
+        symbol_map=_SYMBOL_MAP,
+        http_session=http,
+        streaming_client_factory=lambda: stream,
+        require_streaming=require_streaming,
     )
 
 
@@ -182,6 +232,16 @@ def test_adapter_is_broker_adapter():
     assert isinstance(_adapter(_FakeHttpSession()), BrokerAdapter)
 
 
+def test_lightstreamer_endpoint_candidates_keep_https_first_and_demo_http_fallback():
+    candidates = _lightstreamer_endpoint_candidates(
+        "https://demo-apd.marketdatasystems.com"
+    )
+
+    assert candidates[0] == "https://demo-apd.marketdatasystems.com"
+    assert "https://demo-apd.marketdatasystems.com/" in candidates
+    assert candidates[-1] == "http://demo-apd.marketdatasystems.com/"
+
+
 def test_connect_authenticates_and_switches_account():
     async def _impl():
         http = _FakeHttpSession()
@@ -195,7 +255,6 @@ def test_connect_authenticates_and_switches_account():
                         {"accountId": "Z6BHQ1", "accountName": "Spread bet"},
                     ],
                     "clientId": "104701005",
-                    "lightstreamerEndpoint": "https://demo-apd.marketdatasystems.com",
                 },
                 headers={
                     "CST": "cst-token-here",
@@ -267,6 +326,65 @@ def test_connect_skips_account_switch_when_already_active():
                 await adapter._poll_task
             except asyncio.CancelledError:
                 pass
+
+    _run(_impl())
+
+
+def test_connect_starts_lightstreamer_when_endpoint_available():
+    async def _impl():
+        http = _FakeHttpSession()
+        stream = _FakeStreamingClient()
+        http.scripted = [
+            ("POST", "/session", _FakeResponse(
+                status_code=200,
+                _json_body={
+                    "currentAccountId": "Z6BHQ1",
+                    "accounts": [{"accountId": "Z6BHQ1"}],
+                    "lightstreamerEndpoint": "https://demo-apd.marketdatasystems.com",
+                },
+                headers={"CST": "cst", "X-SECURITY-TOKEN": "sec"},
+                content=b'{}',
+            )),
+        ]
+        adapter = _adapter_with_stream(http, stream)
+        await adapter.connect()
+
+        assert stream.connected == {
+            "endpoint": "https://demo-apd.marketdatasystems.com",
+            "account_id": "Z6BHQ1",
+            "cst": "cst",
+            "security_token": "sec",
+        }
+
+        await adapter.disconnect()
+        assert stream.disconnected is True
+
+    _run(_impl())
+
+
+def test_connect_raises_when_streaming_required_and_endpoint_missing():
+    async def _impl():
+        http = _FakeHttpSession()
+        stream = _FakeStreamingClient()
+        http.scripted = [
+            ("POST", "/session", _FakeResponse(
+                status_code=200,
+                _json_body={
+                    "currentAccountId": "Z6BHQ1",
+                    "accounts": [{"accountId": "Z6BHQ1"}],
+                },
+                headers={"CST": "cst", "X-SECURITY-TOKEN": "sec"},
+                content=b'{}',
+            )),
+        ]
+        adapter = _adapter_with_stream(http, stream, require_streaming=True)
+
+        with pytest.raises(BrokerError) as exc:
+            await adapter.connect()
+
+        assert "lightstreamerEndpoint" in str(exc.value)
+        assert stream.connected is None
+        await adapter.disconnect()
 
     _run(_impl())
 
@@ -674,6 +792,224 @@ def test_submit_order_rejects_separate_bracket_legs():
 
 # ── backfill tests ──────────────────────────────────────────────────────
 
+def test_subscribe_market_data_uses_lightstreamer_price_stream_and_emits_closed_bar():
+    async def _impl():
+        http = _FakeHttpSession()
+        stream = _FakeStreamingClient()
+        http.scripted = [
+            ("POST", "/session", _FakeResponse(
+                status_code=200,
+                _json_body={
+                    "currentAccountId": "Z6BHQ1",
+                    "accounts": [{"accountId": "Z6BHQ1"}],
+                    "lightstreamerEndpoint": "https://demo-apd.marketdatasystems.com",
+                },
+                headers={"CST": "cst", "X-SECURITY-TOKEN": "sec"},
+                content=b'{}',
+            )),
+            ("GET", "/markets/CS.D.GBPUSD.MINI.IP", _FakeResponse(
+                status_code=200,
+                _json_body={
+                    "snapshot": {
+                        "bid": 1.3400,
+                        "offer": 1.3402,
+                        "updateTime": "12:00:00",
+                    },
+                },
+                content=b'{}',
+            )),
+        ]
+        adapter = _adapter_with_stream(http, stream)
+        await adapter.connect()
+        await adapter.subscribe_market_data(symbol="GBPUSD", exchange="IG")
+
+        assert len(stream.subscriptions) == 1
+        assert stream.subscriptions[0]["account_id"] == "Z6BHQ1"
+        spec = stream.subscriptions[0]["spec"]
+        assert spec.epic == "CS.D.GBPUSD.MINI.IP"
+
+        stream.emit(spec, {
+            "BIDPRICE1": "1.3410",
+            "ASKPRICE1": "1.3412",
+            "TIMESTAMP": str(int(dt.datetime(
+                2026, 6, 2, 12, 0, tzinfo=dt.timezone.utc,
+            ).timestamp() * 1000)),
+        })
+        stream.emit(spec, {
+            "BIDPRICE1": "1.3420",
+            "ASKPRICE1": "1.3424",
+            "TIMESTAMP": str(int(dt.datetime(
+                2026, 6, 2, 12, 1, tzinfo=dt.timezone.utc,
+            ).timestamp() * 1000)),
+        })
+        await asyncio.sleep(0.05)
+
+        events = []
+        while not adapter._events_q.empty():
+            events.append(await adapter._events_q.get())
+        bars = [e.bar for e in events if e.kind == BrokerEventKind.MARKET_DATA_BAR]
+        assert len(bars) == 1
+        assert bars[0].symbol == "GBPUSD"
+        assert bars[0].timestamp == dt.datetime(
+            2026, 6, 2, 12, 0, tzinfo=dt.timezone.utc,
+        )
+        assert bars[0].open == pytest.approx(1.3411)
+        assert bars[0].high == pytest.approx(1.3411)
+        assert bars[0].low == pytest.approx(1.3411)
+        assert bars[0].close == pytest.approx(1.3411)
+
+        await adapter.disconnect()
+
+    _run(_impl())
+
+
+def test_chart_tick_stream_fields_emit_closed_bar():
+    async def _impl():
+        adapter = _adapter(_FakeHttpSession())
+        spec = _SYMBOL_MAP["GBPUSD"]
+
+        await adapter._handle_stream_price_update(spec, {
+            "BID": "1.3510",
+            "OFR": "1.3512",
+            "UTM": str(int(dt.datetime(
+                2026, 6, 2, 12, 0, tzinfo=dt.timezone.utc,
+            ).timestamp() * 1000)),
+        })
+        await adapter._handle_stream_price_update(spec, {
+            "BID": "1.3520",
+            "OFR": "1.3524",
+            "UTM": str(int(dt.datetime(
+                2026, 6, 2, 12, 1, tzinfo=dt.timezone.utc,
+            ).timestamp() * 1000)),
+        })
+
+        events = []
+        while not adapter._events_q.empty():
+            events.append(await adapter._events_q.get())
+        bars = [e.bar for e in events if e.kind == BrokerEventKind.MARKET_DATA_BAR]
+        assert len(bars) == 1
+        assert bars[0].symbol == "GBPUSD"
+        assert bars[0].timestamp == dt.datetime(
+            2026, 6, 2, 12, 0, tzinfo=dt.timezone.utc,
+        )
+        assert bars[0].open == pytest.approx(1.3511)
+
+    _run(_impl())
+
+
+def test_chart_1minute_stream_fields_emit_native_closed_bar():
+    async def _impl():
+        adapter = _adapter(_FakeHttpSession())
+        spec = _SYMBOL_MAP["GBPUSD"]
+
+        await adapter._handle_stream_price_update(spec, {
+            "BID_OPEN": "1.3500",
+            "BID_HIGH": "1.3520",
+            "BID_LOW": "1.3490",
+            "BID_CLOSE": "1.3510",
+            "OFR_OPEN": "1.3502",
+            "OFR_HIGH": "1.3524",
+            "OFR_LOW": "1.3494",
+            "OFR_CLOSE": "1.3514",
+            "UTM": str(int(dt.datetime(
+                2026, 6, 2, 12, 0, 31, tzinfo=dt.timezone.utc,
+            ).timestamp() * 1000)),
+            "TTV": "17",
+            "CONS_END": "1",
+        })
+
+        event = await adapter._events_q.get()
+        assert event.kind == BrokerEventKind.MARKET_DATA_BAR
+        assert event.bar is not None
+        assert event.bar.symbol == "GBPUSD"
+        assert event.bar.timestamp == dt.datetime(
+            2026, 6, 2, 12, 0, tzinfo=dt.timezone.utc,
+        )
+        assert event.bar.open == pytest.approx(1.3501)
+        assert event.bar.high == pytest.approx(1.3522)
+        assert event.bar.low == pytest.approx(1.3492)
+        assert event.bar.close == pytest.approx(1.3512)
+        assert event.bar.volume == 17
+
+    _run(_impl())
+
+
+def test_chart_1minute_stream_ignores_provisional_bar():
+    async def _impl():
+        adapter = _adapter(_FakeHttpSession())
+        spec = _SYMBOL_MAP["GBPUSD"]
+
+        await adapter._handle_stream_price_update(spec, {
+            "BID_OPEN": "1.3500",
+            "OFR_OPEN": "1.3502",
+            "UTM": str(int(dt.datetime(
+                2026, 6, 2, 12, 0, tzinfo=dt.timezone.utc,
+            ).timestamp() * 1000)),
+            "CONS_END": "0",
+        })
+
+        assert adapter._events_q.empty()
+
+    _run(_impl())
+
+
+def test_poll_once_skips_rest_market_ticks_when_streaming_connected():
+    async def _impl():
+        http = _FakeHttpSession()
+        stream = _FakeStreamingClient()
+        http.scripted = [
+            ("POST", "/session", _FakeResponse(
+                status_code=200,
+                _json_body={
+                    "currentAccountId": "Z6BHQ1",
+                    "accounts": [{"accountId": "Z6BHQ1"}],
+                    "lightstreamerEndpoint": "https://demo-apd.marketdatasystems.com",
+                },
+                headers={"CST": "cst", "X-SECURITY-TOKEN": "sec"},
+                content=b'{}',
+            )),
+            ("GET", "/markets/CS.D.GBPUSD.MINI.IP", _FakeResponse(
+                status_code=200,
+                _json_body={
+                    "snapshot": {
+                        "bid": 1.3400,
+                        "offer": 1.3402,
+                        "updateTime": "12:00:00",
+                    },
+                },
+                content=b'{}',
+            )),
+            ("GET", "/accounts", _FakeResponse(
+                status_code=200,
+                _json_body={"accounts": []},
+                content=b'{}',
+            )),
+            ("GET", "/positions", _FakeResponse(
+                status_code=200,
+                _json_body={"positions": []},
+                content=b'{}',
+            )),
+        ]
+        adapter = _adapter_with_stream(http, stream)
+        await adapter.connect()
+        await adapter.subscribe_market_data(symbol="GBPUSD", exchange="IG")
+
+        market_calls_before = len([
+            c for c in http.calls
+            if c.method == "GET" and "/markets/CS.D.GBPUSD.MINI.IP" in c.url
+        ])
+        await adapter._poll_once()
+        market_calls_after = len([
+            c for c in http.calls
+            if c.method == "GET" and "/markets/CS.D.GBPUSD.MINI.IP" in c.url
+        ])
+
+        assert market_calls_after == market_calls_before
+        await adapter.disconnect()
+
+    _run(_impl())
+
+
 def test_get_recent_candles_parses_price_blocks_to_mid_candles():
     async def _impl():
         http = _FakeHttpSession()
@@ -714,6 +1050,9 @@ def test_get_recent_candles_parses_price_blocks_to_mid_candles():
         candles = await adapter.get_recent_candles(
             symbol="GBPUSD", count=2, timeframe_minutes=1,
         )
+        price_call = next(c for c in http.calls if c.method == "GET" and "/prices/" in c.url)
+        assert price_call.headers["VERSION"] == "2"
+        assert "/prices/CS.D.GBPUSD.MINI.IP/MINUTE/2" in price_call.url
         assert len(candles) == 2
         # Mid prices: average of bid + ask per O/H/L/C
         assert candles[0].open == pytest.approx((1.34000 + 1.34002) / 2)

@@ -17,6 +17,10 @@ rithmic = [
 mt5 = [
     "MetaTrader5>=5.0.45",
 ]
+ig = [
+    "requests>=2.31",
+    "lightstreamer-client-lib==2.2.2",
+]
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",

@@ -507,8 +507,8 @@ class IntegrationSmokeCheck(Check):
                 payload = SignalPayload(
                     intent_id="audit-smoke-1",
                     timestamp="2026-05-16T11:00:00+00:00",
-                    symbol="MESM26",
-                    nt_symbol="MES 06-26",
+                    symbol="MESU26",
+                    nt_symbol="MES 09-26",
                     side="BUY",
                     quantity=1,
                     atm_template="KATE_MES_ORB_BASE",

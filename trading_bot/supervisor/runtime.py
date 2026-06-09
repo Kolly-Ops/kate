@@ -3,9 +3,9 @@ Runtime configuration for the supervisor — composes instrument metadata
 with strategy-side and DTC-side identifiers.
 
 Sierra Chart's three identifiers for the same contract:
-  - strategy_symbol  e.g. "MESM26"          (used by strategies + state store)
-  - dtc_symbol       e.g. "MESM26-CME"      (used in DTC SUBMIT_NEW_SINGLE_ORDER)
-  - scid_basename    e.g. "MESM26_FUT_CME"  (used for the .scid filename)
+  - strategy_symbol  e.g. "MESU26"          (used by strategies + state store)
+  - dtc_symbol       e.g. "MESU26-CME"      (used in DTC SUBMIT_NEW_SINGLE_ORDER)
+  - scid_basename    e.g. "MESU26_FUT_CME"  (used for the .scid filename)
 
 These three are NOT always derivable from one another — Sierra installs
 vary in their naming convention. The supervisor takes them explicitly.
@@ -23,18 +23,18 @@ class InstrumentRuntime:
     dict key + StrategyContext field) and `exchange`. The CandleManager
     needs the `.scid` filename. The DTC client needs the wire `symbol` +
     `exchange`. The NinjaTrader bridge needs the NT display form (e.g.
-    "MES 06-26"). This dataclass holds them all so the supervisor wires
+    "MES 09-26"). This dataclass holds them all so the supervisor wires
     them in one place per broker."""
 
-    strategy_symbol: str    # e.g. "MESM26"
-    dtc_symbol: str         # e.g. "MESM26-CME"
+    strategy_symbol: str    # e.g. "MESU26"
+    dtc_symbol: str         # e.g. "MESU26-CME"
     exchange: str           # e.g. "CME"
     scid_basename: str      # filename without .scid extension
     tick_size: float
     tick_value: float
     per_contract_margin: float
     # NT display form — used by NinjaBrokerAdapter when constructing the
-    # BrokerSymbolSpec for --broker ninja. Examples: "MES 06-26",
+    # BrokerSymbolSpec for --broker ninja. Examples: "MES 09-26",
     # "M2K 06-26". NinjaTrader maps this to its internal MasterInstrument
     # at signal time. Verified live on Kate Host VPS 2026-05-18 (Gemini's
     # M2K live-data evidence handoff confirms both forms work on Tradovate
@@ -57,12 +57,12 @@ class InstrumentRuntime:
 # at front-month roll dates; until that automation lands, edit this dict
 # manually or pass overrides via the supervisor CLI.
 KNOWN_INSTRUMENTS: dict[str, InstrumentRuntime] = {
-    "MESM26": InstrumentRuntime(
-        strategy_symbol="MESM26",
-        dtc_symbol="MESM26-CME",
-        nt_symbol="MES 06-26",
+    "MESU26": InstrumentRuntime(
+        strategy_symbol="MESU26",
+        dtc_symbol="MESU26-CME",
+        nt_symbol="MES 09-26",
         exchange="CME",
-        scid_basename="MESM26_FUT_CME",
+        scid_basename="MESU26_FUT_CME",
         tick_size=0.25,
         tick_value=1.25,
         per_contract_margin=100.0,    # placeholder — verify against EdgeClear
@@ -144,6 +144,18 @@ KNOWN_INSTRUMENTS: dict[str, InstrumentRuntime] = {
         dtc_symbol="EURGBP",
         exchange="ICMarketsSC-Demo",
         scid_basename="EURGBP",
+        tick_size=0.00001,
+        tick_value=1.0,
+        per_contract_margin=0.0,
+        round_trip_commission=0.0,
+    ),
+    # USDCAD — 4-decimal pip-compatible USD pair for NY-session testing.
+    # Added 2026-06-04 for CEO-directed demo-only NY breakout basket.
+    "USDCAD": InstrumentRuntime(
+        strategy_symbol="USDCAD",
+        dtc_symbol="USDCAD",
+        exchange="ICMarketsSC-Demo",
+        scid_basename="USDCAD",
         tick_size=0.00001,
         tick_value=1.0,
         per_contract_margin=0.0,

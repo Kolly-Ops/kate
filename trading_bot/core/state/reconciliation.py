@@ -135,6 +135,15 @@ def compare_orders(
     for oid in local_by_id.keys() | remote_by_id.keys():
         ls = local_by_id.get(oid)
         rs = remote_by_id.get(oid)
+
+        # An order only drifts if at least one side believes it is active/working
+        # (i.e. status is PENDING or WORKING). If both sides have it as None or
+        # completed (FILLED, REJECTED, CANCELLED), then it is not an active drift.
+        is_local_active = ls in ("PENDING", "WORKING")
+        is_remote_active = rs in ("PENDING", "WORKING")
+        if not is_local_active and not is_remote_active:
+            continue
+
         if ls != rs:
             drifts.append(OrderDrift(
                 client_order_id=oid, local_status=ls, remote_status=rs,

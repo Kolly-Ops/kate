@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from contextlib import asynccontextmanager
 
 import pytest
@@ -20,14 +21,17 @@ from trading_bot.core.execution.broker_adapter import (
 from trading_bot.core.execution.ninja_broker_adapter import (
     NinjaBrokerAdapter,
     NinjaConfig,
-    _STUB_NLV_SENTINEL,
 )
 from trading_bot.core.execution.ninja_messages import (
     BarPayload,
+    BracketUpdatePayload,
     FillEventType,
     FillPayload,
     HeartbeatPayload,
     MsgType,
+    OpenPositionSnapshot,
+    PendingBracketSnapshot,
+    ReconcileResponsePayload,
     build_envelope,
     decode_envelope,
     encode_envelope,
@@ -37,9 +41,9 @@ from trading_bot.core.execution.ninja_transport import NinjaBridgeServer
 SECRET = b"adapter-test-shared-secret"
 
 SYMBOL_MAP = {
-    "MESM26": BrokerSymbolSpec(
-        logical_symbol="MESM26",
-        broker_symbol="MES 06-26",
+    "MESU26": BrokerSymbolSpec(
+        logical_symbol="MESU26",
+        broker_symbol="MES 09-26",
         exchange="CME",
         tick_size=0.25,
     ),
@@ -131,7 +135,7 @@ def test_submit_order_sends_signal_envelope():
         async with _connected_adapter() as (adapter, reader, _writer):
             await adapter.submit_order(
                 client_order_id="intent-001",
-                symbol="MESM26",
+                symbol="MESU26",
                 exchange="CME",
                 side=proto.BUY,
                 quantity=1,
@@ -145,8 +149,8 @@ def test_submit_order_sends_signal_envelope():
             assert obj["msg_type"] == MsgType.SIGNAL.value
             payload = obj["payload"]
             assert payload["intent_id"] == "intent-001"
-            assert payload["symbol"] == "MESM26"
-            assert payload["nt_symbol"] == "MES 06-26"
+            assert payload["symbol"] == "MESU26"
+            assert payload["nt_symbol"] == "MES 09-26"
             assert payload["side"] == "BUY"
             assert payload["quantity"] == 1
             assert payload["stop_price"] == 4990.0
@@ -164,7 +168,7 @@ def test_submit_order_wires_explicit_signal_close_price():
         async with _connected_adapter() as (adapter, reader, _writer):
             await adapter.submit_order(
                 client_order_id="intent-002",
-                symbol="MESM26",
+                symbol="MESU26",
                 exchange="CME",
                 side=proto.BUY,
                 quantity=1,
@@ -203,7 +207,7 @@ def test_submit_order_requires_stop_and_target():
             with pytest.raises(BrokerError, match="stop_price and target_price"):
                 await adapter.submit_order(
                     client_order_id="x",
-                    symbol="MESM26",
+                    symbol="MESU26",
                     exchange="CME",
                     side=proto.BUY,
                     quantity=1,
@@ -274,7 +278,7 @@ def test_subscribe_market_data_acknowledges_known_symbol():
     async def _impl():
         async with _connected_adapter() as (adapter, _r, _w):
             # Known symbol — no-op
-            await adapter.subscribe_market_data(symbol="MESM26", exchange="CME")
+            await adapter.subscribe_market_data(symbol="MESU26", exchange="CME")
             # Unknown symbol — clear BrokerError
             with pytest.raises(BrokerError, match="unknown logical symbol"):
                 await adapter.subscribe_market_data(symbol="UNKNOWN26", exchange="CME")
@@ -289,12 +293,82 @@ def test_cancel_order_not_implemented():
     _run(_impl())
 
 
-def test_request_account_state_returns_sentinel():
+async def _send_reconcile_response(writer, *, seq: int):
+    resp = ReconcileResponsePayload(
+        timestamp="2026-06-05T10:00:00+00:00",
+        cash_balance=50000.0,
+        equity=50125.5,
+        unrealized_pnl=125.5,
+        realized_pnl=20.0,
+        margin_used=1500.0,
+        buying_power=48500.0,
+        account_name="DEMO7962689",
+        open_positions=[
+            OpenPositionSnapshot(
+                symbol="MESU26",
+                nt_symbol="MES 09-26",
+                quantity=1,
+                side="BUY",
+                avg_price=5236.25,
+                server_position_id="ATM-7",
+            ),
+        ],
+        pending_brackets=[
+            PendingBracketSnapshot(
+                intent_id="front5-mesu26-test-001",
+                atm_strategy_id="ATM-7",
+                status="ACTIVE",
+                symbol="MESU26",
+                side="BUY",
+                quantity=1,
+            ),
+        ],
+    )
+    envelope = build_envelope(
+        msg_type=MsgType.RECONCILE_RESP, sequence=seq, payload=resp, secret=SECRET,
+    )
+    writer.write(encode_envelope(envelope))
+    await writer.drain()
+
+
+async def _answer_next_reconcile(reader, writer, *, seq: int = 77):
+    line = await asyncio.wait_for(reader.readline(), timeout=2.0)
+    obj = json.loads(line.decode("utf-8"))
+    assert obj["msg_type"] == MsgType.RECONCILE_REQ.value
+    await _send_reconcile_response(writer, seq=seq)
+
+
+def test_request_account_state_uses_reconcile_payload():
     async def _impl():
-        async with _connected_adapter() as (adapter, _r, _w):
+        async with _connected_adapter() as (adapter, reader, writer):
+            responder = asyncio.create_task(_answer_next_reconcile(reader, writer))
             state = await adapter.request_account_state(trade_account="Sim101")
-            assert state.nlv == _STUB_NLV_SENTINEL
+            await responder
+            assert state.cash == 50000.0
+            assert state.nlv == 50125.5
+            assert state.pnl == 145.5
+            assert state.margin_requirement == 1500.0
             assert state.currency == "USD"
+    _run(_impl())
+
+
+def test_request_positions_and_open_orders_use_reconcile_payload():
+    async def _impl():
+        async with _connected_adapter() as (adapter, reader, writer):
+            responder = asyncio.create_task(_answer_next_reconcile(reader, writer))
+            positions = await adapter.request_positions(trade_account="Sim101")
+            await responder
+            assert len(positions) == 1
+            assert positions[0].symbol == "MESU26"
+            assert positions[0].server_position_id == "ATM-7"
+
+            responder = asyncio.create_task(_answer_next_reconcile(reader, writer, seq=78))
+            orders = await adapter.request_open_orders(trade_account="Sim101")
+            await responder
+            assert len(orders) == 1
+            assert orders[0].client_order_id == "front5-mesu26-test-001"
+            assert orders[0].symbol == "MESU26"
+            assert orders[0].quantity == 1
     _run(_impl())
 
 
@@ -305,7 +379,7 @@ def _bar_payload(
     *,
     bar_index: int,
     timestamp: str = "2026-05-18T14:31:00+00:00",
-    symbol: str = "MESM26",
+    symbol: str = "MESU26",
     open: float = 5000.0,
     high: float = 5002.5,
     low: float = 4999.5,
@@ -315,7 +389,7 @@ def _bar_payload(
     return BarPayload(
         timestamp=timestamp,
         symbol=symbol,
-        nt_symbol="MES 06-26",
+        nt_symbol="MES 09-26",
         timeframe_minutes=1,
         bar_index=bar_index,
         open=open, high=high, low=low, close=close, volume=volume,
@@ -333,11 +407,12 @@ async def _send_bar(writer, *, seq: int, bar: BarPayload):
 def test_bar_envelope_translates_to_market_data_bar_event():
     async def _impl():
         async with _connected_adapter() as (adapter, _r, writer):
+            await adapter.subscribe_market_data(symbol="MESU26", exchange="CME")
             await _send_bar(writer, seq=1, bar=_bar_payload(bar_index=12345))
             async for ev in adapter.events():
                 assert ev.kind is BrokerEventKind.MARKET_DATA_BAR
                 assert ev.bar is not None
-                assert ev.bar.symbol == "MESM26"
+                assert ev.bar.symbol == "MESU26"
                 assert ev.bar.open == 5000.0
                 assert ev.bar.close == 5001.25
                 assert ev.bar.timeframe_minutes == 1
@@ -349,6 +424,7 @@ def test_bar_envelope_translates_to_market_data_bar_event():
 def test_bar_retransmit_with_identical_ohlcv_is_dropped_silently():
     async def _impl():
         async with _connected_adapter() as (adapter, _r, writer):
+            await adapter.subscribe_market_data(symbol="MESU26", exchange="CME")
             bar = _bar_payload(bar_index=100)
             await _send_bar(writer, seq=1, bar=bar)
             # First emit
@@ -376,6 +452,7 @@ def test_bar_revision_emits_error_event():
     surface as an ERROR event so audit layer can fail validation day."""
     async def _impl():
         async with _connected_adapter() as (adapter, _r, writer):
+            await adapter.subscribe_market_data(symbol="MESU26", exchange="CME")
             await _send_bar(writer, seq=1, bar=_bar_payload(bar_index=100, close=5001.25))
             async for ev in adapter.events():
                 assert ev.kind is BrokerEventKind.MARKET_DATA_BAR
@@ -394,6 +471,7 @@ def test_bar_out_of_order_emits_error_event():
     """bar_index must be monotonically non-decreasing per symbol."""
     async def _impl():
         async with _connected_adapter() as (adapter, _r, writer):
+            await adapter.subscribe_market_data(symbol="MESU26", exchange="CME")
             await _send_bar(writer, seq=1, bar=_bar_payload(bar_index=200))
             async for ev in adapter.events():
                 assert ev.kind is BrokerEventKind.MARKET_DATA_BAR
@@ -413,6 +491,7 @@ def test_bar_naive_timestamp_emits_error():
     """Reject naive datetimes — NinjaScript must send tz-aware UTC."""
     async def _impl():
         async with _connected_adapter() as (adapter, _r, writer):
+            await adapter.subscribe_market_data(symbol="MESU26", exchange="CME")
             await _send_bar(writer, seq=1, bar=_bar_payload(
                 bar_index=1, timestamp="2026-05-18T14:31:00",  # no offset
             ))
@@ -421,3 +500,62 @@ def test_bar_naive_timestamp_emits_error():
                 assert "timezone" in (ev.error_message or "")
                 break
     _run(_impl())
+
+
+def test_bar_for_unsubscribed_symbol_is_dropped():
+    async def _impl():
+        async with _connected_adapter() as (adapter, _r, writer):
+            await _send_bar(writer, seq=1, bar=_bar_payload(bar_index=1))
+            hb = HeartbeatPayload(timestamp="x", from_party="nt")
+            envelope = build_envelope(
+                msg_type=MsgType.HEARTBEAT, sequence=2, payload=hb, secret=SECRET,
+            )
+            writer.write(encode_envelope(envelope))
+            await writer.drain()
+            async for ev in adapter.events():
+                assert ev.kind is BrokerEventKind.HEARTBEAT
+                break
+    _run(_impl())
+
+
+def test_bracket_update_logs_dynamic_stop_target_prices(caplog):
+    async def _impl():
+        async with _connected_adapter() as (adapter, _r, writer):
+            payload = BracketUpdatePayload(
+                intent_id="orb-MESU26-asi-260609035500",
+                timestamp="2026-06-09T05:06:02+00:00",
+                symbol="MESU26",
+                nt_symbol="MES 09-26",
+                atm_strategy_id="atm-123",
+                stop_name="Stop1",
+                stop_price=7490.8214,
+                target_name="Target1",
+                target_price=7494.9464,
+            )
+            writer.write(encode_envelope(build_envelope(
+                msg_type=MsgType.BRACKET_UPDATE,
+                sequence=1,
+                payload=payload,
+                secret=SECRET,
+            )))
+            writer.write(encode_envelope(build_envelope(
+                msg_type=MsgType.HEARTBEAT,
+                sequence=2,
+                payload=HeartbeatPayload(timestamp="x", from_party="nt"),
+                secret=SECRET,
+            )))
+            await writer.drain()
+
+            async for ev in adapter.events():
+                if ev.kind is BrokerEventKind.HEARTBEAT:
+                    break
+
+    with caplog.at_level(
+        logging.INFO,
+        logger="trading_bot.core.execution.ninja_broker_adapter",
+    ):
+        _run(_impl())
+
+    assert "BRACKET_UPDATE intent_id=orb-MESU26-asi-260609035500" in caplog.text
+    assert "Stop1=7490.8214" in caplog.text
+    assert "Target1=7494.9464" in caplog.text

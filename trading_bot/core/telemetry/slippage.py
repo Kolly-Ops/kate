@@ -37,6 +37,8 @@ API shape (thread-safe):
       fill_timestamp_utc="2026-05-19T06:55:01+00:00",
   )
   # Above call triggers slippage computation + JSONL write.
+  # `fill_latency_seconds` is recorder-observed wall-clock time between
+  # these two method calls; it is not broker/exchange event latency.
 
   # Periodic summary (used by audit_live or runbook checks):
   print(recorder.summary())
@@ -80,7 +82,7 @@ class SlippageRecord:
     fill_timestamp_utc: str         # ISO 8601 UTC
     slippage_price: float           # signed: positive = bad for trader
     slippage_pips: float            # in pip-units per the front's pip_size
-    fill_latency_seconds: float     # signal → fill wall-clock
+    fill_latency_seconds: float     # recorder-observed method-call latency, not exchange latency
 
     def to_jsonl(self) -> str:
         return json.dumps(asdict(self), separators=(",", ":")) + "\n"
@@ -262,6 +264,9 @@ class SlippageRecorder:
         signal_price, side, symbol, signal_ts, signal_recv = pending
         slippage_price, slippage_pips = _pip_units(side, signal_price, fill_price, self.pip_size)
         fill_recv = time.time()
+        # Recorder-observed wall-clock latency between record_intent() and
+        # record_fill(). Useful for local pipeline health, but not a
+        # broker/exchange event-latency measurement.
         latency = max(0.0, fill_recv - signal_recv)
 
         record = SlippageRecord(

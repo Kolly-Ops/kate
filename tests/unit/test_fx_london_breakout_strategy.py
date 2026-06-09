@@ -127,6 +127,11 @@ def test_one_trade_per_symbol_session_day() -> None:
     )
     assert first_intent is not None
 
+    exit_time_utc = dt.datetime(2026, 5, 13, 7, 15, tzinfo=UK).astimezone(
+        dt.timezone.utc
+    )
+    strategy.on_position_closed("GBPUSD", exit_time_utc)
+
     # Without the engine callback AND with cooldown disabled, second intent
     # ALSO fires — this is the #44 v2 behavior (risk-reject doesn't burn slot)
     second_intent_no_callback = strategy.on_candle_close(
@@ -542,7 +547,7 @@ def test_intent_cooldown_blocks_re_fire() -> None:
     # third is 70 min later — past the cooldown
     third = candle(dt.datetime(2026, 5, 13, 8, 15, tzinfo=UK), 1.2545)
 
-    strategy = FXLondonBreakoutStrategy()  # default 60-min cooldown
+    strategy = FXLondonBreakoutStrategy()  # default 120-min post-exit cooldown
 
     # First intent fires
     first_intent = strategy.on_candle_close(
@@ -551,6 +556,11 @@ def test_intent_cooldown_blocks_re_fire() -> None:
     assert first_intent is not None
 
     # 30 min later — within cooldown — must skip
+    exit_time_utc = dt.datetime(2026, 5, 13, 7, 20, tzinfo=UK).astimezone(
+        dt.timezone.utc
+    )
+    strategy.on_position_closed("GBPUSD", exit_time_utc)
+
     blocked_intent = strategy.on_candle_close(
         ctx(tuple(warmup_before(day) + asian_range(day) + [first, second]))
     )
@@ -558,6 +568,29 @@ def test_intent_cooldown_blocks_re_fire() -> None:
         "intent within cooldown window must be blocked even though the "
         "session marker hasn't been called (defense in depth)"
     )
+
+
+def test_post_exit_cooldown_handles_long_running_trade() -> None:
+    """A trade lasting longer than the cooldown still cools down after exit."""
+    day = dt.date(2026, 5, 13)
+    first = candle(dt.datetime(2026, 5, 13, 7, 5, tzinfo=UK), 1.2530)
+    reentry = candle(dt.datetime(2026, 5, 13, 9, 30, tzinfo=UK), 1.2540)
+    strategy = FXLondonBreakoutStrategy(intent_cooldown_minutes=120)
+
+    first_intent = strategy.on_candle_close(
+        ctx(tuple(warmup_before(day) + asian_range(day) + [first]))
+    )
+    assert first_intent is not None
+
+    late_exit = dt.datetime(2026, 5, 13, 9, 0, tzinfo=UK).astimezone(
+        dt.timezone.utc
+    )
+    strategy.on_position_closed("GBPUSD", late_exit)
+
+    blocked_intent = strategy.on_candle_close(
+        ctx(tuple(warmup_before(day) + asian_range(day) + [first, reentry]))
+    )
+    assert blocked_intent is None
 
 
 def test_intent_cooldown_validates_negative() -> None:

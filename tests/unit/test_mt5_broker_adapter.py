@@ -54,6 +54,9 @@ class _Position:
     volume: float
     type: int
     price_open: float
+    ticket: int = 777
+    sl: float = 1.2300
+    tp: float = 1.2600
 
 
 @dataclass
@@ -92,6 +95,7 @@ class _FakeMT5:
     TRADE_ACTION_DEAL = 1
     TRADE_ACTION_PENDING = 5
     TRADE_ACTION_REMOVE = 8
+    TRADE_ACTION_SLTP = 6
 
     ORDER_TYPE_BUY = 0
     ORDER_TYPE_SELL = 1
@@ -186,7 +190,9 @@ class _FakeMT5:
     def account_info(self):
         return self.account
 
-    def positions_get(self):
+    def positions_get(self, ticket=None):
+        if ticket is not None:
+            return [p for p in self.positions if p.ticket == int(ticket)]
         return self.positions
 
     def orders_get(self):
@@ -506,6 +512,52 @@ def test_cancel_order_requires_server_order_id():
     _run(_impl())
 
 
+def test_mt5_modify_position_stop_success_preserves_take_profit():
+    async def _impl():
+        runtime = _FakeMT5()
+        adapter = _adapter(runtime)
+        await adapter.connect()
+
+        result = await adapter.mt5_modify_position_stop(
+            ticket=777,
+            symbol="GBPUSD",
+            new_stop_price=1.2450,
+        )
+
+        assert result.success is True
+        request = runtime.sent_orders[-1]
+        assert request["action"] == runtime.TRADE_ACTION_SLTP
+        assert request["position"] == 777
+        assert request["symbol"] == "GBPUSD"
+        assert request["sl"] == pytest.approx(1.2450)
+        assert request["tp"] == pytest.approx(1.2600)
+
+    _run(_impl())
+
+
+def test_mt5_modify_position_stop_reject_returns_soft_failure():
+    async def _impl():
+        runtime = _FakeMT5()
+        runtime.next_order_result = _Result(
+            retcode=runtime.TRADE_RETCODE_REJECT,
+            comment="invalid stops",
+        )
+        adapter = _adapter(runtime)
+        await adapter.connect()
+
+        result = await adapter.mt5_modify_position_stop(
+            ticket=777,
+            symbol="GBPUSD",
+            new_stop_price=1.2450,
+        )
+
+        assert result.success is False
+        assert result.reason == "invalid stops"
+        assert result.retcode == runtime.TRADE_RETCODE_REJECT
+
+    _run(_impl())
+
+
 def test_poll_loop_emits_position_delta():
     async def _impl():
         runtime = _FakeMT5()
@@ -528,6 +580,7 @@ def test_poll_loop_emits_position_delta():
         assert event.kind == BrokerEventKind.POSITION_UPDATE
         assert event.position is not None
         assert event.position.quantity == 2.0
+        assert event.position.server_position_id == "777"
 
         await adapter.disconnect()
 

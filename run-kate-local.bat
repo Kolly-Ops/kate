@@ -12,7 +12,7 @@ if %errorlevel% equ 0 exit /b 0
 echo [%date% %time%] lab: launching Kate (VPS Track 1 - Sim-Only) >> logs\local-lab.log
 
 python -u -m trading_bot.supervisor.main ^
-  --symbols MESM26 ^
+  --symbols MESU26 ^
   --scid-dir "C:\SierraChart\Data" ^
   --dtc-host 127.0.0.1 ^
   --dtc-port 11099 ^

@@ -231,25 +231,58 @@ class _MinuteBarBuilder:
         )
 
 
+@dataclass(frozen=True)
+class _IGStreamRoute:
+    name: str
+    mode: str
+    item: str
+    fields: list[str]
+    data_adapter: Optional[str] = None
+    snapshot: Optional[str] = None
+
+
 class _LightstreamerSDKPriceClient:
     """Thin wrapper around lightstreamer-client-lib.
 
     IG's current price stream is PRICE:{account}:{epic} through the
-    Pricing adapter. MARKET:{epic} is deprecated/decommissioned, so keep
-    that older item shape out of the production path.
+    Pricing adapter. Some demo accounts reject that item with Lightstreamer
+    code 21, so the wrapper can fall back to the documented chart-tick
+    stream. MARKET:{epic} is deprecated/decommissioned, so keep that older
+    item shape out of the production path.
     """
 
-    _FIELDS = ["BIDPRICE1", "ASKPRICE1", "TIMESTAMP", "DELAY"]
+    _PRICE_FIELDS = ["BIDPRICE1", "ASKPRICE1", "TIMESTAMP", "DELAY"]
+    _CHART_TICK_FIELDS = ["BID", "OFR", "LTP", "LTV", "TTV", "UTM"]
+    _CHART_1MINUTE_FIELDS = [
+        "BID_OPEN",
+        "BID_HIGH",
+        "BID_LOW",
+        "BID_CLOSE",
+        "OFR_OPEN",
+        "OFR_HIGH",
+        "OFR_LOW",
+        "OFR_CLOSE",
+        "LTP_OPEN",
+        "LTP_HIGH",
+        "LTP_LOW",
+        "LTP_CLOSE",
+        "LTV",
+        "TTV",
+        "UTM",
+        "CONS_END",
+    ]
 
     def __init__(self) -> None:
         self._client: Any = None
         self._subscriptions: list[Any] = []
+        self._last_status: Optional[str] = None
+        self._last_server_error: Optional[str] = None
 
     async def connect(
         self, *, endpoint: str, account_id: str, cst: str, security_token: str,
     ) -> None:
         try:
-            from lightstreamer.client import LightstreamerClient
+            from lightstreamer.client import ClientListener, LightstreamerClient
         except ImportError as exc:
             raise BrokerError(
                 "IG Lightstreamer support requires package "
@@ -257,14 +290,92 @@ class _LightstreamerSDKPriceClient:
                 "Front 7 streaming."
             ) from exc
 
-        def _connect() -> None:
-            client = LightstreamerClient(endpoint, "DEFAULT")
-            client.connectionDetails.setUser(account_id)
-            client.connectionDetails.setPassword(f"CST-{cst}|XST-{security_token}")
-            client.connect()
-            self._client = client
+        loop = asyncio.get_running_loop()
 
-        await asyncio.to_thread(_connect)
+        endpoint_candidates = _lightstreamer_endpoint_candidates(endpoint)
+        last_status = ""
+        for candidate in endpoint_candidates:
+            for transport in (None, "HTTP-STREAMING", "HTTP-POLLING"):
+                status_queue: asyncio.Queue[str] = asyncio.Queue()
+
+                class _ClientListener(ClientListener):
+                    def onStatusChange(_self, status: str) -> None:
+                        self._last_status = status
+                        logger.info(
+                            "IG Lightstreamer status=%s endpoint=%s transport=%s",
+                            status,
+                            candidate,
+                            transport or "auto",
+                        )
+                        asyncio.run_coroutine_threadsafe(
+                            status_queue.put(status), loop,
+                        )
+
+                    def onServerError(_self, code: Any, message: Any) -> None:
+                        self._last_server_error = f"{code}: {message}"
+                        logger.error(
+                            "IG Lightstreamer server error code=%s message=%s",
+                            code, message,
+                        )
+                        asyncio.run_coroutine_threadsafe(
+                            status_queue.put(f"SERVER_ERROR:{code}:{message}"),
+                            loop,
+                        )
+
+                def _connect() -> Any:
+                    client = LightstreamerClient(candidate, "DEFAULT")
+                    client.addListener(_ClientListener())
+                    client.connectionDetails.setUser(account_id)
+                    client.connectionDetails.setPassword(
+                        f"CST-{cst}|XST-{security_token}"
+                    )
+                    if transport is not None:
+                        client.connectionOptions.setForcedTransport(transport)
+                    client.connect()
+                    return client
+
+                client = await asyncio.to_thread(_connect)
+                deadline = time.monotonic() + 10.0
+                while time.monotonic() < deadline:
+                    try:
+                        status = await asyncio.wait_for(
+                            status_queue.get(),
+                            timeout=max(0.1, deadline - time.monotonic()),
+                        )
+                    except asyncio.TimeoutError:
+                        break
+                    last_status = status
+                    if status.startswith("CONNECTED:"):
+                        self._client = client
+                        logger.info(
+                            "IG Lightstreamer connected endpoint=%s "
+                            "transport=%s status=%s",
+                            candidate,
+                            transport or "auto",
+                            status,
+                        )
+                        return
+                    if status.startswith("SERVER_ERROR:"):
+                        break
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(client.disconnect)
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(client.closeConnection)
+                logger.warning(
+                    "IG Lightstreamer candidate failed endpoint=%s "
+                    "transport=%s last_status=%s server_error=%s",
+                    candidate,
+                    transport or "auto",
+                    last_status or self._last_status,
+                    self._last_server_error,
+                )
+
+        raise BrokerError(
+            "IG Lightstreamer failed to reach CONNECTED status. "
+            f"last_status={last_status or self._last_status!r} "
+            f"server_error={self._last_server_error!r} "
+            f"endpoint_candidates={endpoint_candidates!r}"
+        )
 
     async def subscribe_price(
         self, *, spec: IGSymbolSpec, account_id: str,
@@ -280,28 +391,122 @@ class _LightstreamerSDKPriceClient:
                 "'lightstreamer-client-lib'."
             ) from exc
 
-        fields = ["BID", "OFFER", "UPDATE_TIME"]
-        item = f"MARKET:{spec.epic}"
+        routes = [
+            _IGStreamRoute(
+                name="PRICE",
+                mode="MERGE",
+                item=f"PRICE:{account_id}:{spec.epic}",
+                fields=list(self._PRICE_FIELDS),
+                data_adapter="Pricing",
+                snapshot="yes",
+            ),
+            _IGStreamRoute(
+                name="CHART_1MINUTE",
+                mode="MERGE",
+                item=f"CHART:{spec.epic}:1MINUTE",
+                fields=list(self._CHART_1MINUTE_FIELDS),
+            ),
+            _IGStreamRoute(
+                name="CHART_TICK",
+                mode="DISTINCT",
+                item=f"CHART:{spec.epic}:TICK",
+                fields=list(self._CHART_TICK_FIELDS),
+            ),
+        ]
+
+        for route in routes:
+            accepted = await self._try_subscribe_route(
+                Subscription=Subscription,
+                SubscriptionListener=SubscriptionListener,
+                route=route,
+                spec=spec,
+                callback=callback,
+            )
+            if accepted:
+                return
+
+        raise BrokerError(
+            "IG Lightstreamer could not subscribe to any documented price "
+            f"route for {spec.logical_symbol}/{spec.epic}"
+        )
+
+    async def _try_subscribe_route(
+        self,
+        *,
+        Subscription: Any,
+        SubscriptionListener: Any,
+        route: _IGStreamRoute,
+        spec: IGSymbolSpec,
+        callback: IGStreamUpdateCallback,
+    ) -> bool:
+        loop = asyncio.get_running_loop()
+        status_queue: asyncio.Queue[tuple[str, Optional[Any], Optional[Any]]] = (
+            asyncio.Queue()
+        )
 
         class _Listener(SubscriptionListener):
+            def onSubscription(self) -> None:
+                logger.info(
+                    "IG Lightstreamer subscription accepted route=%s item=%s",
+                    route.name,
+                    route.item,
+                )
+                asyncio.run_coroutine_threadsafe(
+                    status_queue.put(("accepted", None, None)), loop,
+                )
+
             def onItemUpdate(self, update: Any) -> None:
-                callback(spec, {field: update.getValue(field) for field in fields})
+                callback(
+                    spec,
+                    {field: update.getValue(field) for field in route.fields},
+                )
 
             def onSubscriptionError(self, code: Any, message: Any) -> None:
                 logger.error(
-                    "IG Lightstreamer subscription error item=%s code=%s message=%s",
-                    item, code, message,
+                    "IG Lightstreamer subscription error route=%s item=%s "
+                    "code=%s message=%s",
+                    route.name,
+                    route.item,
+                    code,
+                    message,
+                )
+                asyncio.run_coroutine_threadsafe(
+                    status_queue.put(("error", code, message)), loop,
                 )
 
         def _subscribe() -> None:
-            sub = Subscription("MERGE", [item], fields)
-            sub.setDataAdapter("Pricing")
-            sub.setRequestedSnapshot("yes")
+            sub = Subscription(route.mode, [route.item], route.fields)
+            if route.data_adapter:
+                sub.setDataAdapter(route.data_adapter)
+            if route.snapshot:
+                sub.setRequestedSnapshot(route.snapshot)
             sub.addListener(_Listener())
             self._client.subscribe(sub)
             self._subscriptions.append(sub)
 
         await asyncio.to_thread(_subscribe)
+        try:
+            status, code, message = await asyncio.wait_for(
+                status_queue.get(),
+                timeout=8.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "IG Lightstreamer subscription route timed out route=%s item=%s",
+                route.name,
+                route.item,
+            )
+            return False
+        if status == "accepted":
+            return True
+        logger.warning(
+            "IG Lightstreamer route rejected route=%s item=%s code=%s message=%s",
+            route.name,
+            route.item,
+            code,
+            message,
+        )
+        return False
 
     async def disconnect(self) -> None:
         client = self._client
@@ -341,6 +546,7 @@ class IGBrokerAdapter(BrokerAdapter):
         http_session: Optional[Any] = None,
         streaming_client_factory: Optional[Callable[[], IGStreamingClient]] = None,
         emit_stream_ticks: bool = False,
+        require_streaming: bool = False,
     ) -> None:
         self.config = config
         self.symbol_map = dict(symbol_map)
@@ -352,6 +558,7 @@ class IGBrokerAdapter(BrokerAdapter):
         self._stream_loop: Optional[asyncio.AbstractEventLoop] = None
         self._stream_subscribed_symbols: set[str] = set()
         self._emit_stream_ticks = emit_stream_ticks
+        self._require_streaming = require_streaming
         self._connected = False
         self._cst: Optional[str] = None
         self._security_token: Optional[str] = None
@@ -766,15 +973,19 @@ class IGBrokerAdapter(BrokerAdapter):
 
     async def _start_streaming_client(self) -> None:
         if not self._lightstreamer_endpoint:
-            logger.warning(
+            msg = (
                 "IG /session did not return lightstreamerEndpoint; "
                 "falling back to REST market polling"
             )
+            if self._require_streaming:
+                raise BrokerError(msg)
+            logger.warning(msg)
             return
         if not self._cst or not self._security_token:
-            logger.warning(
-                "IG Lightstreamer not started because session tokens are missing"
-            )
+            msg = "IG Lightstreamer not started because session tokens are missing"
+            if self._require_streaming:
+                raise BrokerError(msg)
+            logger.warning(msg)
             return
         try:
             client = self._streaming_client_factory()
@@ -785,6 +996,10 @@ class IGBrokerAdapter(BrokerAdapter):
                 security_token=self._security_token,
             )
         except Exception as exc:
+            if self._require_streaming:
+                raise BrokerError(
+                    "IG Lightstreamer start failed while streaming is required"
+                ) from exc
             logger.warning(
                 "IG Lightstreamer start failed; falling back to REST polling: %s",
                 exc,
@@ -810,7 +1025,8 @@ class IGBrokerAdapter(BrokerAdapter):
         )
         self._stream_subscribed_symbols.add(spec.logical_symbol)
         logger.info(
-            "IG Lightstreamer subscribed PRICE:%s:%s",
+            "IG Lightstreamer subscribed symbol=%s account=%s epic=%s",
+            spec.logical_symbol,
             self.config.active_account_id,
             spec.epic,
         )
@@ -833,8 +1049,11 @@ class IGBrokerAdapter(BrokerAdapter):
     async def _handle_stream_price_update(
         self, spec: IGSymbolSpec, fields: dict[str, Any],
     ) -> None:
+        if "BID_OPEN" in fields or "OFR_OPEN" in fields or "LTP_OPEN" in fields:
+            await self._handle_stream_chart_bar_update(spec, fields)
+            return
         bid_raw = fields.get("BIDPRICE1") or fields.get("BID")
-        ask_raw = fields.get("ASKPRICE1") or fields.get("OFFER")
+        ask_raw = fields.get("ASKPRICE1") or fields.get("OFFER") or fields.get("OFR")
         try:
             bid = float(bid_raw) if bid_raw not in (None, "") else None
             ask = float(ask_raw) if ask_raw not in (None, "") else None
@@ -853,7 +1072,11 @@ class IGBrokerAdapter(BrokerAdapter):
         )
         tick = MarketDataTick(
             symbol=spec.logical_symbol,
-            timestamp=_parse_ig_stream_timestamp(fields.get("UPDATE_TIME") or fields.get("TIMESTAMP")),
+            timestamp=_parse_ig_stream_timestamp(
+                fields.get("UPDATE_TIME")
+                or fields.get("TIMESTAMP")
+                or fields.get("UTM")
+            ),
             last_price=last_price,
             last_size=1.0,
             bid=bid,
@@ -866,6 +1089,75 @@ class IGBrokerAdapter(BrokerAdapter):
                 tick=tick,
             ))
         await self._update_bar_builder_and_maybe_emit(tick)
+
+    async def _handle_stream_chart_bar_update(
+        self, spec: IGSymbolSpec, fields: dict[str, Any],
+    ) -> None:
+        if not _ig_cons_end_is_true(fields.get("CONS_END")):
+            logger.debug(
+                "IG provisional chart bar ignored for %s: %s",
+                spec.logical_symbol,
+                fields,
+            )
+            return
+
+        try:
+            open_price = _ig_mid_or_last(
+                bid=fields.get("BID_OPEN"),
+                ask=fields.get("OFR_OPEN"),
+                last=fields.get("LTP_OPEN"),
+            )
+            high_price = _ig_mid_or_last(
+                bid=fields.get("BID_HIGH"),
+                ask=fields.get("OFR_HIGH"),
+                last=fields.get("LTP_HIGH"),
+            )
+            low_price = _ig_mid_or_last(
+                bid=fields.get("BID_LOW"),
+                ask=fields.get("OFR_LOW"),
+                last=fields.get("LTP_LOW"),
+            )
+            close_price = _ig_mid_or_last(
+                bid=fields.get("BID_CLOSE"),
+                ask=fields.get("OFR_CLOSE"),
+                last=fields.get("LTP_CLOSE"),
+            )
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "IG Lightstreamer bad chart bar update for %s: %s",
+                spec.logical_symbol,
+                fields,
+            )
+            return
+
+        timestamp = _parse_ig_stream_timestamp(fields.get("UTM"))
+        volume = _parse_ig_int(fields.get("TTV") or fields.get("LTV"), default=0)
+        bar = BarEvent(
+            symbol=spec.logical_symbol,
+            timestamp=_floor_utc_minute(timestamp),
+            timeframe_minutes=1,
+            open=open_price,
+            high=high_price,
+            low=low_price,
+            close=close_price,
+            volume=volume,
+        )
+        logger.info(
+            "IG CLOSED BAR %s route=CHART_1MINUTE ts=%s "
+            "o=%.5f h=%.5f l=%.5f c=%.5f v=%d",
+            bar.symbol,
+            bar.timestamp.isoformat(),
+            bar.open,
+            bar.high,
+            bar.low,
+            bar.close,
+            bar.volume,
+        )
+        await self._events_q.put(BrokerEvent(
+            kind=BrokerEventKind.MARKET_DATA_BAR,
+            received_at=time.time(),
+            bar=bar,
+        ))
 
     async def _update_bar_builder_and_maybe_emit(
         self, tick: MarketDataTick,
@@ -1238,6 +1530,63 @@ def _parse_ig_stream_timestamp(value: Any) -> dt.datetime:
                     tz=dt.timezone.utc,
                 )
     return dt.datetime.now(dt.timezone.utc)
+
+
+def _ig_mid_or_last(*, bid: Any, ask: Any, last: Any) -> float:
+    bid_value = _parse_ig_float(bid)
+    ask_value = _parse_ig_float(ask)
+    if bid_value is not None and ask_value is not None:
+        return (bid_value + ask_value) / 2.0
+    if bid_value is not None:
+        return bid_value
+    if ask_value is not None:
+        return ask_value
+    last_value = _parse_ig_float(last)
+    if last_value is not None:
+        return last_value
+    raise ValueError("IG chart bar update did not include bid/offer/last price")
+
+
+def _parse_ig_float(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    return float(value)
+
+
+def _parse_ig_int(value: Any, *, default: int = 0) -> int:
+    if value in (None, ""):
+        return default
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _ig_cons_end_is_true(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value in (1, 1.0):
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return False
+
+
+def _lightstreamer_endpoint_candidates(endpoint: str) -> list[str]:
+    raw = (endpoint or "").strip()
+    if not raw:
+        return []
+    candidates = []
+    for value in (raw, raw.rstrip("/") + "/"):
+        if value not in candidates:
+            candidates.append(value)
+    # IG returns https endpoints, but some Lightstreamer SDKs negotiate
+    # more reliably against the http form in demo. Keep https first.
+    if raw.startswith("https://demo-"):
+        http_value = "http://" + raw[len("https://"):].rstrip("/") + "/"
+        if http_value not in candidates:
+            candidates.append(http_value)
+    return candidates
 
 
 __all__ = [

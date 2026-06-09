@@ -67,7 +67,7 @@ from trading_bot.core.state import (
     RemotePosition,
     StateStore,
 )
-from trading_bot.core.strategy import Strategy, StrategyContext
+from trading_bot.core.strategy import StepRatchetState, StepRatchetStopPolicy, Strategy, StrategyContext
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +121,30 @@ class _EntryMarker:
     exchange: str
     strategy_name: str                   # for future multi-strategy routing
     signal_timestamp_utc: dt.datetime    # candle timestamp UTC tz-aware
+    side: Optional[int] = None
+    entry_price: Optional[float] = None
+    initial_stop: Optional[float] = None
+    pip_size: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class _RatchetPendingEntry:
+    symbol: str
+    side: int
+    entry_price: float
+    initial_stop: float
+    pip_size: float
+
+
+@dataclass
+class _RatchetTracker:
+    state: StepRatchetState
+    entry_price: float
+    initial_stop: float
+    pip_size: float
+    side: int
+    ticket: int
+    symbol: str
 
 
 @dataclass(frozen=True)
@@ -205,6 +229,7 @@ class ManagedFuturesEngine:
         history_size: Optional[int] = None,
         tick_interval_seconds: float = 1.0,
         reconciliation_interval_seconds: float = 30.0,
+        enable_step_ratchet_stops: bool = False,
         on_drift: Optional[Callable[[ReconciliationReport], None]] = None,
         on_intent_rejected: Optional[Callable[[TradeIntent, RiskVerdict], None]] = None,
     ) -> None:
@@ -237,6 +262,10 @@ class ManagedFuturesEngine:
         self.use_native_brackets = use_native_brackets
         self.tick_interval_seconds = tick_interval_seconds
         self.reconciliation_interval_seconds = reconciliation_interval_seconds
+        self._step_ratchet_enabled = bool(enable_step_ratchet_stops)
+        self._step_ratchet_policy = StepRatchetStopPolicy()
+        self._ratchet_pending_by_symbol_side: dict[tuple[str, int], _RatchetPendingEntry] = {}
+        self._ratchet_tracked: dict[int, _RatchetTracker] = {}
         self.on_drift = on_drift
         self.on_intent_rejected = on_intent_rejected
 
@@ -585,7 +614,10 @@ class ManagedFuturesEngine:
                     await self._handle_order_event(event.kind, event.order)
             elif event.kind == BrokerEventKind.POSITION_UPDATE:
                 if event.position is not None:
-                    self._handle_position_event(event.position)
+                    self._handle_position_event(
+                        event.position,
+                        received_at=event.received_at,
+                    )
             elif event.kind == BrokerEventKind.ACCOUNT_BALANCE_UPDATE:
                 if event.balance is not None:
                     self._handle_account_balance_event(event.balance)
@@ -637,6 +669,7 @@ class ManagedFuturesEngine:
                 "StateStore, broker_orders updated only",
                 order.client_order_id,
             )
+            self._handle_entry_marker_for_order_event(kind, order)
             return
         rejected_reason = order.rejected_reason if store_status == "REJECTED" else None
         fill_price = order.fill_price if store_status == "FILLED" else None
@@ -662,8 +695,9 @@ class ManagedFuturesEngine:
             BrokerEventKind.ORDER_FILLED,
             BrokerEventKind.ORDER_PARTIAL_FILL,
         ):
-            marker = self._entry_intents.pop(order.client_order_id, None)
+            marker = self._entry_intents.get(order.client_order_id)
             if marker is not None:
+                del self._entry_intents[order.client_order_id]
                 try:
                     # Per Codex P0 on v2: pass the SIGNAL candle's
                     # timestamp (carried on the marker), NOT wall-clock
@@ -696,7 +730,8 @@ class ManagedFuturesEngine:
             # reach here (they short-circuit in _process_intent before
             # _submit_order is called), so _entry_intents only contains
             # broker-accepted submissions.
-            self._entry_intents.pop(order.client_order_id, None)
+            if order.client_order_id in self._entry_intents:
+                del self._entry_intents[order.client_order_id]
 
         # ── Bracket-order side effects on FILL ────────────────────────
         if store_status == "FILLED":
@@ -712,7 +747,42 @@ class ManagedFuturesEngine:
                     filled_coid=order.client_order_id, sibling_coid=sibling,
                 )
 
-    def _handle_position_event(self, position: PositionEvent) -> None:
+    def _handle_entry_marker_for_order_event(
+        self, kind: BrokerEventKind, order: OrderEvent,
+    ) -> None:
+        if kind in (
+            BrokerEventKind.ORDER_FILLED,
+            BrokerEventKind.ORDER_PARTIAL_FILL,
+        ):
+            marker = self._entry_intents.pop(order.client_order_id, None)
+            if marker is not None:
+                try:
+                    self.strategy.mark_session_traded(
+                        marker.symbol,
+                        marker.signal_timestamp_utc,
+                    )
+                    logger.info(
+                        "engine: session marked traded for %s via %s "
+                        "(strategy=%s, coid=%s, signal_ts=%s)",
+                        marker.symbol, kind.value,
+                        marker.strategy_name, order.client_order_id,
+                        marker.signal_timestamp_utc.isoformat(),
+                    )
+                except Exception:
+                    logger.exception(
+                        "engine: strategy.mark_session_traded raised for "
+                        "%s coid=%s - engine continues",
+                        marker.symbol, order.client_order_id,
+                    )
+        elif kind in (
+            BrokerEventKind.ORDER_REJECTED,
+            BrokerEventKind.ORDER_CANCELED,
+        ):
+            self._entry_intents.pop(order.client_order_id, None)
+
+    def _handle_position_event(
+        self, position: PositionEvent, *, received_at: Optional[float] = None,
+    ) -> None:
         meta = self.instruments.get(position.symbol)
         if meta is None:
             logger.debug(
@@ -721,12 +791,166 @@ class ManagedFuturesEngine:
             )
             return
         key = (position.symbol, meta.exchange)
+        previous = self._broker_positions.get(key)
         if position.quantity == 0:
             self._broker_positions.pop(key, None)
+            self.state.close_position(symbol=position.symbol, exchange=meta.exchange)
+            self._clear_ratchet_tracker(position)
+            if previous is not None:
+                timestamp = (
+                    dt.datetime.fromtimestamp(received_at, tz=dt.timezone.utc)
+                    if received_at is not None
+                    else dt.datetime.now(dt.timezone.utc)
+                )
+                try:
+                    self.strategy.on_position_closed(position.symbol, timestamp)
+                    logger.info(
+                        "engine: strategy.on_position_closed fired for %s at %s",
+                        position.symbol,
+                        timestamp.isoformat(),
+                    )
+                except Exception:
+                    logger.exception(
+                        "engine: strategy.on_position_closed raised for %s "
+                        "- engine continues",
+                        position.symbol,
+                    )
         else:
             self._broker_positions[key] = RemotePosition(
                 symbol=position.symbol, exchange=meta.exchange,
                 quantity=position.quantity,
+            )
+            side = position.side
+            if side is None:
+                side = proto.BUY if position.quantity > 0 else proto.SELL
+            self.state.upsert_position(
+                symbol=position.symbol,
+                exchange=meta.exchange,
+                side=side,
+                quantity=abs(position.quantity),
+                avg_price=position.avg_price,
+            )
+            self._activate_ratchet_tracker(position, side)
+
+    def _activate_ratchet_tracker(self, position: PositionEvent, side: int) -> None:
+        if not self._step_ratchet_enabled:
+            return
+        if not hasattr(self.broker, "mt5_modify_position_stop"):
+            return
+        if not position.server_position_id:
+            logger.warning(
+                "ratchet: cannot track %s position - missing server_position_id",
+                position.symbol,
+            )
+            return
+        try:
+            ticket = int(position.server_position_id)
+        except ValueError:
+            logger.warning(
+                "ratchet: cannot track %s position - invalid ticket %r",
+                position.symbol, position.server_position_id,
+            )
+            return
+        if ticket in self._ratchet_tracked:
+            return
+        pending = self._ratchet_pending_by_symbol_side.pop((position.symbol, side), None)
+        if pending is None:
+            logger.debug(
+                "ratchet: ignoring broker/startup position symbol=%s ticket=%s - no new-entry marker",
+                position.symbol, ticket,
+            )
+            return
+        entry_price = position.avg_price if position.avg_price > 0 else pending.entry_price
+        self._ratchet_tracked[ticket] = _RatchetTracker(
+            state=self._step_ratchet_policy.initial_state(initial_stop=pending.initial_stop),
+            entry_price=entry_price,
+            initial_stop=pending.initial_stop,
+            pip_size=pending.pip_size,
+            side=pending.side,
+            ticket=ticket,
+            symbol=position.symbol,
+        )
+        logger.info(
+            "ratchet: tracking new MT5 position ticket=%d symbol=%s side=%s entry=%.5f stop=%.5f",
+            ticket, position.symbol, pending.side, entry_price, pending.initial_stop,
+        )
+
+    def _clear_ratchet_tracker(self, position: PositionEvent) -> None:
+        if position.server_position_id:
+            try:
+                ticket = int(position.server_position_id)
+            except ValueError:
+                ticket = 0
+            if ticket:
+                self._ratchet_tracked.pop(ticket, None)
+                return
+        stale = [
+            ticket
+            for ticket, tracker in self._ratchet_tracked.items()
+            if tracker.symbol == position.symbol
+        ]
+        for ticket in stale:
+            self._ratchet_tracked.pop(ticket, None)
+
+    @staticmethod
+    def _pip_size_for_symbol(symbol: str) -> float:
+        # FX day-1 uses 4-decimal pairs; keep USDJPY correct for the next slice.
+        return 0.01 if symbol.upper().endswith("JPY") else 0.0001
+
+    async def _evaluate_step_ratchet(self, symbol: str, candle: Candle) -> None:
+        if not self._step_ratchet_enabled:
+            return
+        if not hasattr(self.broker, "mt5_modify_position_stop"):
+            return
+        trackers = [
+            tracker for tracker in self._ratchet_tracked.values()
+            if tracker.symbol == symbol
+        ]
+        for tracker in trackers:
+            try:
+                decision = self._step_ratchet_policy.evaluate_bar_close(
+                    state=tracker.state,
+                    side=tracker.side,
+                    entry_price=tracker.entry_price,
+                    initial_stop=tracker.initial_stop,
+                    bar_close=candle.close,
+                    pip_size=tracker.pip_size,
+                )
+            except Exception:
+                logger.exception(
+                    "ratchet: policy evaluation failed ticket=%d symbol=%s - leaving stop unchanged",
+                    tracker.ticket, tracker.symbol,
+                )
+                continue
+            if not decision.advanced:
+                continue
+            try:
+                result = await self.broker.mt5_modify_position_stop(
+                    ticket=tracker.ticket,
+                    symbol=tracker.symbol,
+                    new_stop_price=decision.state.stop_price,
+                    keep_take_profit=True,
+                )
+            except Exception:
+                logger.exception(
+                    "ratchet: modify failed ticket=%d - leaving at stage %d",
+                    tracker.ticket, tracker.state.stage,
+                )
+                continue
+            if not getattr(result, "success", False):
+                logger.warning(
+                    "ratchet: stop modify rejected ticket=%d reason=%s - staying at stage %d",
+                    tracker.ticket, getattr(result, "reason", ""), tracker.state.stage,
+                )
+                continue
+            tracker.state = decision.state
+            logger.info(
+                "ratchet: advanced ticket=%d symbol=%s stage=%d new_stop=%.5f reason=%s",
+                tracker.ticket,
+                tracker.symbol,
+                tracker.state.stage,
+                tracker.state.stop_price,
+                decision.reason,
             )
 
     def _handle_account_balance_event(self, balance: AccountBalanceEvent) -> None:
@@ -866,6 +1090,8 @@ class ManagedFuturesEngine:
             logger.debug("engine: no account state yet, skipping strategy on %s", symbol)
             return
 
+        await self._evaluate_step_ratchet(symbol, candle)
+
         # Volatility-blackout: skip strategy invocation entirely if the
         # bar's UTC timestamp falls inside any configured window. Existing
         # positions are unaffected — their stop/target brackets remain in
@@ -983,7 +1209,43 @@ class ManagedFuturesEngine:
             exchange=intent.exchange,
             strategy_name=intent.strategy_name,
             signal_timestamp_utc=sig_ts,
+            side=intent.side,
+            entry_price=(intent.price if intent.price else None),
+            initial_stop=intent.stop_loss,
+            pip_size=self._pip_size_for_symbol(intent.symbol),
         )
+        logger.info(
+            "engine: entry marker registered for %s "
+            "(symbol=%s, strategy=%s, signal_ts=%s)",
+            intent.intent_id,
+            intent.symbol,
+            intent.strategy_name,
+            sig_ts.isoformat(),
+        )
+
+        if (
+            self._step_ratchet_enabled
+            and self.use_native_brackets
+            and hasattr(self.broker, "mt5_modify_position_stop")
+            and intent.stop_loss is not None
+        ):
+            entry_price = intent.price if intent.price else (
+                intent.signal_close_price if intent.signal_close_price is not None else 0.0
+            )
+            if entry_price > 0:
+                self._ratchet_pending_by_symbol_side[(intent.symbol, intent.side)] = (
+                    _RatchetPendingEntry(
+                        symbol=intent.symbol,
+                        side=intent.side,
+                        entry_price=entry_price,
+                        initial_stop=intent.stop_loss,
+                        pip_size=self._pip_size_for_symbol(intent.symbol),
+                    )
+                )
+                logger.info(
+                    "ratchet: pending new MT5 entry symbol=%s side=%s entry=%.5f stop=%.5f",
+                    intent.symbol, intent.side, entry_price, intent.stop_loss,
+                )
 
         # Cache bracket params keyed by entry coid. Submitted only after
         # the entry's FILLED event arrives (see _handle_order_event).

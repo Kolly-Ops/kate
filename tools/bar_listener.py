@@ -11,7 +11,7 @@ Usage on Kate Host VPS:
     python tools\\bar_listener.py
 
 Then in NinjaTrader: enable KateBridgeStrategy on the MES chart with
-PublishBars=True, LogicalSymbol=MESM26. Watch this terminal for:
+PublishBars=True, LogicalSymbol=MESU26. Watch this terminal for:
     "client connected"        — NT side connected to Python bridge
     "[hb seq=N]"              — heartbeats every 5s (connection healthy)
     "*** BAR #N ***"          — actual closed-bar envelopes from NT

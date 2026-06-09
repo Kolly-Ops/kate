@@ -1,13 +1,6 @@
 """
-Unit tests for strategy layer — indicators + AtrBreakoutStrategy.
-
-NOTE 2026-05-16: `AtrBreakoutStrategy` was refactored into a thin
-backward-compat wrapper around `ORBStrategy` (session-based opening-range
-breakout). Three tests below assert the OLD strategy's behavior (ATR
-+ moving-average breakout with `history_window = max(params) + 1`) and
-are skipped pending proper rebuild against the new session-aware logic.
-See `trading_bot/core/strategy/breakout.py` module docstring + the
-review request filed 2026-05-16 for the rebuild scope.
+Unit tests for strategy layer, indicators, and the ORB-backed
+AtrBreakoutStrategy compatibility wrapper.
 """
 from __future__ import annotations
 
@@ -41,11 +34,38 @@ def _series(*ohlcs: tuple[float, float, float, float]) -> tuple[Candle, ...]:
     )
 
 
-# ── Indicators ────────────────────────────────────────────────────────────
+def _series_at(
+    base: datetime,
+    *ohlcs: tuple[float, float, float, float],
+) -> tuple[Candle, ...]:
+    """Build a minute-resolution candle series from a specified base time."""
+    return tuple(
+        _candle(base + timedelta(minutes=i), o=o, h=h, l=l, c=c)
+        for i, (o, h, l, c) in enumerate(ohlcs)
+    )
+
+
+def _orb_us_long_history() -> tuple[Candle, ...]:
+    return (
+        _candle(datetime(2026, 4, 27, 14, 30), o=100, h=102, l=99, c=100),
+        _candle(datetime(2026, 4, 27, 14, 45), o=100, h=102, l=99, c=101),
+        _candle(datetime(2026, 4, 27, 15, 30), o=101, h=111, l=100, c=110),
+    )
+
+
+def _orb_asian_long_history() -> tuple[Candle, ...]:
+    return (
+        _candle(datetime(2026, 4, 27, 0, 0), o=100, h=102, l=99, c=100),
+        _candle(datetime(2026, 4, 27, 0, 15), o=100, h=102, l=99, c=101),
+        _candle(datetime(2026, 4, 27, 1, 0), o=101, h=111, l=100, c=110),
+    )
+
+
+# Indicators
 def test_sma_basic() -> None:
     candles = _series((1, 1, 1, 1), (2, 2, 2, 2), (3, 3, 3, 3), (4, 4, 4, 4))
     assert sma(candles, 4) == 2.5
-    assert sma(candles, 2) == 3.5    # last 2 closes
+    assert sma(candles, 2) == 3.5
 
 
 def test_sma_returns_zero_when_insufficient() -> None:
@@ -57,23 +77,20 @@ def test_sma_returns_zero_when_insufficient() -> None:
 def test_true_range() -> None:
     prev = _candle(datetime(2026, 4, 27, 12, 0), o=100, h=102, l=99, c=101)
     cur = _candle(datetime(2026, 4, 27, 12, 1), o=101, h=104, l=100, c=103)
-    # H-L = 4, |H - prev_c| = 3, |L - prev_c| = 1 → max = 4
     assert true_range(prev, cur) == 4
 
 
 def test_true_range_with_gap() -> None:
     prev = _candle(datetime(2026, 4, 27, 12, 0), o=100, h=102, l=99, c=101)
     cur = _candle(datetime(2026, 4, 27, 12, 1), o=110, h=112, l=108, c=111)
-    # H-L = 4, |H - prev_c| = 11, |L - prev_c| = 7 → max = 11 (gap up)
     assert true_range(prev, cur) == 11
 
 
 def test_atr_basic() -> None:
-    # 3 candles → 2 true ranges
     candles = (
         _candle(datetime(2026, 4, 27, 12, 0), o=100, h=102, l=99, c=101),
-        _candle(datetime(2026, 4, 27, 12, 1), o=101, h=104, l=100, c=103),  # TR = 4
-        _candle(datetime(2026, 4, 27, 12, 2), o=103, h=105, l=102, c=104),  # TR = max(3, 2, 1) = 3
+        _candle(datetime(2026, 4, 27, 12, 1), o=101, h=104, l=100, c=103),
+        _candle(datetime(2026, 4, 27, 12, 2), o=103, h=105, l=102, c=104),
     )
     assert atr(candles, 2) == pytest.approx(3.5)
 
@@ -91,11 +108,11 @@ def test_highest_high_and_lowest_low() -> None:
     )
     assert highest_high(candles, 3) == 15
     assert lowest_low(candles, 3) == 9
-    assert highest_high(candles, 1) == 14   # last candle only
-    assert lowest_low(candles, 0) == 0.0    # invalid period
+    assert highest_high(candles, 1) == 14
+    assert lowest_low(candles, 0) == 0.0
 
 
-# ── Strategy: validation ──────────────────────────────────────────────────
+# Strategy: validation
 def test_strategy_rejects_bad_params() -> None:
     with pytest.raises(ValueError):
         AtrBreakoutStrategy(breakout_lookback=1)
@@ -109,17 +126,15 @@ def test_strategy_rejects_bad_params() -> None:
         AtrBreakoutStrategy(quantity=0)
 
 
-@pytest.mark.skip(
-    reason="Strategy retired: AtrBreakoutStrategy now wraps ORBStrategy. "
-    "New history_window = max(ema_period, atr_period+1). Test asserts "
-    "the old `max(params) + 1` formula. Codex to rebuild — see handoff."
-)
-def test_strategy_history_window_is_max_param_plus_one() -> None:
+def test_orb_history_window_is_max_ema_or_atr_plus_one() -> None:
     s = AtrBreakoutStrategy(breakout_lookback=20, ma_period=50, atr_period=14)
-    assert s.history_window == 51   # max(20, 50, 14) + 1
+    assert s.history_window == 50
+
+    s = AtrBreakoutStrategy(breakout_lookback=20, ma_period=10, atr_period=14)
+    assert s.history_window == 15
 
 
-# ── Strategy: behavior ────────────────────────────────────────────────────
+# Strategy: behavior
 def _ctx(history: tuple[Candle, ...], *, has_open: bool = False) -> StrategyContext:
     return StrategyContext(
         symbol="MESM26",
@@ -141,37 +156,18 @@ def test_no_signal_when_history_too_short() -> None:
 
 def test_no_signal_when_position_open() -> None:
     s = AtrBreakoutStrategy(breakout_lookback=3, ma_period=3, atr_period=2)
-    # Build a clear breakout, but mark position open — should still return None
-    history = _series(
-        *[(100, 101, 99, 100)] * 5,            # flat history
-        (100, 110, 100, 109),                  # explosive breakout candle
-    )
-    assert s.on_candle_close(_ctx(history, has_open=True)) is None
+    assert s.on_candle_close(_ctx(_orb_us_long_history(), has_open=True)) is None
 
 
-@pytest.mark.skip(
-    reason="Strategy retired: new ORBStrategy requires candle timestamps "
-    "inside a session window (Asian 00:00-06:00 UTC or US 14:30-20:45 UTC). "
-    "_series() builds candles at 12:00 UTC — outside both windows, so "
-    "no signal can fire. Codex to rebuild test with proper session timestamps."
-)
-def test_breakout_long_intent_is_emitted() -> None:
+def test_orb_long_intent_in_us_session() -> None:
     s = AtrBreakoutStrategy(
         breakout_lookback=3,
         ma_period=3,
         atr_period=2,
-        atr_stop_mult=2.0,
-        atr_target_mult=3.0,
+        atr_stop_mult=1.0,
+        atr_target_mult=2.5,
     )
-    # 5 flat candles around 100 + a strong breakout at 110
-    history = _series(
-        (100, 101, 99, 100),
-        (100, 101, 99, 100),
-        (100, 101, 99, 100),
-        (100, 101, 99, 100),
-        (100, 101, 99, 100),
-        (100, 110, 100, 109),
-    )
+    history = _orb_us_long_history()
     intent = s.on_candle_close(_ctx(history))
     assert intent is not None
     assert intent.side == proto.BUY
@@ -179,72 +175,69 @@ def test_breakout_long_intent_is_emitted() -> None:
     assert intent.exchange == "CME"
     assert intent.quantity == 1.0
     assert intent.order_type == proto.ORDER_TYPE_MARKET
-    assert intent.price == 109
-    # ATR(period=2) uses the last 3 candles (period + 1) for 2 true ranges:
-    #   bar4 (flat 100/101/99/100) → bar5 (flat 100/101/99/100):
-    #     TR = max(101-99, |101-100|, |99-100|) = max(2, 1, 1) = 2
-    #   bar5 (flat) → breakout (100/110/100/109):
-    #     TR = max(110-100, |110-100|, |100-100|) = 10
-    #   ATR(2) = (2 + 10) / 2 = 6.0
-    # Stop  = 109 - 2*6.0 = 97.0
-    # Target = 109 + 3*6.0 = 127.0
-    assert intent.stop_loss == pytest.approx(97.0)
-    assert intent.take_profit == pytest.approx(127.0)
+    assert intent.price == 110
+    assert intent.stop_loss == pytest.approx(103.0)
+    assert intent.take_profit == pytest.approx(127.5)
     assert intent.per_contract_margin == 100.0
-    assert "breakout" in intent.reason
-    # intent_id is short (≤32 chars to fit DTC ClientOrderID[32]) and
-    # includes the strategy tag + symbol + timestamp for uniqueness.
+    assert "ORB us long" in intent.reason
+    assert intent.metadata["session"] == "us"
     assert len(intent.intent_id) <= 32
-    assert intent.intent_id.startswith("atrbo-")
+    assert intent.intent_id.startswith("orb-us-")
     assert "MESM26" in intent.intent_id
+
+
+def test_orb_long_intent_in_asian_session() -> None:
+    s = AtrBreakoutStrategy(
+        breakout_lookback=3,
+        ma_period=3,
+        atr_period=2,
+        atr_stop_mult=1.0,
+        atr_target_mult=2.5,
+    )
+    history = _orb_asian_long_history()
+    intent = s.on_candle_close(_ctx(history))
+    assert intent is not None
+    assert intent.side == proto.BUY
+    assert intent.metadata["session"] == "asian"
+    assert intent.intent_id.startswith("orb-as-")
+
+
+def test_orb_no_signal_outside_session_window() -> None:
+    s = AtrBreakoutStrategy(breakout_lookback=3, ma_period=3, atr_period=2)
+    history = _series_at(
+        datetime(2026, 4, 27, 12, 0),
+        (100, 102, 99, 100),
+        (100, 102, 99, 101),
+        (101, 111, 100, 110),
+    )
+    assert s.on_candle_close(_ctx(history)) is None
 
 
 def test_no_signal_when_close_below_breakout_high() -> None:
     s = AtrBreakoutStrategy(breakout_lookback=3, ma_period=3, atr_period=2)
-    # Last bar barely above SMA but BELOW the prior 3-bar high
     history = _series(
-        (100, 105, 99, 104),    # high = 105
-        (104, 106, 103, 105),   # high = 106 — this will be the breakout reference
-        (105, 107, 104, 105),   # high = 107
-        (105, 106, 104, 105),   # close 105 < highest_high(prior 3) = 107
+        (100, 105, 99, 104),
+        (104, 106, 103, 105),
+        (105, 107, 104, 105),
+        (105, 106, 104, 105),
     )
     assert s.on_candle_close(_ctx(history)) is None
 
 
 def test_no_signal_when_close_below_sma() -> None:
     s = AtrBreakoutStrategy(breakout_lookback=3, ma_period=3, atr_period=2)
-    # Build history where close exceeds prior high but is below SMA
-    # (rising prices then a small breakout from below the average)
     history = _series(
         (110, 115, 109, 114),
         (114, 116, 113, 115),
         (115, 117, 114, 116),
-        (116, 117, 100, 101),   # close below SMA but above prior high? No — this clarifies why we test SMA
+        (116, 117, 100, 101),
     )
-    intent = s.on_candle_close(_ctx(history))
-    # close 101 < prior 3-bar high (117) AND < SMA — both filters fail
-    assert intent is None
+    assert s.on_candle_close(_ctx(history)) is None
 
 
-@pytest.mark.skip(
-    reason="Strategy retired: same root cause as test_breakout_long_intent_is_emitted. "
-    "Test history timestamps are at 12:00 UTC — outside ORB session windows. "
-    "The stop_loss assertion contract is still important; Codex's rebuild "
-    "should include a session-aware version of this test."
-)
 def test_intent_includes_stop_loss_so_risk_engine_will_evaluate() -> None:
-    """Risk engine requires stop_loss for per-trade-risk evaluation. Confirm
-    the strategy always sets one on entries."""
     s = AtrBreakoutStrategy(breakout_lookback=3, ma_period=3, atr_period=2)
-    history = _series(
-        (100, 101, 99, 100),
-        (100, 101, 99, 100),
-        (100, 101, 99, 100),
-        (100, 101, 99, 100),
-        (100, 101, 99, 100),
-        (100, 110, 100, 109),
-    )
-    intent = s.on_candle_close(_ctx(history))
+    intent = s.on_candle_close(_ctx(_orb_us_long_history()))
     assert intent is not None
     assert intent.stop_loss is not None
-    assert intent.stop_loss < intent.price   # long stop is below entry
+    assert intent.stop_loss < intent.price

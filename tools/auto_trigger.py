@@ -36,8 +36,8 @@ async def main():
     payload = SignalPayload(
         intent_id=f"auto-smoke-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d%H%M%S')}",
         timestamp=dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat(),
-        symbol="MESM26",
-        nt_symbol="MES 06-26",
+        symbol="MESU26",
+        nt_symbol="MES 09-26",
         side="BUY",
         quantity=1,
         atm_template="KATE_MES_ORB_BASE",

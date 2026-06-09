@@ -109,9 +109,10 @@ def _render_human(summary: dict, *, recent: list) -> None:
     print(f"  median slippage     : {summary['median_pips']:+.3f} pip")
     print(f"  std dev             : {summary['std_pips']:.3f} pip")
     print(f"  min  / max          : {summary['min_pips']:+.3f}  /  {summary['max_pips']:+.3f} pip")
-    print(f"  avg fill latency    : {summary['mean_latency_seconds']:.2f} s")
+    print(f"  avg recorder latency: {summary['mean_latency_seconds']:.2f} s")
     print()
     print("  Convention: positive = bad for trader (paid more on BUY, received less on SELL)")
+    print("  Latency is local recorder-observed time, not broker/exchange event latency.")
     print()
     if recent:
         print("  Last 5 trades:")

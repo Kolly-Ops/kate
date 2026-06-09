@@ -66,6 +66,7 @@ from .broker_adapter import (
     PositionEvent,
 )
 from .ninja_messages import (
+    BracketUpdatePayload,
     FillEventType,
     HeartbeatPayload,
     MsgType,
@@ -79,11 +80,8 @@ from .ninja_transport import NinjaBridgeServer, NotConnectedError
 logger = logging.getLogger(__name__)
 
 
-# Engine pre-flight requires non-zero NLV before strategy evaluation can
-# begin (see broker_adapter.py BrokerAdapter.request_account_state docstring).
-# We surface a clear sentinel so the engine fails fast with an obvious cause
-# rather than silently running against bogus state. CEO directive 2026-05-08:
-# "no opaque account state."
+# Retained for import compatibility with older tests/handoffs. Phase 5
+# replaces the sentinel path with NT reconcile-backed account telemetry.
 _STUB_NLV_SENTINEL: float = -1.0
 
 
@@ -115,8 +113,8 @@ class NinjaBrokerAdapter(BrokerAdapter):
     server is bound on construction (or via `connect()`) and waits for the
     NinjaScript `KateBridgeStrategy.cs` client to connect.
 
-    `symbol_map` maps Kate logical symbols (e.g. "MESM26") to the
-    `BrokerSymbolSpec` carrying NT's display form (e.g. "MES 06-26"). The
+    `symbol_map` maps Kate logical symbols (e.g. "MESU26") to the
+    `BrokerSymbolSpec` carrying NT's display form (e.g. "MES 09-26"). The
     NinjaScript side resolves to the actual NT instrument at signal time;
     the adapter just passes the broker form through.
     """
@@ -143,9 +141,11 @@ class NinjaBrokerAdapter(BrokerAdapter):
         # Cache the latest reconcile snapshot so request_positions /
         # request_open_orders can return synchronously without round-tripping
         # the bridge each call (matches the seed-call semantics in the ABC).
+        self._last_account_state: Optional[AccountBalanceEvent] = None
         self._last_reconcile_positions: tuple[PositionEvent, ...] = ()
         self._last_reconcile_orders: tuple[OrderEvent, ...] = ()
         self._reconcile_event: asyncio.Event = asyncio.Event()
+        self._subscribed_symbols: set[str] = set()
         # Bar-dedup state (Codex's design 2026-05-18): keyed by (symbol,
         # bar_index, timestamp). Idempotent retransmits with identical
         # OHLCV are dropped silently; revisions with different OHLCV are
@@ -343,6 +343,7 @@ class NinjaBrokerAdapter(BrokerAdapter):
                 f"KNOWN_INSTRUMENTS + supervisor symbol_map. Known: "
                 f"{sorted(self.symbol_map)}"
             )
+        self._subscribed_symbols.add(symbol)
         logger.info(
             "ninja-adapter: subscribe_market_data(%s) acknowledged — "
             "NT-side bar publication is autonomous; ensure "
@@ -357,46 +358,20 @@ class NinjaBrokerAdapter(BrokerAdapter):
         *,
         trade_account: str,
     ) -> AccountBalanceEvent:
-        """SKELETON — bridge protocol carries no account-balance fields yet.
-
-        Returns a sentinel AccountBalanceEvent with NLV = -1.0. **Important
-        caveat caught by Codex review 2026-05-18 §1**: the engine's
-        `_hydrate_account_balance` (`managed_futures_engine.py:567`) has a
-        demo-mode fallback that silently converts NLV <= 0 to
-        `risk.policy.starting_nlv`. So in `--trade-mode demo` (sim / MFFU
-        eval prep), the engine WILL seed against the configured starting
-        NLV — not refuse to seed as an earlier docstring revision implied.
-
-        Implications:
-        - Demo / sim / MFFU eval prep: acceptable. Risk gates compute
-          against `policy.starting_nlv` (default $1,080 per risk.json).
-          Drawdown tracking is approximate.
-        - Live / funded account: NOT acceptable. We need real NLV
-          telemetry from NT before the first real-money trade. Real
-          implementation extends `ReconcileResponsePayload` with
-          cash/nlv/pnl/margin fields (or new `ACCOUNT_INFO` MsgType);
-          requires C# mirror in `KateBridgeStrategy.cs`. Tracked as
-          pre-live-flip gate item.
-
-        Refer to `protocol/kate-pre-live-flip-gate.md` for the live gate
-        once that doc is updated; today this stub is the documented
-        risk-acceptance for sim phases.
-        """
-        logger.warning(
-            "ninja-adapter: request_account_state returning STUB sentinel "
-            "(NLV=%.2f). Engine demo-mode fallback (managed_futures_engine.py "
-            "_hydrate_account_balance) will substitute risk.policy.starting_nlv. "
-            "This is acceptable for sim/demo but MUST be replaced with real NT "
-            "account telemetry before live-mode operation. See Codex review "
-            "2026-05-18 §1.", _STUB_NLV_SENTINEL,
-        )
-        return AccountBalanceEvent(
-            cash=_STUB_NLV_SENTINEL,
-            nlv=_STUB_NLV_SENTINEL,
-            pnl=0.0,
-            margin_requirement=0.0,
-            currency="USD",
-        )
+        await self._send_reconcile_request()
+        try:
+            await asyncio.wait_for(self._reconcile_event.wait(), timeout=5.0)
+        except asyncio.TimeoutError as exc:
+            raise BrokerError(
+                "ninja-adapter: reconcile response not received within 5s "
+                "while requesting account state"
+            ) from exc
+        if self._last_account_state is None:
+            raise BrokerError(
+                "ninja-adapter: reconcile response did not include account "
+                "balance fields; update KateBridgeStrategy.cs and re-run smoke"
+            )
+        return self._last_account_state
 
     async def request_positions(
         self,
@@ -470,7 +445,8 @@ class NinjaBrokerAdapter(BrokerAdapter):
         Handles FILL, HEARTBEAT, ACK, RECONCILE_RESP. BAR envelopes are
         accepted but currently not translated into a BrokerEvent (the
         engine seam for bar-close events lands when market-data path is
-        wired). Unknown msg_types are logged + dropped.
+        wired). BRACKET_UPDATE is logged as smoke/audit evidence.
+        Unknown msg_types are logged + dropped.
         """
         while True:
             try:
@@ -530,22 +506,59 @@ class NinjaBrokerAdapter(BrokerAdapter):
             ))
             return
 
+        if msg_type == MsgType.BRACKET_UPDATE.value:
+            update = BracketUpdatePayload(**payload)
+            logger.info(
+                "ninja-adapter: BRACKET_UPDATE intent_id=%s symbol=%s "
+                "nt_symbol=%s atm_strategy_id=%s %s=%.4f %s=%.4f",
+                update.intent_id,
+                update.symbol,
+                update.nt_symbol,
+                update.atm_strategy_id,
+                update.stop_name,
+                update.stop_price,
+                update.target_name,
+                update.target_price,
+            )
+            return
+
         if msg_type == MsgType.RECONCILE_RESP.value:
+            account_name = str(payload.get("account_name", ""))
+            cash = float(payload.get("cash_balance", 0.0))
+            equity = float(payload.get("equity", 0.0))
+            unrealized_pnl = float(payload.get("unrealized_pnl", 0.0))
+            realized_pnl = float(payload.get("realized_pnl", 0.0))
+            margin_used = float(payload.get("margin_used", 0.0))
+            nlv = equity if equity > 0.0 else cash
+            self._last_account_state = AccountBalanceEvent(
+                cash=cash,
+                nlv=nlv,
+                pnl=realized_pnl + unrealized_pnl,
+                margin_requirement=margin_used,
+                currency=str(payload.get("currency", "USD")) or "USD",
+            )
+            if account_name and account_name != self.config.nt_account_label:
+                logger.warning(
+                    "ninja-adapter: reconcile account_name=%s differs from "
+                    "configured nt_account_label=%s",
+                    account_name, self.config.nt_account_label,
+                )
             self._last_reconcile_positions = tuple(
                 PositionEvent(
                     symbol=str(p.get("symbol", "")),
                     quantity=float(p.get("quantity", 0)),
                     avg_price=float(p.get("avg_price", 0.0)),
                     side=1 if str(p.get("side", "")).upper() == "BUY" else 2,
+                    server_position_id=str(p.get("server_position_id", "")) or None,
                 )
                 for p in payload.get("open_positions", [])
             )
             self._last_reconcile_orders = tuple(
                 OrderEvent(
                     client_order_id=str(b.get("intent_id", "")),
-                    symbol=_UNKNOWN_SYMBOL,
-                    side=1,
-                    quantity=0.0,
+                    symbol=str(b.get("symbol", "")) or _UNKNOWN_SYMBOL,
+                    side=1 if str(b.get("side", "")).upper() == "BUY" else 2,
+                    quantity=float(b.get("quantity", 0)),
                     server_order_id=str(b.get("atm_strategy_id", "")) or None,
                 )
                 for b in payload.get("pending_brackets", [])
@@ -591,6 +604,13 @@ class NinjaBrokerAdapter(BrokerAdapter):
             await self._emit_bar_error(
                 f"malformed BAR payload seq={envelope.sequence}: {exc} "
                 f"(payload={payload!r})"
+            )
+            return
+
+        if symbol not in self._subscribed_symbols:
+            logger.debug(
+                "ninja-adapter: BAR for unsubscribed symbol %s seq=%d dropped",
+                symbol, envelope.sequence,
             )
             return
 

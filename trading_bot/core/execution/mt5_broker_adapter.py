@@ -107,6 +107,13 @@ class MT5Config:
         )
 
 
+@dataclass(frozen=True)
+class ModifyResult:
+    success: bool
+    reason: str = ""
+    retcode: int = 0
+
+
 def _load_runtime() -> Any:
     try:
         import MetaTrader5 as mt5  # type: ignore
@@ -185,7 +192,7 @@ class MT5BrokerAdapter(BrokerAdapter):
             "timeout": self.config.timeout_ms,
             "portable": self.config.portable,
         }
-        if self.config.path:
+        if self.config.path and self.config.path.strip():
             kwargs["path"] = self.config.path
         if self.config.login:
             kwargs["login"] = self.config.login
@@ -385,6 +392,46 @@ class MT5BrokerAdapter(BrokerAdapter):
                 server_order_id=server_order_id,
             ),
         ))
+
+    async def mt5_modify_position_stop(
+        self,
+        *,
+        ticket: int,
+        symbol: str,
+        new_stop_price: float,
+        keep_take_profit: bool = True,
+    ) -> ModifyResult:
+        """MT5-only stop-loss modification for step-ratchet protection."""
+        self._require_connected()
+        mt5 = self._ensure_runtime()
+        spec = self._spec(symbol)
+        if ticket <= 0:
+            return ModifyResult(success=False, reason="ticket must be > 0")
+        if new_stop_price <= 0:
+            return ModifyResult(success=False, reason="new_stop_price must be > 0")
+
+        positions = await asyncio.to_thread(mt5.positions_get, ticket=int(ticket))
+        if not positions:
+            return ModifyResult(success=False, reason=f"position ticket {ticket} not found")
+        position = positions[0]
+        current_tp = float(_field(position, "tp", 0.0) or 0.0)
+        request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "position": int(ticket),
+            "symbol": spec.broker_symbol,
+            "sl": float(new_stop_price),
+            "magic": self.config.magic,
+            "comment": "kate-step-ratchet",
+        }
+        if keep_take_profit and current_tp > 0:
+            request["tp"] = current_tp
+
+        result = await asyncio.to_thread(mt5.order_send, request)
+        retcode = int(_field(result, "retcode", 0) or 0)
+        if retcode not in self._success_retcodes(mt5):
+            reason = str(_field(result, "comment", "") or self._last_error())
+            return ModifyResult(success=False, reason=reason, retcode=retcode)
+        return ModifyResult(success=True, retcode=retcode)
 
     async def subscribe_market_data(
         self,
@@ -708,6 +755,7 @@ class MT5BrokerAdapter(BrokerAdapter):
                             quantity=0.0,
                             avg_price=float(prev.get("price_open", 0.0) or 0.0),
                             side=None,
+                            server_position_id=str(closed_ticket),
                         ),
                     ))
                 await self._alert_position_closed(closed_ticket, prev)
@@ -956,6 +1004,7 @@ class MT5BrokerAdapter(BrokerAdapter):
             quantity=signed_qty,
             avg_price=float(_field(row, "price_open", 0.0) or 0.0),
             side=side,
+            server_position_id=str(_field(row, "ticket", "") or "") or None,
         )
 
     def _open_order_to_event(self, row: Any) -> OrderEvent:

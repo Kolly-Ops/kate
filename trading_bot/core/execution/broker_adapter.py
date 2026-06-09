@@ -126,6 +126,7 @@ class PositionEvent:
     quantity: float
     avg_price: float
     side: Optional[int] = None           # may be None when flat
+    server_position_id: Optional[str] = None
 
 
 @dataclass(frozen=True)

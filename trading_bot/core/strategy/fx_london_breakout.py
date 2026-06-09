@@ -1,7 +1,8 @@
-"""FX London breakout strategy.
+"""FX session breakout strategies.
 
-Captures the UK Asian session range, then trades one London open breakout.
-Designed for the MT5 demo path first, with GBPUSD as the primary symbol.
+The London strategy captures the 00:00-07:00 UK Asian range, then trades one
+London-open breakout. The NY strategy uses the same mechanics on a separate
+12:00-15:30 UK range and 15:30-18:00 UK trade window.
 """
 from __future__ import annotations
 
@@ -11,14 +12,14 @@ from dataclasses import dataclass
 from typing import Optional, Sequence
 from zoneinfo import ZoneInfo
 
-logger = logging.getLogger(__name__)
-
 from trading_bot.core.data import Candle
 from trading_bot.core.execution import dtc_protocol as proto
 from trading_bot.core.risk import TradeIntent
 
 from .base import Strategy, StrategyContext
 from .indicators import atr
+
+logger = logging.getLogger(__name__)
 
 
 # Per-symbol minimum stop distance in pips. Guards against the failure mode
@@ -30,6 +31,7 @@ DEFAULT_MIN_STOP_PIPS_BY_SYMBOL: dict[str, float] = {
     "EURUSD": 5.0,
     "AUDUSD": 5.0,
     "EURGBP": 4.0,
+    "USDCAD": 5.0,
 }
 DEFAULT_MIN_STOP_PIPS_FALLBACK: float = 5.0
 
@@ -43,12 +45,59 @@ class NewsEvent:
     label: str = ""
 
 
-class FXLondonBreakoutStrategy(Strategy):
-    """Trade breaks of the 00:00-07:00 UK Asian range during 07:00-10:00 UK."""
+@dataclass(frozen=True)
+class FXSessionConfig:
+    """Local-time breakout session windows."""
+
+    name: str
+    intent_prefix: str
+    range_label: str
+    range_start: dt.time
+    range_end: dt.time
+    trade_start: dt.time
+    trade_end: dt.time
+    force_flat: dt.time
+
+    def __post_init__(self) -> None:
+        if not (self.range_start < self.range_end <= self.trade_start < self.trade_end):
+            raise ValueError(
+                "session windows must satisfy "
+                "range_start < range_end <= trade_start < trade_end"
+            )
+        if self.force_flat != self.trade_end:
+            raise ValueError("force_flat must match trade_end for current bracket-only wiring")
+
+
+LONDON_SESSION = FXSessionConfig(
+    name="london",
+    intent_prefix="fxlon",
+    range_label="Asian range",
+    range_start=dt.time(0, 0),
+    range_end=dt.time(7, 0),
+    trade_start=dt.time(7, 0),
+    trade_end=dt.time(10, 0),
+    force_flat=dt.time(10, 0),
+)
+
+NY_SESSION = FXSessionConfig(
+    name="ny",
+    intent_prefix="fxny",
+    range_label="NY reference range",
+    range_start=dt.time(12, 0),
+    range_end=dt.time(15, 30),
+    trade_start=dt.time(15, 30),
+    trade_end=dt.time(18, 0),
+    force_flat=dt.time(18, 0),
+)
+
+
+class FXSessionBreakoutStrategy(Strategy):
+    """Trade breaks of a configured FX range during its trade window."""
 
     def __init__(
         self,
         *,
+        session: FXSessionConfig = LONDON_SESSION,
         quantity: float = 0.01,
         reward_risk: float = 2.0,
         atr_period: int = 14,
@@ -63,7 +112,7 @@ class FXLondonBreakoutStrategy(Strategy):
         timezone: str = "Europe/London",
         news_events: Sequence[NewsEvent | dt.datetime] = (),
         news_buffer_minutes: int = 2,
-        intent_cooldown_minutes: int = 60,
+        intent_cooldown_minutes: int = 120,
     ) -> None:
         if quantity <= 0:
             raise ValueError("quantity must be > 0")
@@ -88,6 +137,7 @@ class FXLondonBreakoutStrategy(Strategy):
         if intent_cooldown_minutes < 0:
             raise ValueError("intent_cooldown_minutes must be >= 0")
 
+        self.session = session
         self.quantity = quantity
         self.reward_risk = reward_risk
         self.atr_period = atr_period
@@ -106,18 +156,14 @@ class FXLondonBreakoutStrategy(Strategy):
         self.timezone = ZoneInfo(timezone)
         self.news_events = tuple(news_events)
         self.news_buffer = dt.timedelta(minutes=news_buffer_minutes)
-        self._traded_sessions: set[tuple[str, dt.date]] = set()
-        # 2026-06-02 INTENT COOLDOWN (CEO directive): per-symbol last-intent
-        # timestamp. Belt-and-braces gate that doesn't rely on FILL event
-        # propagation to mark_session_traded — the canonical session marker
-        # is failing silently (see retrospective 2026-06-02).
         self.intent_cooldown_minutes = int(intent_cooldown_minutes)
-        self._last_intent_at_utc: dict[str, dt.datetime] = {}
+        self._traded_sessions: set[tuple[str, dt.date]] = set()
+        self._last_exit_at_utc: dict[str, dt.datetime] = {}
 
     @property
     def name(self) -> str:
         return (
-            "fx_london_breakout("
+            f"fx_{self.session.name}_breakout("
             f"qty={self.quantity:g},rr={self.reward_risk:g},atr={self.atr_period},"
             f"atr_mult={self.atr_stop_multiplier:g})"
         )
@@ -128,62 +174,82 @@ class FXLondonBreakoutStrategy(Strategy):
 
     def on_candle_close(self, ctx: StrategyContext) -> Optional[TradeIntent]:
         if ctx.has_open_position:
-            logger.debug("fxlon %s: skip — open position", ctx.symbol)
+            logger.debug("%s %s: skip - open position", self.session.intent_prefix, ctx.symbol)
             return None
-        # 2026-06-02 INTENT COOLDOWN: skip if we emitted an intent on this
-        # symbol within the configured cooldown window. Uses candle.timestamp
-        # (UTC) so backtests and live runs share a clock.
+
         if self.intent_cooldown_minutes > 0:
-            last_at = self._last_intent_at_utc.get(ctx.symbol)
+            last_at = self._last_exit_at_utc.get(ctx.symbol)
             if last_at is not None:
-                candle_ts = ctx.candle.timestamp
-                if candle_ts.tzinfo is None:
-                    candle_ts = candle_ts.replace(tzinfo=dt.timezone.utc)
-                if last_at.tzinfo is None:
-                    last_at = last_at.replace(tzinfo=dt.timezone.utc)
+                candle_ts = self._as_utc(ctx.candle.timestamp)
+                last_at = self._as_utc(last_at)
                 elapsed_min = (candle_ts - last_at).total_seconds() / 60.0
                 if elapsed_min < self.intent_cooldown_minutes:
                     logger.info(
-                        "fxlon %s: skip - cooldown (%.1f min elapsed < %d min window)",
-                        ctx.symbol, elapsed_min, self.intent_cooldown_minutes,
+                        "%s %s: skip - post-exit cooldown "
+                        "(last_exit=%s, %.1f min elapsed < %d min window)",
+                        self.session.intent_prefix,
+                        ctx.symbol,
+                        last_at.isoformat(),
+                        elapsed_min,
+                        self.intent_cooldown_minutes,
                     )
                     return None
 
-        ts_uk = self._to_local(ctx.candle.timestamp)
-        if not self._in_trade_window(ts_uk):
+        ts_local = self._to_local(ctx.candle.timestamp)
+        if not self._in_trade_window(ts_local):
             logger.debug(
-                "fxlon %s @ %s UK: outside trade window 07:00-10:00",
-                ctx.symbol, ts_uk.strftime("%Y-%m-%d %H:%M"),
+                "%s %s @ %s UK: outside trade window %s-%s",
+                self.session.intent_prefix,
+                ctx.symbol,
+                ts_local.strftime("%Y-%m-%d %H:%M"),
+                self.session.trade_start.strftime("%H:%M"),
+                self.session.trade_end.strftime("%H:%M"),
             )
             return None
 
-        # Inside the trade window — promote to INFO so we can see the
-        # strategy is actually being evaluated each minute.
         logger.info(
-            "fxlon %s @ %s UK: IN trade window, evaluating (history=%d candles)",
-            ctx.symbol, ts_uk.strftime("%H:%M"), len(ctx.history),
+            "%s %s @ %s UK: IN trade window, evaluating (history=%d candles)",
+            self.session.intent_prefix,
+            ctx.symbol,
+            ts_local.strftime("%H:%M"),
+            len(ctx.history),
         )
 
-        session_key = (ctx.symbol, ts_uk.date())
+        session_key = (ctx.symbol, ts_local.date())
         if session_key in self._traded_sessions:
-            logger.info("fxlon %s: skip — already traded this session", ctx.symbol)
+            logger.info(
+                "%s %s: skip - already traded this session",
+                self.session.intent_prefix,
+                ctx.symbol,
+            )
             return None
 
-        if self._in_news_blackout(ts_uk):
-            logger.info("fxlon %s: skip — inside news blackout buffer", ctx.symbol)
+        if self._in_news_blackout(ts_local):
+            logger.info(
+                "%s %s: skip - inside news blackout buffer",
+                self.session.intent_prefix,
+                ctx.symbol,
+            )
             return None
 
-        range_candles = self._asian_range_candles(ctx.history, ts_uk.date())
+        range_candles = self._session_range_candles(ctx.history, ts_local.date())
         if not range_candles:
             logger.info(
-                "fxlon %s: skip — no Asian-range candles found for session %s",
-                ctx.symbol, ts_uk.date(),
+                "%s %s: skip - no %s candles found for session %s",
+                self.session.intent_prefix,
+                ctx.symbol,
+                self.session.range_label,
+                ts_local.date(),
             )
             return None
         if len(ctx.history) < self.atr_period + 1:
             logger.info(
-                "fxlon %s: skip — insufficient history (%d < %d for ATR%d)",
-                ctx.symbol, len(ctx.history), self.atr_period + 1, self.atr_period,
+                "%s %s: skip - insufficient history (%d < %d for ATR%d)",
+                self.session.intent_prefix,
+                ctx.symbol,
+                len(ctx.history),
+                self.atr_period + 1,
+                self.atr_period,
             )
             return None
 
@@ -191,50 +257,59 @@ class FXLondonBreakoutStrategy(Strategy):
         range_low = min(c.low for c in range_candles)
         range_pips = (range_high - range_low) / self.pip_size
         logger.info(
-            "fxlon %s Asian range: high=%.5f low=%.5f pips=%.1f close=%.5f (n_bars=%d)",
-            ctx.symbol, range_high, range_low, range_pips, ctx.candle.close, len(range_candles),
+            "%s %s %s: high=%.5f low=%.5f pips=%.1f close=%.5f (n_bars=%d)",
+            self.session.intent_prefix,
+            ctx.symbol,
+            self.session.range_label,
+            range_high,
+            range_low,
+            range_pips,
+            ctx.candle.close,
+            len(range_candles),
         )
         if range_pips < self.min_range_pips or range_pips > self.max_range_pips:
             logger.info(
-                "fxlon %s: skip — range %.1f pips outside filter [%.0f, %.0f]",
-                ctx.symbol, range_pips, self.min_range_pips, self.max_range_pips,
+                "%s %s: skip - range %.1f pips outside filter [%.0f, %.0f]",
+                self.session.intent_prefix,
+                ctx.symbol,
+                range_pips,
+                self.min_range_pips,
+                self.max_range_pips,
             )
             return None
 
-        # Sprint 2 (2026-05-30): min_breakout_pips guard — runs BEFORE
-        # ATR/min-stop-floor calculation per Codex REVIEW-RESPONSE
-        # 2026-05-30 (item 1 concern #3). Reasons:
-        #   - skipped trades don't need stop sizing computed
-        #   - avoids fail_on_unknown_symbol floor-lookup for trades that
-        #     would be skipped anyway
-        #   - shallow-breakout log isn't preceded by an irrelevant
-        #     min-stop-floor line
-        # Live evidence Fri 2026-05-29: AUDUSD fired on 0.5-pip break of
-        # a 13.8-pip range, stopped out in 49 seconds when price retraced
-        # to range-mid. False-breakout / liquidity-hunt pattern is the
-        # documented failure mode; widening the floor doesn't help
-        # because the stop still falls inside the prior range. See
-        # proposals/2026-05-29-claude-audusd-breakout-confirmation-not-floor-tuning.md
         if ctx.candle.close > range_high:
             breakout_pips = (ctx.candle.close - range_high) / self.pip_size
         elif ctx.candle.close < range_low:
             breakout_pips = (range_low - ctx.candle.close) / self.pip_size
         else:
             logger.info(
-                "fxlon %s: skip — no breakout (close %.5f inside range %.5f-%.5f)",
-                ctx.symbol, ctx.candle.close, range_low, range_high,
+                "%s %s: skip - no breakout (close %.5f inside range %.5f-%.5f)",
+                self.session.intent_prefix,
+                ctx.symbol,
+                ctx.candle.close,
+                range_low,
+                range_high,
             )
             return None
         if breakout_pips < self.min_breakout_pips:
             logger.info(
-                "fxlon %s: skip — shallow breakout (%.2f pips < %.2f min)",
-                ctx.symbol, breakout_pips, self.min_breakout_pips,
+                "%s %s: skip - shallow breakout (%.2f pips < %.2f min)",
+                self.session.intent_prefix,
+                ctx.symbol,
+                breakout_pips,
+                self.min_breakout_pips,
             )
             return None
 
         current_atr = atr(ctx.history, self.atr_period)
         if current_atr <= 0:
-            logger.info("fxlon %s: skip — ATR%d <= 0", ctx.symbol, self.atr_period)
+            logger.info(
+                "%s %s: skip - ATR%d <= 0",
+                self.session.intent_prefix,
+                ctx.symbol,
+                self.atr_period,
+            )
             return None
 
         atr_stop_distance = current_atr * self.atr_stop_multiplier
@@ -245,21 +320,31 @@ class FXLondonBreakoutStrategy(Strategy):
         floor_binding = min_stop_distance > atr_stop_distance
         if floor_binding:
             logger.info(
-                "fxlon %s: min-stop floor binding — atr_stop=%.2f pips < min=%.2f pips; "
-                "stop_distance=%.2f pips",
-                ctx.symbol, atr_stop_pips, min_stop_pips, stop_distance / self.pip_size,
+                "%s %s: min-stop floor binding - atr_stop=%.2f pips < "
+                "min=%.2f pips; stop_distance=%.2f pips",
+                self.session.intent_prefix,
+                ctx.symbol,
+                atr_stop_pips,
+                min_stop_pips,
+                stop_distance / self.pip_size,
             )
 
-        side: int
-        stop_loss: float
         if ctx.candle.close > range_high:
             side = proto.BUY
             stop_loss = max(range_low, ctx.candle.close - stop_distance)
             risk = ctx.candle.close - stop_loss
             take_profit = ctx.candle.close + (risk * self.reward_risk)
             logger.info(
-                "fxlon %s: BREAKOUT HIGH — BUY @ %.5f stop=%.5f tp=%.5f (range %.5f-%.5f, breakout=%.2f pips)",
-                ctx.symbol, ctx.candle.close, stop_loss, take_profit, range_low, range_high, breakout_pips,
+                "%s %s: BREAKOUT HIGH - BUY @ %.5f stop=%.5f tp=%.5f "
+                "(range %.5f-%.5f, breakout=%.2f pips)",
+                self.session.intent_prefix,
+                ctx.symbol,
+                ctx.candle.close,
+                stop_loss,
+                take_profit,
+                range_low,
+                range_high,
+                breakout_pips,
             )
         else:
             side = proto.SELL
@@ -267,46 +352,31 @@ class FXLondonBreakoutStrategy(Strategy):
             risk = stop_loss - ctx.candle.close
             take_profit = ctx.candle.close - (risk * self.reward_risk)
             logger.info(
-                "fxlon %s: BREAKOUT LOW — SELL @ %.5f stop=%.5f tp=%.5f (range %.5f-%.5f, breakout=%.2f pips)",
-                ctx.symbol, ctx.candle.close, stop_loss, take_profit, range_low, range_high, breakout_pips,
+                "%s %s: BREAKOUT LOW - SELL @ %.5f stop=%.5f tp=%.5f "
+                "(range %.5f-%.5f, breakout=%.2f pips)",
+                self.session.intent_prefix,
+                ctx.symbol,
+                ctx.candle.close,
+                stop_loss,
+                take_profit,
+                range_low,
+                range_high,
+                breakout_pips,
             )
 
         if risk <= 0:
-            logger.info("fxlon %s: skip — risk computed <= 0", ctx.symbol)
+            logger.info(
+                "%s %s: skip - risk computed <= 0",
+                self.session.intent_prefix,
+                ctx.symbol,
+            )
             return None
 
-        # Sprint 2 #44 (2026-05-30): session-marking moved from intent-
-        # emission to engine callback via mark_session_traded(). The
-        # engine populates _entry_intents on broker submission and calls
-        # mark_session_traded() on FILL/PARTIAL_FILL. This fixes the
-        # risk-reject-burns-the-slot issue while keeping fast-fill-fast-
-        # close protection (the FILL event arrives before the next
-        # strategy evaluation, marking the session before re-fire is
-        # possible).
-        # NOTE: do NOT add self._traded_sessions.add(session_key) here —
-        # that's the pre-#44 intent-emission marking. Engine owns it now.
-        ymdhm = ts_uk.strftime("%y%m%d%H%M")
+        ymdhm = ts_local.strftime("%y%m%d%H%M")
         effective_stop_pips = abs(ctx.candle.close - stop_loss) / self.pip_size
-        # Sprint 2 #44 (2026-05-30): carry the signal candle's UTC timestamp
-        # on the intent so the engine can mark the correct session even if
-        # the fill event is delayed/replayed/processed across a UK boundary.
-        # ctx.candle.timestamp is normally tz-aware; convert to UTC.
-        signal_ts = ctx.candle.timestamp
-        if signal_ts.tzinfo is None:
-            signal_ts_utc = signal_ts.replace(tzinfo=dt.timezone.utc)
-        else:
-            signal_ts_utc = signal_ts.astimezone(dt.timezone.utc)
-        # 2026-06-02 INTENT COOLDOWN: stamp the symbol BEFORE returning so the
-        # next candle close in the cooldown window is gated. Even if the
-        # intent is risk-rejected, the cooldown still applies (deliberate
-        # - don't churn on a symbol that risk just rejected).
-        self._last_intent_at_utc[ctx.symbol] = (
-            ctx.candle.timestamp
-            if ctx.candle.timestamp.tzinfo is not None
-            else ctx.candle.timestamp.replace(tzinfo=dt.timezone.utc)
-        )
+        signal_ts_utc = self._as_utc(ctx.candle.timestamp)
         return TradeIntent(
-            intent_id=f"fxlon-{ctx.symbol}-{ymdhm}"[:32],
+            intent_id=f"{self.session.intent_prefix}-{ctx.symbol}-{ymdhm}"[:32],
             strategy_name=self.name,
             symbol=ctx.symbol,
             exchange=ctx.exchange,
@@ -322,14 +392,16 @@ class FXLondonBreakoutStrategy(Strategy):
             per_contract_margin=ctx.per_contract_margin,
             round_trip_commission=ctx.round_trip_commission,
             reason=(
-                "London breakout "
+                f"{self.session.name.upper()} breakout "
                 f"{'high' if side == proto.BUY else 'low'}; "
-                f"Asian range {range_low:.5f}-{range_high:.5f}"
+                f"{self.session.range_label} {range_low:.5f}-{range_high:.5f}"
             ),
             metadata={
                 "asian_range_low": f"{range_low:.5f}",
                 "asian_range_high": f"{range_high:.5f}",
                 "asian_range_pips": f"{range_pips:.1f}",
+                "session": self.session.name,
+                "range_label": self.session.range_label,
                 "breakout_pips": f"{breakout_pips:.2f}",
                 "min_breakout_pips": f"{self.min_breakout_pips:.2f}",
                 "atr": f"{current_atr:.5f}",
@@ -342,65 +414,96 @@ class FXLondonBreakoutStrategy(Strategy):
         )
 
     def mark_session_traded(self, symbol: str, timestamp_utc: dt.datetime) -> None:
-        """Sprint 2 #44 (2026-05-30): engine-driven session marking.
-
-        Called by the engine when an entry order for this strategy is
-        accepted at the broker (ORDER_FILLED or ORDER_PARTIAL_FILL).
-        Converts the UTC timestamp to UK local date (matching the
-        on_candle_close session-key convention at line 137).
-
-        Idempotent — set membership prevents double-marking. Risk-rejected
-        intents never reach this callback (they're filtered before broker
-        submission), so the session stays un-marked and the strategy can
-        re-attempt on the next candle within the trade window.
-        """
-        # Ensure timestamp is UTC-aware before converting; defensive only
-        if timestamp_utc.tzinfo is None:
-            timestamp_utc = timestamp_utc.replace(tzinfo=dt.timezone.utc)
-        session_date = self._to_local(timestamp_utc).date()
+        """Engine-driven session marking after broker accepts entry."""
+        session_date = self._to_local(self._as_utc(timestamp_utc)).date()
         self._traded_sessions.add((symbol, session_date))
+
+    def on_position_closed(self, symbol: str, timestamp_utc: dt.datetime) -> None:
+        """Start cooldown from broker-observed exit time, not entry time."""
+        timestamp_utc = self._as_utc(timestamp_utc)
+        self._last_exit_at_utc[symbol] = timestamp_utc
+        logger.info(
+            "%s %s: post-exit cooldown stamped at %s for %d minutes",
+            self.session.intent_prefix,
+            symbol,
+            timestamp_utc.isoformat(),
+            self.intent_cooldown_minutes,
+        )
 
     def _min_stop_pips_for(self, symbol: str) -> float:
         if symbol in self.min_stop_pips_by_symbol:
             return self.min_stop_pips_by_symbol[symbol]
         if self.fail_on_unknown_symbol:
             raise ValueError(
-                f"fx_london_breakout: no min_stop_pips configured for {symbol!r}; "
+                f"fx_{self.session.name}_breakout: no min_stop_pips configured for {symbol!r}; "
                 f"add it to min_stop_pips_by_symbol or set "
                 f"fail_on_unknown_symbol=False to use the fallback "
                 f"({self.min_stop_pips_fallback} pips)"
             )
         logger.warning(
-            "fxlon %s: no min_stop_pips configured — using fallback %.1f pips. "
+            "%s %s: no min_stop_pips configured - using fallback %.1f pips. "
             "Configure min_stop_pips_by_symbol for production.",
-            symbol, self.min_stop_pips_fallback,
+            self.session.intent_prefix,
+            symbol,
+            self.min_stop_pips_fallback,
         )
         return self.min_stop_pips_fallback
 
     def _to_local(self, timestamp: dt.datetime) -> dt.datetime:
-        if timestamp.tzinfo is None:
-            timestamp = timestamp.replace(tzinfo=dt.timezone.utc)
-        return timestamp.astimezone(self.timezone)
+        return self._as_utc(timestamp).astimezone(self.timezone)
 
-    def _asian_range_candles(self, history: Sequence[Candle], session_date: dt.date) -> tuple[Candle, ...]:
+    @staticmethod
+    def _as_utc(timestamp: dt.datetime) -> dt.datetime:
+        if timestamp.tzinfo is None:
+            return timestamp.replace(tzinfo=dt.timezone.utc)
+        return timestamp.astimezone(dt.timezone.utc)
+
+    def _session_range_candles(
+        self,
+        history: Sequence[Candle],
+        session_date: dt.date,
+    ) -> tuple[Candle, ...]:
         return tuple(
             candle
             for candle in history
-            if self._is_asian_range_bar(self._to_local(candle.timestamp), session_date)
+            if self._is_session_range_bar(self._to_local(candle.timestamp), session_date)
         )
 
-    @staticmethod
-    def _is_asian_range_bar(ts_uk: dt.datetime, session_date: dt.date) -> bool:
-        return ts_uk.date() == session_date and dt.time(0, 0) <= ts_uk.time() < dt.time(7, 0)
+    def _asian_range_candles(
+        self,
+        history: Sequence[Candle],
+        session_date: dt.date,
+    ) -> tuple[Candle, ...]:
+        """Backward-compatible alias used by older London analysis code."""
+        return self._session_range_candles(history, session_date)
 
-    @staticmethod
-    def _in_trade_window(ts_uk: dt.datetime) -> bool:
-        return dt.time(7, 0) <= ts_uk.time() < dt.time(10, 0)
+    def _is_session_range_bar(self, ts_local: dt.datetime, session_date: dt.date) -> bool:
+        return (
+            ts_local.date() == session_date
+            and self.session.range_start <= ts_local.time() < self.session.range_end
+        )
 
-    def _in_news_blackout(self, ts_uk: dt.datetime) -> bool:
+    def _in_trade_window(self, ts_local: dt.datetime) -> bool:
+        return self.session.trade_start <= ts_local.time() < self.session.trade_end
+
+    def _in_news_blackout(self, ts_local: dt.datetime) -> bool:
         for event in self.news_events:
             event_ts = event.timestamp if isinstance(event, NewsEvent) else event
-            event_uk = self._to_local(event_ts)
-            if abs(ts_uk - event_uk) <= self.news_buffer:
+            event_local = self._to_local(event_ts)
+            if abs(ts_local - event_local) <= self.news_buffer:
                 return True
         return False
+
+
+class FXLondonBreakoutStrategy(FXSessionBreakoutStrategy):
+    """London-open FX breakout using the 00:00-07:00 UK Asian range."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(session=LONDON_SESSION, **kwargs)
+
+
+class FXNYBreakoutStrategy(FXSessionBreakoutStrategy):
+    """NY-session FX breakout using the 12:00-15:30 UK reference range."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(session=NY_SESSION, **kwargs)
