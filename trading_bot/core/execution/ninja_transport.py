@@ -83,11 +83,21 @@ class NinjaBridgeServer:
         return self._port
 
     async def start(self) -> None:
-        """Begin listening. Returns once the socket is bound."""
+        """Begin listening. Returns once the socket is bound.
+
+        For loopback, bind BOTH IPv4 (127.0.0.1) and IPv6 (::1) so the
+        NinjaScript client connects whether it dials "127.0.0.1" or
+        "localhost" — on Windows "localhost" often resolves to ::1 first, and
+        an IPv4-only bind would then silently refuse the connection (the client
+        logs "connect failed" every retry while the server sees no client).
+        """
+        bind_host: Any = self._host
+        if self._host in ("127.0.0.1", "localhost", "::1", "::"):
+            bind_host = ["127.0.0.1", "::1"]
         self._server = await asyncio.start_server(
-            self._handle_client, self._host, self._port
+            self._handle_client, bind_host, self._port
         )
-        logger.info("ninja-bridge listening on %s:%d", self._host, self.port)
+        logger.info("ninja-bridge listening on %s:%d", bind_host, self.port)
 
     async def stop(self) -> None:
         """Close any active client + stop listening."""
