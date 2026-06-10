@@ -896,8 +896,8 @@ async def _run(args: argparse.Namespace) -> int:
         elif args.broker == "ninja":
             LOGGER.info(
                 "supervisor: NT8/Tradovate selected (Front 5); "
-                "skipping Sierra DTC preflights. account_id=%s env=%s",
-                broker.config.active_account_id, broker.config.environment,
+                "skipping Sierra DTC preflights. account=%s mode=%s",
+                broker.config.nt_account_label, args.trade_mode,
             )
         elif args.broker == "ig":
             LOGGER.info(
