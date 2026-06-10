@@ -359,35 +359,44 @@ def _build_broker_adapter(*, args, instruments):
             symbol_map=symbol_map,
         )
     if args.broker == "ig":
-        # Verified 2026-05-22 via diag against demo-api.ig.com /markets/{epic}.
-        # All four are spread-bet FX mini contracts; lotSize=1.0 per IG API,
-        # quantity_per_lot=10.0 is the standard FX-mini conversion (Kate's
-        # 1.0 lot -> 10 GBP/point IG size). Per Codex 2026-05-21 review,
-        # the 10.0 default is only safe inside verified FX MINI epics —
-        # do NOT extend this map to other instruments without re-running
-        # the /markets/{epic} verification.
+        # Epics switched .MINI.IP -> .TODAY.IP (DFB) on 2026-06-10.
+        # ROOT CAUSE of the Front 7 streaming blocker: the .MINI.IP epics were
+        # NOT streamable on the spread-bet demo account (Z6BHQ1). IG support
+        # (Jeremy, 2026-06-10) confirmed there is NO separate streaming
+        # entitlement — the API key already grants REST + STREAMING; the epic
+        # must simply match the account type. diag_ig_epics.py / _today_epics.py
+        # confirmed all four .TODAY.IP epics on Z6BHQ1 report
+        # instrument.streamingPricesAvailable=true, type=CURRENCIES, TRADEABLE,
+        # lotSize=1.0 (identical sizing model to the old MINI epics, so
+        # quantity_per_lot=10.0 carries over with NO change in £/point risk).
+        # diag_ig_stream_proof.py then delivered 20 live GBPUSD ticks in 25s via
+        # CS.D.GBPUSD.TODAY.IP — end-to-end streaming proven.
+        # lotSize=1.0 per IG API; quantity_per_lot=10.0 = Kate's 1.0 lot ->
+        # £10/point IG size. Per Codex 2026-05-21 review, the 10.0 default is
+        # only safe inside verified FX epics — do NOT extend this map to other
+        # instruments without re-running the /markets/{epic} verification.
         ig_specs = {
             "GBPUSD": IGSymbolSpec(
                 logical_symbol="GBPUSD",
-                epic="CS.D.GBPUSD.MINI.IP",
+                epic="CS.D.GBPUSD.TODAY.IP",
                 quantity_per_lot=10.0,
                 pip_decimal_position=4,
             ),
             "EURUSD": IGSymbolSpec(
                 logical_symbol="EURUSD",
-                epic="CS.D.EURUSD.MINI.IP",
+                epic="CS.D.EURUSD.TODAY.IP",
                 quantity_per_lot=10.0,
                 pip_decimal_position=4,
             ),
             "AUDUSD": IGSymbolSpec(
                 logical_symbol="AUDUSD",
-                epic="CS.D.AUDUSD.MINI.IP",
+                epic="CS.D.AUDUSD.TODAY.IP",
                 quantity_per_lot=10.0,
                 pip_decimal_position=4,
             ),
             "EURGBP": IGSymbolSpec(
                 logical_symbol="EURGBP",
-                epic="CS.D.EURGBP.MINI.IP",
+                epic="CS.D.EURGBP.TODAY.IP",
                 quantity_per_lot=10.0,
                 pip_decimal_position=4,
             ),

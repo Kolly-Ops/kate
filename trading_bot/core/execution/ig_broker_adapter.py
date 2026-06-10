@@ -94,7 +94,7 @@ class IGSymbolSpec:
     decimal that constitutes one pip (4 for most FX, 2 for JPY pairs).
     """
     logical_symbol: str               # e.g. "GBPUSD"
-    epic: str                         # e.g. "CS.D.GBPUSD.MINI.IP"
+    epic: str                         # e.g. "CS.D.GBPUSD.TODAY.IP" (DFB spread-bet)
     quantity_per_lot: float = 10.0    # spread-bet £/point per 1 lot
     pip_decimal_position: int = 4     # 4 for most FX, 2 for JPY
 
