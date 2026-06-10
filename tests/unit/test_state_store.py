@@ -131,6 +131,31 @@ def test_update_order_status_to_filled(store: StateStore) -> None:
     assert updated.filled_at is not None
 
 
+def test_update_order_status_records_exit_telemetry(store: StateStore) -> None:
+    store.record_order(
+        client_order_id="T-EXIT", symbol="MESU26", exchange="CME",
+        side=1, quantity=1.0, order_type=1,
+    )
+    store.update_order_status(
+        client_order_id="T-EXIT", status=ORDER_STATUS_FILLED,
+        fill_price=7492.50, fill_quantity=1.0,
+    )
+    updated = store.update_order_status(
+        client_order_id="T-EXIT", status=ORDER_STATUS_FILLED,
+        exit_price=7494.95,
+        exit_quantity=1.0,
+        exit_reason="TARGET_HIT",
+        realized_pnl=12.25,
+    )
+    assert updated is not None
+    assert updated.fill_price == 7492.50
+    assert updated.exit_price == 7494.95
+    assert updated.exit_quantity == 1.0
+    assert updated.exit_reason == "TARGET_HIT"
+    assert updated.realized_pnl == 12.25
+    assert updated.exited_at is not None
+
+
 def test_update_order_status_to_rejected_records_reason(store: StateStore) -> None:
     store.record_order(
         client_order_id="T-002", symbol="MESM26", exchange="CME",

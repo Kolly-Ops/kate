@@ -117,6 +117,9 @@ class OrderEvent:
     fill_quantity: Optional[float] = None
     rejected_reason: Optional[str] = None
     server_order_id: Optional[str] = None
+    event_type: Optional[str] = None
+    exit_reason: Optional[str] = None
+    realized_pnl: Optional[float] = None
 
 
 @dataclass(frozen=True)

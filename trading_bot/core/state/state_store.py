@@ -67,6 +67,11 @@ class Order:
     fill_price: Optional[float] = None
     fill_quantity: Optional[float] = None
     filled_at: Optional[str] = None
+    exit_price: Optional[float] = None
+    exit_quantity: Optional[float] = None
+    exited_at: Optional[str] = None
+    exit_reason: Optional[str] = None
+    realized_pnl: Optional[float] = None
     rejected_reason: Optional[str] = None
 
 
@@ -115,6 +120,11 @@ CREATE TABLE IF NOT EXISTS orders (
     fill_price      REAL,
     fill_quantity   REAL,
     filled_at       TEXT,
+    exit_price      REAL,
+    exit_quantity   REAL,
+    exited_at       TEXT,
+    exit_reason     TEXT,
+    realized_pnl    REAL,
     rejected_reason TEXT
 );
 
@@ -214,9 +224,31 @@ class StateStore:
                 (KILL_SWITCH_ACTIVE, now, now),
             )
         # Record schema version (idempotent)
+        self._ensure_order_telemetry_columns(c)
         c.execute(
             "INSERT OR IGNORE INTO schema_version (version) VALUES (?)", (1,)
         )
+
+    def _ensure_order_telemetry_columns(self, c: sqlite3.Connection) -> None:
+        """Add post-v1 order outcome columns to existing SQLite files.
+
+        `CREATE TABLE IF NOT EXISTS` does not alter live DBs, so keep this
+        migration idempotent and column-scoped.
+        """
+        existing = {
+            row["name"]
+            for row in c.execute("PRAGMA table_info(orders)").fetchall()
+        }
+        additions = {
+            "exit_price": "REAL",
+            "exit_quantity": "REAL",
+            "exited_at": "TEXT",
+            "exit_reason": "TEXT",
+            "realized_pnl": "REAL",
+        }
+        for name, ddl_type in additions.items():
+            if name not in existing:
+                c.execute(f"ALTER TABLE orders ADD COLUMN {name} {ddl_type}")
 
     # ── Positions ─────────────────────────────────────────────────────────
     def upsert_position(
@@ -330,12 +362,17 @@ class StateStore:
         status: str,
         fill_price: Optional[float] = None,
         fill_quantity: Optional[float] = None,
+        exit_price: Optional[float] = None,
+        exit_quantity: Optional[float] = None,
+        exit_reason: Optional[str] = None,
+        realized_pnl: Optional[float] = None,
         rejected_reason: Optional[str] = None,
     ) -> Optional[Order]:
         if status not in VALID_ORDER_STATUSES:
             raise ValueError(f"invalid order status: {status}")
         now = _utc_now_iso()
         filled_at = now if status == ORDER_STATUS_FILLED else None
+        exited_at = now if exit_price is not None or exit_reason is not None else None
         with self._txn() as c:
             cur = c.execute(
                 """
@@ -344,12 +381,18 @@ class StateStore:
                     fill_price      = COALESCE(?, fill_price),
                     fill_quantity   = COALESCE(?, fill_quantity),
                     filled_at       = COALESCE(?, filled_at),
+                    exit_price      = COALESCE(?, exit_price),
+                    exit_quantity   = COALESCE(?, exit_quantity),
+                    exited_at       = COALESCE(?, exited_at),
+                    exit_reason     = COALESCE(?, exit_reason),
+                    realized_pnl    = COALESCE(?, realized_pnl),
                     rejected_reason = COALESCE(?, rejected_reason),
                     updated_at      = ?
                 WHERE client_order_id = ?
                 """,
                 (status, fill_price, fill_quantity, filled_at,
-                 rejected_reason, now, client_order_id),
+                 exit_price, exit_quantity, exited_at, exit_reason,
+                 realized_pnl, rejected_reason, now, client_order_id),
             )
             if cur.rowcount == 0:
                 return None
@@ -471,5 +514,9 @@ def _row_to_order(row: sqlite3.Row) -> Order:
         order_type=row["order_type"], status=row["status"],
         submitted_at=row["submitted_at"], updated_at=row["updated_at"],
         fill_price=row["fill_price"], fill_quantity=row["fill_quantity"],
-        filled_at=row["filled_at"], rejected_reason=row["rejected_reason"],
+        filled_at=row["filled_at"],
+        exit_price=row["exit_price"], exit_quantity=row["exit_quantity"],
+        exited_at=row["exited_at"], exit_reason=row["exit_reason"],
+        realized_pnl=row["realized_pnl"],
+        rejected_reason=row["rejected_reason"],
     )

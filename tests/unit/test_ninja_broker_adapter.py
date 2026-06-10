@@ -249,6 +249,40 @@ def test_fill_envelope_translates_to_order_filled_event():
     _run(_impl())
 
 
+def test_target_fill_envelope_carries_exit_telemetry():
+    async def _impl():
+        async with _connected_adapter() as (adapter, _reader, writer):
+            fill = FillPayload(
+                intent_id="orb-MESU26-asi-260609035500",
+                timestamp="2026-06-09T05:13:38+00:00",
+                event_type=FillEventType.TARGET_HIT.value,
+                fill_price=7494.9464,
+                fill_quantity=1,
+                nt_order_id="atm-123",
+                symbol="MESU26",
+                nt_symbol="MES 09-26",
+                exit_reason="TARGET_HIT",
+                realized_pnl=12.23,
+            )
+            writer.write(encode_envelope(build_envelope(
+                msg_type=MsgType.FILL,
+                sequence=1,
+                payload=fill,
+                secret=SECRET,
+            )))
+            await writer.drain()
+            async for ev in adapter.events():
+                assert ev.kind is BrokerEventKind.ORDER_FILLED
+                assert ev.order is not None
+                assert ev.order.client_order_id == "orb-MESU26-asi-260609035500"
+                assert ev.order.event_type == "TARGET_HIT"
+                assert ev.order.exit_reason == "TARGET_HIT"
+                assert ev.order.realized_pnl == 12.23
+                assert ev.order.fill_price == 7494.9464
+                break
+    _run(_impl())
+
+
 def test_heartbeat_envelope_translates_to_heartbeat_event():
     async def _impl():
         async with _connected_adapter() as (adapter, _reader, writer):

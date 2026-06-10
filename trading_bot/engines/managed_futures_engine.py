@@ -71,6 +71,13 @@ from trading_bot.core.strategy import StepRatchetState, StepRatchetStopPolicy, S
 
 logger = logging.getLogger(__name__)
 
+_NATIVE_BRACKET_EXIT_EVENT_TYPES = frozenset({
+    "STOP_HIT",
+    "TARGET_HIT",
+    "MANUAL_FLAT",
+    "OTHER",
+})
+
 
 @dataclass(frozen=True)
 class _BracketSpec:
@@ -670,6 +677,29 @@ class ManagedFuturesEngine:
                 order.client_order_id,
             )
             self._handle_entry_marker_for_order_event(kind, order)
+            return
+        if (
+            existing.status == "FILLED"
+            and kind == BrokerEventKind.ORDER_FILLED
+            and order.event_type in _NATIVE_BRACKET_EXIT_EVENT_TYPES
+        ):
+            self.state.update_order_status(
+                client_order_id=order.client_order_id,
+                status="FILLED",
+                exit_price=order.fill_price,
+                exit_quantity=order.fill_quantity,
+                exit_reason=order.exit_reason or order.event_type,
+                realized_pnl=order.realized_pnl,
+            )
+            logger.info(
+                "engine: native bracket exit recorded coid=%s reason=%s "
+                "exit_price=%s exit_qty=%s realized_pnl=%s",
+                order.client_order_id,
+                order.exit_reason or order.event_type,
+                order.fill_price,
+                order.fill_quantity,
+                order.realized_pnl,
+            )
             return
         rejected_reason = order.rejected_reason if store_status == "REJECTED" else None
         fill_price = order.fill_price if store_status == "FILLED" else None

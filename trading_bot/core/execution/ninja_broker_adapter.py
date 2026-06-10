@@ -488,8 +488,26 @@ class NinjaBrokerAdapter(BrokerAdapter):
                     fill_quantity=float(payload.get("fill_quantity", 0)) or None,
                     rejected_reason=str(payload.get("reason", "")) or None,
                     server_order_id=str(payload.get("nt_order_id", "")) or None,
+                    event_type=str(event_type) if event_type else None,
+                    exit_reason=str(payload.get("exit_reason", "")) or None,
+                    realized_pnl=float(payload.get("realized_pnl", 0.0)),
                 ),
             ))
+            if event_type in (
+                FillEventType.STOP_HIT.value,
+                FillEventType.TARGET_HIT.value,
+                FillEventType.MANUAL_FLAT.value,
+                FillEventType.OTHER.value,
+            ):
+                logger.info(
+                    "ninja-adapter: EXIT_FILL intent_id=%s event_type=%s "
+                    "price=%.4f qty=%s realized_pnl=%.2f",
+                    payload.get("intent_id", ""),
+                    event_type,
+                    float(payload.get("fill_price", 0.0)),
+                    payload.get("fill_quantity", 0),
+                    float(payload.get("realized_pnl", 0.0)),
+                )
             return
 
         if msg_type == MsgType.HEARTBEAT.value:
@@ -690,6 +708,8 @@ _FILL_EVENT_KIND_MAP: dict[str, BrokerEventKind] = {
     FillEventType.ENTRY.value: BrokerEventKind.ORDER_FILLED,
     FillEventType.STOP_HIT.value: BrokerEventKind.ORDER_FILLED,
     FillEventType.TARGET_HIT.value: BrokerEventKind.ORDER_FILLED,
+    FillEventType.MANUAL_FLAT.value: BrokerEventKind.ORDER_FILLED,
+    FillEventType.OTHER.value: BrokerEventKind.ORDER_FILLED,
     FillEventType.CANCELLED.value: BrokerEventKind.ORDER_CANCELED,
     FillEventType.REJECTED.value: BrokerEventKind.ORDER_REJECTED,
 }

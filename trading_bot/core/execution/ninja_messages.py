@@ -46,6 +46,8 @@ class FillEventType(str, Enum):
     ENTRY = "ENTRY"
     STOP_HIT = "STOP_HIT"
     TARGET_HIT = "TARGET_HIT"
+    MANUAL_FLAT = "MANUAL_FLAT"
+    OTHER = "OTHER"
     CANCELLED = "CANCELLED"
     REJECTED = "REJECTED"
 
@@ -83,6 +85,10 @@ class FillPayload:
     fill_quantity: int
     nt_order_id: str
     reason: str = ""     # populated on REJECTED
+    symbol: str = ""
+    nt_symbol: str = ""
+    exit_reason: str = ""
+    realized_pnl: float = 0.0
 
 
 @dataclass(frozen=True)

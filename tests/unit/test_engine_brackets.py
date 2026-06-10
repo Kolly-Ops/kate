@@ -121,6 +121,51 @@ def _fill_event(
 
 
 # ── Entry-fill triggers bracket submission ──────────────────────────────
+def test_native_bracket_exit_updates_existing_order_telemetry(engine_setup) -> None:
+    engine, _fake, state = engine_setup
+    coid = "orb-MESU26-asi-260609035500"
+    state.record_order(
+        client_order_id=coid,
+        symbol="MESU26",
+        exchange="CME",
+        side=proto.BUY,
+        quantity=1.0,
+        order_type=proto.ORDER_TYPE_MARKET,
+    )
+    state.update_order_status(
+        client_order_id=coid,
+        status="FILLED",
+        fill_price=7492.50,
+        fill_quantity=1.0,
+    )
+
+    asyncio.get_event_loop().run_until_complete(
+        engine._handle_broker_event(BrokerEvent(
+            kind=BrokerEventKind.ORDER_FILLED,
+            received_at=time.time(),
+            order=OrderEvent(
+                client_order_id=coid,
+                symbol="MESU26",
+                side=proto.BUY,
+                quantity=1.0,
+                fill_price=7494.95,
+                fill_quantity=1.0,
+                event_type="TARGET_HIT",
+                exit_reason="TARGET_HIT",
+                realized_pnl=12.25,
+            ),
+        ))
+    )
+
+    updated = state.get_order(client_order_id=coid)
+    assert updated is not None
+    assert updated.fill_price == 7492.50
+    assert updated.exit_price == 7494.95
+    assert updated.exit_reason == "TARGET_HIT"
+    assert updated.realized_pnl == 12.25
+    assert updated.exited_at is not None
+
+
 def test_entry_fill_submits_stop_and_target(engine_setup) -> None:
     engine, fake, _state = engine_setup
     entry_coid = "atrbo-MESM26-260430080000"
