@@ -654,6 +654,16 @@ class IGBrokerAdapter(BrokerAdapter):
     async def connect(self) -> None:
         if self._connected:
             return
+            
+        # Hard fail-closed whitelist guard for Phase 0
+        is_demo = self.config.environment.lower() == "demo"
+        is_z6bhq1 = self.config.active_account_id.upper() == "Z6BHQ1"
+        if not (is_demo and is_z6bhq1):
+            raise BrokerError(
+                f"DemoGuardFailure: IG adapter strictly requires env='demo' and account='Z6BHQ1'. "
+                f"Got env={self.config.environment!r}, account={self.config.active_account_id!r}"
+            )
+
         # POST /session — get CST + X-SECURITY-TOKEN
         body, resp_headers = await self._request(
             "POST",
@@ -687,17 +697,35 @@ class IGBrokerAdapter(BrokerAdapter):
         # Z6BHQ1 spread-bet) regardless of the user's preferred-account
         # setting in My IG. This is load-bearing for the CGT-free path.
         if current != self.config.active_account_id:
-            _, put_headers = await self._request(
-                "PUT",
-                "/session",
-                version=1,
-                authenticated=True,
-                json_body={
-                    "accountId": self.config.active_account_id,
-                    "defaultAccountId": self.config.active_account_id,
-                },
-                return_headers=True,
-            )
+            try:
+                _, put_headers = await self._request(
+                    "PUT",
+                    "/session",
+                    version=1,
+                    authenticated=True,
+                    json_body={
+                        "accountId": self.config.active_account_id,
+                        "defaultAccountId": self.config.active_account_id,
+                    },
+                    return_headers=True,
+                )
+            except BrokerError as e:
+                if "401" in str(e):
+                    logger.info("IG /session PUT got 401. Waiting 2 seconds and retrying...")
+                    await asyncio.sleep(2.0)
+                    _, put_headers = await self._request(
+                        "PUT",
+                        "/session",
+                        version=1,
+                        authenticated=True,
+                        json_body={
+                            "accountId": self.config.active_account_id,
+                            "defaultAccountId": self.config.active_account_id,
+                        },
+                        return_headers=True,
+                    )
+                else:
+                    raise e
             if put_headers.get("CST"):
                 self._cst = put_headers.get("CST")
             if put_headers.get("X-SECURITY-TOKEN"):
@@ -1215,6 +1243,13 @@ class IGBrokerAdapter(BrokerAdapter):
         sanitize to [a-zA-Z0-9_-] and truncate to 30 chars.
         """
         self._require_connected()
+        is_demo = self.config.environment.lower() == "demo"
+        is_z6bhq1 = self.config.active_account_id.upper() == "Z6BHQ1"
+        if not (is_demo and is_z6bhq1):
+            raise BrokerError(
+                f"DemoGuardFailure: IG adapter strictly requires env='demo' and account='Z6BHQ1'. "
+                f"Got env={self.config.environment!r}, account={self.config.active_account_id!r}"
+            )
         spec = self._spec(symbol)
         direction = "BUY" if side == proto.BUY else "SELL"
         if order_type != proto.ORDER_TYPE_MARKET:
@@ -1238,7 +1273,7 @@ class IGBrokerAdapter(BrokerAdapter):
 
         order_body: dict[str, Any] = {
             "epic": spec.epic,
-            "expiry": "-",            # FX spread-bet: no expiry
+            "expiry": "DFB",          # Daily Funded Bet (DFB) spread-bet
             "direction": direction,
             "size": size,
             "orderType": "MARKET" if order_type == proto.ORDER_TYPE_MARKET else "LIMIT",

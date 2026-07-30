@@ -91,6 +91,17 @@ class _Result:
     comment: str = ""
 
 
+@dataclass
+class _Deal:
+    ticket: int
+    position_id: int
+    price: float
+    profit: float
+    swap: float = 0.0
+    commission: float = 0.0
+    time: int = 1_715_601_700
+
+
 class _FakeMT5:
     TRADE_ACTION_DEAL = 1
     TRADE_ACTION_PENDING = 5
@@ -156,6 +167,7 @@ class _FakeMT5:
         # dicts in test fixtures.
         self.rates: list[dict] = []
         self.copy_rates_calls = []
+        self.deals: list[_Deal] = []
 
     def copy_rates_from_pos(self, symbol, timeframe, start_pos, count):
         self.copy_rates_calls.append((symbol, timeframe, start_pos, count))
@@ -194,6 +206,11 @@ class _FakeMT5:
         if ticket is not None:
             return [p for p in self.positions if p.ticket == int(ticket)]
         return self.positions
+
+    def history_deals_get(self, position=None):
+        if position is None:
+            return self.deals
+        return [d for d in self.deals if d.position_id == int(position)]
 
     def orders_get(self):
         return self.orders
@@ -844,6 +861,43 @@ def test_detect_server_offset_rejects_absurd_offset_with_critical_log():
                 "expected BrokerError on absurd +12h offset; supervisor should "
                 "refuse to start with an offset outside the retail broker band"
             )
+
+    _run(_impl())
+
+
+def test_alert_position_closed_uses_net_deal_pnl_when_costs_erase_gross_profit(monkeypatch):
+    """Closed-position telemetry must use broker-net deal history.
+
+    A gross winner can become exact breakeven after commission/swap. That
+    exact zero must not fall back to the previous open-position snapshot
+    profit, or reports overstate performance precisely when fees matter.
+    """
+
+    async def _impl() -> None:
+        runtime = _FakeMT5()
+        runtime.deals = [
+            _Deal(ticket=1, position_id=777, price=1.2400, profit=0.0, time=1),
+            _Deal(ticket=2, position_id=777, price=1.2450, profit=4.50, commission=-4.50, time=2),
+        ]
+        adapter = _adapter(runtime)
+        alerts: list[str] = []
+        monkeypatch.setattr(
+            "trading_bot.core.execution.mt5_broker_adapter.push_telegram_alert",
+            lambda message: alerts.append(message) or True,
+        )
+
+        await adapter._alert_position_closed(
+            777,
+            {
+                "symbol": "GBPUSD",
+                "price_open": 1.2400,
+                "profit": 12.34,
+            },
+        )
+
+        assert alerts, "expected close alert"
+        assert "realized P&L = £0.00" in alerts[0]
+        assert "£12.34" not in alerts[0]
 
     _run(_impl())
 

@@ -1070,8 +1070,11 @@ class MT5BrokerAdapter(BrokerAdapter):
                     if d_time > latest_time:
                         latest_time = d_time
                         latest_price = float(_field(d, "price", 0.0) or 0.0)
-                if total_profit != 0.0:
-                    profit = total_profit
+                # Trust broker history whenever it is available, including
+                # exact breakeven after commission/swap. Falling back on
+                # zero would reuse the last open-position snapshot and
+                # overstate fee-erased closes.
+                profit = total_profit
                 if latest_price > 0:
                     close_price = latest_price
             # Infer SL vs TP vs other from sign + which bracket was nearer
